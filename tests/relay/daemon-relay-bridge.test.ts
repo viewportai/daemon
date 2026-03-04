@@ -576,6 +576,46 @@ describe('daemon relay bridge helpers', () => {
     expect((bridge as any).acceptInboundSeq(session, RELAY_REPLAY_WINDOW + 10)).toBe(false);
   });
 
+  it('supports overriding key rotation threshold for test harnesses', () => {
+    const bridge = new DaemonRelayBridge({
+      relayEndpoint: 'ws://127.0.0.1:7781/ws',
+      relayServerUrl: 'http://127.0.0.1:7780',
+      workspaceId: 'workspace_demo',
+      enrollToken: 'enroll-token',
+      daemonWsUrl: 'ws://127.0.0.1:7070/ws',
+      keyRotateAfterMessages: 2,
+    });
+
+    const sent: string[] = [];
+    const relayWs = {
+      send(payload: string): void {
+        sent.push(payload);
+      },
+      readyState: 1,
+    };
+
+    (bridge as any).relaySessions.set('rs_override', {
+      key: Buffer.alloc(32, 7),
+      profile: 'noise-ik',
+      sessionId: 'rs_override',
+      epoch: 1,
+      txSeq: 1,
+      rxHighestSeq: 0,
+      rxSeenSeq: new Set<number>(),
+      lastActivityAt: Date.now(),
+      keyRotationRequested: false,
+    });
+
+    (bridge as any).sendToAllRelaySessions(relayWs, JSON.stringify({ type: 'ping' }));
+    expect(sent.length).toBe(2);
+    expect(JSON.parse(sent[1] ?? '{}')).toMatchObject({
+      type: 'relay_key_update_required',
+      sessionId: 'rs_override',
+      nextEpoch: 2,
+      reason: 'message_threshold',
+    });
+  });
+
   it('rejects key exchange rekey requests for unknown previous session ids', () => {
     const bridge = new DaemonRelayBridge({
       relayEndpoint: 'ws://127.0.0.1:7781/ws',

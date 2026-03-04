@@ -82,6 +82,14 @@ function localDaemonWsUrl(config: RuntimeLaunchConfig): string | null {
   return `ws://${host}:${config.port}/ws`;
 }
 
+function parsePositiveIntEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) return undefined;
+  return parsed;
+}
+
 async function isRuntimeResponsive(): Promise<boolean> {
   const res = await daemonFetch('/health', { timeoutMs: 1_200 });
   return !!(res && res.ok);
@@ -372,6 +380,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
         relayTokenAudience: config.relayTokenAudience,
         relayTokenSigningKeys: config.relayTokenSigningKeys,
         relayTokenClockSkewSec: config.relayTokenClockSkewSec,
+        keyRotateAfterMessages: parsePositiveIntEnv('VIEWPORT_RELAY_KEY_ROTATE_AFTER_MESSAGES'),
       });
       await relayBridge.start();
       logger.log(

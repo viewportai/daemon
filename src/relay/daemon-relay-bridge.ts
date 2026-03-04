@@ -26,6 +26,11 @@ import {
   type RelayHandshakeProfile,
   type RelayKeyExchangeInitFrame,
 } from './bridge-key-exchange.js';
+import {
+  deriveNoiseV3SessionFromInit,
+  parseRelayKeyExchangeInitFrameV3,
+  type RelayKeyExchangeInitFrameV3,
+} from './bridge-noise-v3.js';
 import { BridgeError, type BridgeErrorCode } from './bridge-errors.js';
 import { type RelayTokenClaims, verifyRelayTokenClaims } from './bridge-jwt.js';
 import { closeQuietly, resolveRelayTlsOptions, wsOpen } from './bridge-network.js';
@@ -72,6 +77,7 @@ export interface DaemonRelayBridgeOptions {
   relayTokenClockSkewSec?: number;
   maxPendingOutbound?: number;
   maxPendingOutboundBytes?: number;
+  keyRotateAfterMessages?: number;
 }
 
 interface RelaySessionState {
@@ -152,9 +158,16 @@ export class DaemonRelayBridge {
   private lastErrorAt: number | undefined;
   private state: DaemonRelayBridgeStatus['state'] = 'stopped';
   private relayEndpoint: string;
+  private readonly keyRotateAfterMessages: number;
 
   constructor(private readonly options: DaemonRelayBridgeOptions) {
     this.relayEndpoint = options.relayEndpoint;
+    this.keyRotateAfterMessages =
+      typeof options.keyRotateAfterMessages === 'number' &&
+      Number.isInteger(options.keyRotateAfterMessages) &&
+      options.keyRotateAfterMessages >= 1
+        ? options.keyRotateAfterMessages
+        : RELAY_KEY_ROTATE_AFTER_MESSAGES;
     this.daemonIssueToken = options.issueToken ?? null;
     this.relayTokenSigningKeys =
       options.relayTokenSigningKeys && Object.keys(options.relayTokenSigningKeys).length > 0
@@ -456,7 +469,7 @@ export class DaemonRelayBridge {
       });
       relayWs.send(envelope);
 
-      if (!session.keyRotationRequested && session.txSeq >= RELAY_KEY_ROTATE_AFTER_MESSAGES) {
+      if (!session.keyRotationRequested && session.txSeq >= this.keyRotateAfterMessages) {
         const rotateNotice: RelayKeyUpdateRequiredFrame = {
           type: 'relay_key_update_required',
           sessionId: session.sessionId,
@@ -501,6 +514,12 @@ export class DaemonRelayBridge {
       parsedUnknown = JSON.parse(text);
     } catch {
       return false;
+    }
+
+    const keyExchangeInitV3 = parseRelayKeyExchangeInitFrameV3(parsedUnknown);
+    if (keyExchangeInitV3) {
+      this.handleKeyExchangeInitV3(keyExchangeInitV3, relayWs);
+      return true;
     }
 
     const keyExchangeInit = parseRelayKeyExchangeInitFrame(parsedUnknown);
@@ -616,6 +635,73 @@ export class DaemonRelayBridge {
       const message = error instanceof Error ? error.message : String(error);
       this.recordError('KEY_EXCHANGE_FAILED', message);
       out.warn(`[relay] key exchange failed [KEY_EXCHANGE_FAILED]: ${message}`);
+    }
+  }
+
+  private handleKeyExchangeInitV3(init: RelayKeyExchangeInitFrameV3, relayWs: RelayWs): void {
+    if (!this.daemonIdentity) {
+      out.warn('[relay] noise-v3 key exchange init ignored: daemon identity not ready');
+      return;
+    }
+
+    if (init.profile !== this.requiredProfile) {
+      out.warn(
+        `[relay] noise-v3 key exchange profile mismatch (got=${init.profile}, expected=${this.requiredProfile})`,
+      );
+      return;
+    }
+
+    let previous: RelaySessionState | undefined;
+    let nextEpoch = 1;
+    if (init.previousSessionId) {
+      previous = this.relaySessions.get(init.previousSessionId);
+      if (!previous) {
+        out.warn(
+          `[relay] noise-v3 key exchange rejected: unknown previous session ${init.previousSessionId}`,
+        );
+        return;
+      }
+      if (previous.profile !== init.profile) {
+        out.warn(
+          `[relay] noise-v3 key exchange rejected: profile mismatch for previous session ${init.previousSessionId}`,
+        );
+        return;
+      }
+      if (!previous.keyRotationRequested) {
+        out.warn(
+          `[relay] noise-v3 key exchange rejected: previous session ${init.previousSessionId} has no pending key rotation`,
+        );
+        return;
+      }
+      nextEpoch = previous.epoch + 1;
+    }
+
+    try {
+      const derived = deriveNoiseV3SessionFromInit({
+        init,
+        daemonIdentity: this.daemonIdentity,
+        nextEpoch,
+        pairingSecret: this.requiredProfile === 'noise-ikpsk2' ? this.pairingSecret : undefined,
+      });
+      if (previous && init.previousSessionId) {
+        this.relaySessions.delete(init.previousSessionId);
+      }
+      this.relaySessions.set(derived.session.sessionId, {
+        ...derived.session,
+        profile: derived.session.profile as RelayHandshakeProfile,
+        txSeq: 0,
+        rxHighestSeq: 0,
+        rxSeenSeq: new Set<number>(),
+        lastActivityAt: Date.now(),
+        keyRotationRequested: false,
+      });
+      if (relayWs.readyState === WebSocket.OPEN) {
+        relayWs.send(JSON.stringify(derived.response));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.recordError('KEY_EXCHANGE_FAILED', message);
+      out.warn(`[relay] noise-v3 key exchange failed [KEY_EXCHANGE_FAILED]: ${message}`);
     }
   }
 
