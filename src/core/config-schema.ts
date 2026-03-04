@@ -65,6 +65,7 @@ export const ViewportConfigSchema = z
             serverUrl: z.string().optional(),
             workspaceId: z.string().optional(),
             enrollToken: z.string().optional(),
+            issueToken: z.string().optional(),
             tlsVerify: z.enum(['auto', '0', '1']).optional(),
             caCertPath: z.string().optional(),
           })

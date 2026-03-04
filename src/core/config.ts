@@ -104,6 +104,7 @@ export interface ViewportConfig {
       serverUrl?: string;
       workspaceId?: string;
       enrollToken?: string;
+      issueToken?: string;
       tlsVerify?: 'auto' | '0' | '1';
       caCertPath?: string;
     };
@@ -291,6 +292,7 @@ export class ConfigManager {
           serverUrl?: string;
           workspaceId?: string;
           enrollToken?: string;
+          issueToken?: string;
           tlsVerify?: 'auto' | '0' | '1';
           caCertPath?: string;
         };

@@ -75,6 +75,8 @@ function decodeRuntimeConfig(raw: string | undefined): RuntimeLaunchConfig {
       typeof parsed.relayWorkspaceId === 'string' ? parsed.relayWorkspaceId : undefined,
     relayEnrollToken:
       typeof parsed.relayEnrollToken === 'string' ? parsed.relayEnrollToken : undefined,
+    relayIssueToken:
+      typeof parsed.relayIssueToken === 'string' ? parsed.relayIssueToken : undefined,
     relayTlsVerify:
       parsed.relayTlsVerify === 'auto' ||
       parsed.relayTlsVerify === '0' ||

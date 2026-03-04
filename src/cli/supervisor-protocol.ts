@@ -21,6 +21,7 @@ export interface RuntimeLaunchConfig {
   relayServerUrl?: string;
   relayWorkspaceId?: string;
   relayEnrollToken?: string;
+  relayIssueToken?: string;
   relayTlsVerify?: 'auto' | '0' | '1';
   relayCaCertPath?: string;
 }

@@ -21,12 +21,6 @@ import { HookRouter, SupervisionManager } from './hooks/index.js';
 import { LocalAuthProvider } from './server/auth.js';
 import type { AuthProvider } from './server/auth.js';
 import type { GitTrackerConfig } from './core/types.js';
-import {
-  loadPersistedSessions,
-  savePersistedSessions,
-  clearPersistedSessions,
-} from './core/session-state-file.js';
-import type { PersistedSession } from './core/session-state-file.js';
 import { hasFlag } from './cli/args.js';
 import {
   readDaemonRuntimeState,
@@ -53,6 +47,7 @@ import { resolveDaemonSettingsFromSources } from './cli/daemon-settings.js';
 import { loadAgents, autoRegisterDirectories, decodeAutoRegisterEntry } from './startup-agents.js';
 import { startDiscoveryWatchers } from './startup-watchers.js';
 import { maybeOfferAgentPrerequisites } from './startup-prereqs.js';
+import { setupSessionPersistence } from './startup-session-persistence.js';
 import { DaemonRelayBridge } from './relay/daemon-relay-bridge.js';
 import { configDir } from './core/config.js';
 
@@ -217,63 +212,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
       new GitTracker(trackerConfig, sessionId),
   );
 
-  // Wire session persistence
-  const PERSIST_DEBOUNCE_MS = 2000;
-  let persistTimer: ReturnType<typeof setTimeout> | null = null;
-  const sessionMeta = new Map<string, { startedAt: number; lastStateChange: number }>();
-
-  const persistSessions = async () => {
-    try {
-      const activeSessions = daemon.getActiveSessions();
-      const entries: PersistedSession[] = activeSessions.map((sid) => {
-        const info = daemon.getSessionInfo(sid);
-        const dir = daemon.directoryManager.get(info.directoryId);
-        const meta = sessionMeta.get(sid);
-        return {
-          sessionId: sid,
-          directoryId: info.directoryId,
-          agent: info.agent,
-          startedAt: meta?.startedAt ?? Date.now(),
-          lastStateChange: meta?.lastStateChange ?? Date.now(),
-          state: info.state,
-          cwd: dir?.path ?? '',
-        };
-      });
-      await savePersistedSessions(entries);
-    } catch (err) {
-      logger.warn('persistSessions failed:', err);
-    }
-  };
-
-  const debouncedPersist = () => {
-    if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => {
-      persistTimer = null;
-      persistSessions().catch((err) => logger.warn('persistSessions failed:', err));
-    }, PERSIST_DEBOUNCE_MS);
-  };
-
-  daemon.on('session:started', ({ sessionId }) => {
-    const now = Date.now();
-    sessionMeta.set(sessionId, { startedAt: now, lastStateChange: now });
-    debouncedPersist();
-  });
-  daemon.on('session:ended', ({ sessionId }) => {
-    sessionMeta.delete(sessionId);
-    debouncedPersist();
-  });
-  daemon.on('session:state-changed', ({ sessionId }) => {
-    const existing = sessionMeta.get(sessionId);
-    if (!existing) return;
-    existing.lastStateChange = Date.now();
-    debouncedPersist();
-  });
-
-  const orphaned = await loadPersistedSessions();
-  if (orphaned.length > 0) {
-    logger.log(`Found ${orphaned.length} orphaned session(s) from previous run (cleaned up)`);
-    await clearPersistedSessions();
-  }
+  const sessionPersistence = await setupSessionPersistence(daemon);
 
   const securityProfile = buildSecurityProfile({
     profile: config.profile,
@@ -327,11 +266,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
     shutdownExitCode = exitCode;
     logger.log('\nShutting down...');
 
-    if (persistTimer) {
-      clearTimeout(persistTimer);
-      persistTimer = null;
-    }
-    await persistSessions();
+    await sessionPersistence.flush();
     discoveryWatches.stop();
     hookRouter.shutdown();
     if (relayBridge) {
@@ -339,7 +274,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
       relayBridge = null;
     }
     await daemon.shutdown();
-    await clearPersistedSessions();
+    await sessionPersistence.clearPersistedState();
     await app.close();
     if (socketPath) {
       await fs.rm(socketPath, { force: true }).catch(() => undefined);
@@ -427,6 +362,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
         relayServerUrl: config.relayServerUrl!,
         workspaceId: config.relayWorkspaceId!,
         enrollToken: config.relayEnrollToken!,
+        issueToken: config.relayIssueToken,
         daemonWsUrl: daemonWsUrl!,
         daemonAuthToken: daemonToken ?? undefined,
         relayTlsVerify: config.relayTlsVerify ?? 'auto',

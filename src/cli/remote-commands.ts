@@ -131,6 +131,7 @@ export async function remote(): Promise<void> {
         serverUrl: relayConfig.serverUrl,
         workspaceId: relayConfig.workspaceId,
         enrollToken: redact(relayConfig.enrollToken),
+        issueToken: redact(relayConfig.issueToken),
         tlsVerify: relayConfig.tlsVerify ?? 'auto',
         caCertPath: relayConfig.caCertPath,
       },
@@ -145,6 +146,7 @@ export async function remote(): Promise<void> {
     console.log(`Relay server:         ${payload.relay.serverUrl ?? '-'}`);
     console.log(`Workspace:            ${payload.relay.workspaceId ?? '-'}`);
     console.log(`Enroll token:         ${payload.relay.enrollToken ?? '-'}`);
+    console.log(`Issue token:          ${payload.relay.issueToken ?? '-'}`);
     console.log(`TLS verify:           ${payload.relay.tlsVerify}`);
     console.log(`CA cert path:         ${payload.relay.caCertPath ?? '-'}`);
     return;
@@ -174,6 +176,7 @@ export async function remote(): Promise<void> {
         ...relayConfig,
         enabled: false,
         enrollToken: undefined,
+        issueToken: undefined,
       },
     });
     const payload = { command: 'remote logout', ok: true, enabled: false };
@@ -239,6 +242,7 @@ export async function remote(): Promise<void> {
         serverUrl,
         workspaceId,
         enrollToken,
+        issueToken: relayConfig.issueToken,
         tlsVerify: relayTlsVerify,
         caCertPath: relayCaCertPath,
       },
@@ -253,6 +257,7 @@ export async function remote(): Promise<void> {
         serverUrl,
         workspaceId,
         enrollToken: redact(enrollToken),
+        issueToken: redact(relayConfig.issueToken),
         tlsVerify: relayTlsVerify,
         caCertPath: relayCaCertPath,
       },
