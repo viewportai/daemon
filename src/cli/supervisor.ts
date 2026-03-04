@@ -70,6 +70,19 @@ function decodeRuntimeConfig(raw: string | undefined): RuntimeLaunchConfig {
     logPath: typeof parsed.logPath === 'string' ? parsed.logPath : undefined,
     relayEnabled: typeof parsed.relayEnabled === 'boolean' ? parsed.relayEnabled : undefined,
     relayEndpoint: typeof parsed.relayEndpoint === 'string' ? parsed.relayEndpoint : undefined,
+    relayServerUrl: typeof parsed.relayServerUrl === 'string' ? parsed.relayServerUrl : undefined,
+    relayWorkspaceId:
+      typeof parsed.relayWorkspaceId === 'string' ? parsed.relayWorkspaceId : undefined,
+    relayEnrollToken:
+      typeof parsed.relayEnrollToken === 'string' ? parsed.relayEnrollToken : undefined,
+    relayTlsVerify:
+      parsed.relayTlsVerify === 'auto' ||
+      parsed.relayTlsVerify === '0' ||
+      parsed.relayTlsVerify === '1'
+        ? parsed.relayTlsVerify
+        : undefined,
+    relayCaCertPath:
+      typeof parsed.relayCaCertPath === 'string' ? parsed.relayCaCertPath : undefined,
   };
 }
 
@@ -188,6 +201,9 @@ async function writeState(config: RuntimeLaunchConfig, workerPid?: number): Prom
     allowedOriginsRaw: config.allowedOriginsRaw,
     relayEnabled: config.relayEnabled,
     relayEndpoint: config.relayEndpoint,
+    relayServerUrl: config.relayServerUrl,
+    relayWorkspaceId: config.relayWorkspaceId,
+    relayTlsVerify: config.relayTlsVerify,
   });
 }
 

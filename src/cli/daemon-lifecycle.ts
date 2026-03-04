@@ -39,6 +39,9 @@ export interface DaemonRuntimeState {
   allowedOriginsRaw?: string;
   relayEnabled?: boolean;
   relayEndpoint?: string;
+  relayServerUrl?: string;
+  relayWorkspaceId?: string;
+  relayTlsVerify?: 'auto' | '0' | '1';
 }
 
 function daemonStatePath(): string {
@@ -103,6 +106,15 @@ export async function readDaemonRuntimeState(): Promise<DaemonRuntimeState | nul
         typeof parsed.allowedOriginsRaw === 'string' ? parsed.allowedOriginsRaw : undefined,
       relayEnabled: typeof parsed.relayEnabled === 'boolean' ? parsed.relayEnabled : undefined,
       relayEndpoint: typeof parsed.relayEndpoint === 'string' ? parsed.relayEndpoint : undefined,
+      relayServerUrl: typeof parsed.relayServerUrl === 'string' ? parsed.relayServerUrl : undefined,
+      relayWorkspaceId:
+        typeof parsed.relayWorkspaceId === 'string' ? parsed.relayWorkspaceId : undefined,
+      relayTlsVerify:
+        parsed.relayTlsVerify === 'auto' ||
+        parsed.relayTlsVerify === '0' ||
+        parsed.relayTlsVerify === '1'
+          ? parsed.relayTlsVerify
+          : undefined,
     };
   } catch {
     return null;

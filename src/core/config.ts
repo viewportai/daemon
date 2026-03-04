@@ -101,6 +101,11 @@ export interface ViewportConfig {
       enabled?: boolean;
       endpoint?: string;
       publicEndpoint?: string;
+      serverUrl?: string;
+      workspaceId?: string;
+      enrollToken?: string;
+      tlsVerify?: 'auto' | '0' | '1';
+      caCertPath?: string;
     };
   };
 }
@@ -283,6 +288,11 @@ export class ConfigManager {
           enabled?: boolean;
           endpoint?: string;
           publicEndpoint?: string;
+          serverUrl?: string;
+          workspaceId?: string;
+          enrollToken?: string;
+          tlsVerify?: 'auto' | '0' | '1';
+          caCertPath?: string;
         };
       }
     | undefined {

@@ -53,6 +53,8 @@ import { resolveDaemonSettingsFromSources } from './cli/daemon-settings.js';
 import { loadAgents, autoRegisterDirectories, decodeAutoRegisterEntry } from './startup-agents.js';
 import { startDiscoveryWatchers } from './startup-watchers.js';
 import { maybeOfferAgentPrerequisites } from './startup-prereqs.js';
+import { DaemonRelayBridge } from './relay/daemon-relay-bridge.js';
+import { configDir } from './core/config.js';
 
 export { decodeAutoRegisterEntry };
 
@@ -65,6 +67,25 @@ export const HTTP_LOG_REDACT_PATHS = [
   'req.headers.cookie',
   'res.headers["set-cookie"]',
 ] as const;
+
+async function readDaemonAuthToken(): Promise<string | null> {
+  try {
+    const raw = await fs.readFile(path.join(configDir(), 'auth-token'), 'utf-8');
+    const token = raw.trim();
+    return token.length > 0 ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+function localDaemonWsUrl(config: RuntimeLaunchConfig): string | null {
+  if (config.socketPath) {
+    // ws+unix is not currently supported by the ws client in this relay bridge.
+    return null;
+  }
+  const host = config.host === '0.0.0.0' || config.host === '::' ? '127.0.0.1' : config.host;
+  return `ws://${host}:${config.port}/ws`;
+}
 
 async function isRuntimeResponsive(): Promise<boolean> {
   const res = await daemonFetch('/health', { timeoutMs: 1_200 });
@@ -298,6 +319,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
   let shutdownExitCode = 0;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | null = null;
+  let relayBridge: DaemonRelayBridge | null = null;
 
   const shutdown = async (exitCode = 0) => {
     if (shuttingDown) return;
@@ -312,6 +334,10 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
     await persistSessions();
     discoveryWatches.stop();
     hookRouter.shutdown();
+    if (relayBridge) {
+      await relayBridge.stop();
+      relayBridge = null;
+    }
     await daemon.shutdown();
     await clearPersistedSessions();
     await app.close();
@@ -378,6 +404,42 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
     logger.log(`  WebSocket: ${address.replace('http', 'ws')}/ws`);
   }
   logger.log(`  Agents:    ${registry.getIds().join(', ') || 'none'}`);
+
+  if (config.relayEnabled) {
+    const missing: string[] = [];
+    if (!config.relayEndpoint) missing.push('relay endpoint');
+    if (!config.relayServerUrl) missing.push('relay server URL');
+    if (!config.relayWorkspaceId) missing.push('relay workspace ID');
+    if (!config.relayEnrollToken) missing.push('relay enroll token');
+    const daemonWsUrl = localDaemonWsUrl(config);
+    if (!daemonWsUrl) {
+      missing.push(
+        'tcp listen target (relay runtime currently requires tcp listen, not unix socket)',
+      );
+    }
+
+    if (missing.length > 0) {
+      logger.warn(`[relay] disabled due to incomplete config: ${missing.join(', ')}`);
+    } else {
+      const daemonToken = config.authEnabled ? await readDaemonAuthToken() : null;
+      const daemonWsWithToken = daemonToken
+        ? `${daemonWsUrl}?token=${encodeURIComponent(daemonToken)}`
+        : daemonWsUrl;
+      relayBridge = new DaemonRelayBridge({
+        relayEndpoint: config.relayEndpoint!,
+        relayServerUrl: config.relayServerUrl!,
+        workspaceId: config.relayWorkspaceId!,
+        enrollToken: config.relayEnrollToken!,
+        daemonWsUrl: daemonWsWithToken!,
+        relayTlsVerify: config.relayTlsVerify ?? 'auto',
+        relayCaCertPath: config.relayCaCertPath,
+      });
+      await relayBridge.start();
+      logger.log(
+        `[relay] enabled (workspace=${config.relayWorkspaceId}, endpoint=${config.relayEndpoint})`,
+      );
+    }
+  }
 
   process.on('SIGINT', () => {
     if (!shutdownPromise) {
