@@ -213,8 +213,11 @@ export class DaemonRelayBridge {
   private lastErrorMessage: string | undefined;
   private lastErrorAt: number | undefined;
   private state: DaemonRelayBridgeStatus['state'] = 'stopped';
+  private relayEndpoint: string;
 
-  constructor(private readonly options: DaemonRelayBridgeOptions) {}
+  constructor(private readonly options: DaemonRelayBridgeOptions) {
+    this.relayEndpoint = options.relayEndpoint;
+  }
 
   getStatus(): DaemonRelayBridgeStatus {
     return {
@@ -288,7 +291,7 @@ export class DaemonRelayBridge {
       this.daemonWs = daemonWs;
 
       const relayUrl =
-        `${this.options.relayEndpoint}?role=workspace-daemon` +
+        `${this.relayEndpoint}?role=workspace-daemon` +
         `&workspaceId=${encodeURIComponent(this.options.workspaceId)}` +
         `&token=${encodeURIComponent(issue.relayToken)}`;
 
@@ -367,8 +370,29 @@ export class DaemonRelayBridge {
     relayWs.on('message', (raw) => {
       const text = raw.toString('utf8');
       try {
-        const control = JSON.parse(text) as { type?: string; code?: string; message?: string };
+        const control = JSON.parse(text) as {
+          type?: string;
+          code?: string;
+          message?: string;
+          relayWsBaseUrl?: string;
+        };
         if (control.type === 'relay_status') {
+          if (
+            control.code === 'RELAY_REDIRECT' &&
+            typeof control.relayWsBaseUrl === 'string' &&
+            control.relayWsBaseUrl.trim().length > 0 &&
+            control.relayWsBaseUrl !== this.relayEndpoint
+          ) {
+            this.relayEndpoint = control.relayWsBaseUrl;
+            this.recordError(
+              'WEBSOCKET_ERROR',
+              `relay redirect requested: ${control.relayWsBaseUrl}`,
+            );
+            out.log(`[relay] redirecting daemon bridge to ${control.relayWsBaseUrl}`);
+            closeQuietly(relayWs);
+            closeQuietly(daemonWs);
+            return;
+          }
           out.log(
             `[relay] status ${control.code ?? 'UNKNOWN'}: ${
               control.message ?? 'no additional detail'
