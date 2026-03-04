@@ -196,13 +196,17 @@ export function registerWsServer(
       }
     }
     if (auth) {
+      const allowQueryToken = securityProfile
+        ? securityProfile.profile === 'local' ||
+          process.env['VIEWPORT_ALLOW_QUERY_TOKEN_NON_LOCAL'] === '1'
+        : true;
       const token = extractTokenFromRequest({
         authorization:
           typeof request.headers.authorization === 'string'
             ? request.headers.authorization
             : undefined,
         url: request.url,
-        allowQueryToken: true,
+        allowQueryToken,
       });
       if (!token || !(await auth.validate(token))) {
         metrics.increment('ws.connections.rejected.unauthorized');

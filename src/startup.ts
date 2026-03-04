@@ -421,16 +421,14 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
     if (missing.length > 0) {
       logger.warn(`[relay] disabled due to incomplete config: ${missing.join(', ')}`);
     } else {
-      const daemonToken = config.authEnabled ? await readDaemonAuthToken() : null;
-      const daemonWsWithToken = daemonToken
-        ? `${daemonWsUrl}?token=${encodeURIComponent(daemonToken)}`
-        : daemonWsUrl;
+      const daemonToken = securityProfile.requireAuth ? await readDaemonAuthToken() : null;
       relayBridge = new DaemonRelayBridge({
         relayEndpoint: config.relayEndpoint!,
         relayServerUrl: config.relayServerUrl!,
         workspaceId: config.relayWorkspaceId!,
         enrollToken: config.relayEnrollToken!,
-        daemonWsUrl: daemonWsWithToken!,
+        daemonWsUrl: daemonWsUrl!,
+        daemonAuthToken: daemonToken ?? undefined,
         relayTlsVerify: config.relayTlsVerify ?? 'auto',
         relayCaCertPath: config.relayCaCertPath,
       });

@@ -60,6 +60,19 @@ describe('security profile helpers', () => {
     expect(isHostAllowed('evil.test', profile)).toBe(false);
   });
 
+  it('rejects over-broad short suffix rules', () => {
+    const profile = {
+      profile: 'lan' as const,
+      host: '0.0.0.0',
+      allowedHosts: ['.com', '.example.com'],
+      requireAuth: true,
+    };
+
+    expect(isHostAllowed('api.evil.com', profile)).toBe(false);
+    expect(isHostAllowed('example.com', profile)).toBe(true);
+    expect(isHostAllowed('api.example.com', profile)).toBe(true);
+  });
+
   it('enforces origin allowlist with loopback allowance', () => {
     const profile = {
       profile: 'lan' as const,
