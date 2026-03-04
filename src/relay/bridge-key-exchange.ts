@@ -255,6 +255,8 @@ export function deriveSessionFromKeyExchange(params: {
   daemonIdentity: DaemonRelayIdentity;
   nextEpoch: number;
   pairingSecret?: Buffer;
+  daemonNonceOverride?: Buffer;
+  sessionIdOverride?: string;
 }): { session: DerivedRelaySession; response: RelayKeyExchangeResponseFrame } {
   const clientPublic = fromBase64Url(params.init.clientPublicKey);
   if (clientPublic.length !== 65 || clientPublic[0] !== 0x04) {
@@ -273,8 +275,14 @@ export function deriveSessionFromKeyExchange(params: {
     throw new Error('pairing secret required for noise-ikpsk2');
   }
 
-  const daemonNonce = crypto.randomBytes(16);
-  const sessionId = `rs_${crypto.randomBytes(12).toString('hex')}`;
+  const daemonNonce = params.daemonNonceOverride ?? crypto.randomBytes(16);
+  if (daemonNonce.length !== 16) {
+    throw new Error('invalid daemon nonce override');
+  }
+  const sessionId = params.sessionIdOverride ?? `rs_${crypto.randomBytes(12).toString('hex')}`;
+  if (sessionId.trim().length === 0) {
+    throw new Error('invalid session id override');
+  }
   const epoch = Math.max(1, params.nextEpoch);
   const ecdh = crypto.createECDH('prime256v1');
   ecdh.setPrivateKey(daemonPrivate);
