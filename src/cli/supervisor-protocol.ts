@@ -24,4 +24,9 @@ export interface RuntimeLaunchConfig {
   relayIssueToken?: string;
   relayTlsVerify?: 'auto' | '0' | '1';
   relayCaCertPath?: string;
+  relayTlsPins?: string[];
+  relayTokenIssuer?: string;
+  relayTokenAudience?: string;
+  relayTokenSigningKeys?: Record<string, string>;
+  relayTokenClockSkewSec?: number;
 }

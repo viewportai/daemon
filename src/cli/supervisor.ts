@@ -85,6 +85,27 @@ function decodeRuntimeConfig(raw: string | undefined): RuntimeLaunchConfig {
         : undefined,
     relayCaCertPath:
       typeof parsed.relayCaCertPath === 'string' ? parsed.relayCaCertPath : undefined,
+    relayTlsPins:
+      Array.isArray(parsed.relayTlsPins) &&
+      parsed.relayTlsPins.every((entry) => typeof entry === 'string')
+        ? parsed.relayTlsPins
+        : undefined,
+    relayTokenIssuer:
+      typeof parsed.relayTokenIssuer === 'string' ? parsed.relayTokenIssuer : undefined,
+    relayTokenAudience:
+      typeof parsed.relayTokenAudience === 'string' ? parsed.relayTokenAudience : undefined,
+    relayTokenSigningKeys:
+      parsed.relayTokenSigningKeys &&
+      typeof parsed.relayTokenSigningKeys === 'object' &&
+      !Array.isArray(parsed.relayTokenSigningKeys)
+        ? (parsed.relayTokenSigningKeys as Record<string, string>)
+        : undefined,
+    relayTokenClockSkewSec:
+      typeof parsed.relayTokenClockSkewSec === 'number' &&
+      Number.isInteger(parsed.relayTokenClockSkewSec) &&
+      parsed.relayTokenClockSkewSec >= 0
+        ? parsed.relayTokenClockSkewSec
+        : undefined,
   };
 }
 

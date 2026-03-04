@@ -27,13 +27,9 @@ import {
   type RelayKeyExchangeInitFrame,
 } from './bridge-key-exchange.js';
 import { BridgeError, type BridgeErrorCode } from './bridge-errors.js';
+import { type RelayTokenClaims, verifyRelayTokenClaims } from './bridge-jwt.js';
 import { closeQuietly, resolveRelayTlsOptions, wsOpen } from './bridge-network.js';
 import { logger as out } from '../core/output.js';
-
-interface RelayTokenClaims {
-  e2eeProfile?: string;
-  pairingSecret?: string;
-}
 
 interface RelayTokenResponse {
   ok: boolean;
@@ -69,6 +65,11 @@ export interface DaemonRelayBridgeOptions {
   daemonAuthToken?: string;
   relayTlsVerify?: 'auto' | '0' | '1';
   relayCaCertPath?: string;
+  relayTlsPins?: string[];
+  relayTokenIssuer?: string;
+  relayTokenAudience?: string;
+  relayTokenSigningKeys?: Record<string, string>;
+  relayTokenClockSkewSec?: number;
   maxPendingOutbound?: number;
   maxPendingOutboundBytes?: number;
 }
@@ -110,39 +111,6 @@ async function parseRelayIssueResponse(res: Response): Promise<RelayTokenRespons
   return json;
 }
 
-function decodeJwtPayloadClaims(relayToken: string): RelayTokenClaims {
-  const parts = relayToken.split('.');
-  if (parts.length !== 3) {
-    throw new BridgeError('TOKEN_RESPONSE_INVALID', 'relay token is malformed');
-  }
-  const payloadPart = parts[1] ?? '';
-  if (!payloadPart) {
-    throw new BridgeError('TOKEN_RESPONSE_INVALID', 'relay token payload is missing');
-  }
-  let payloadText = '';
-  try {
-    payloadText = Buffer.from(payloadPart, 'base64url').toString('utf8');
-  } catch (error) {
-    throw new BridgeError(
-      'TOKEN_RESPONSE_INVALID',
-      `relay token payload decode failed: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  let payload: unknown;
-  try {
-    payload = JSON.parse(payloadText);
-  } catch (error) {
-    throw new BridgeError(
-      'TOKEN_RESPONSE_INVALID',
-      `relay token payload JSON invalid: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new BridgeError('TOKEN_RESPONSE_INVALID', 'relay token payload is not an object');
-  }
-  return payload as RelayTokenClaims;
-}
-
 function isRelayControlFrame(value: unknown): value is RelayControlFrame {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const frame = value as Record<string, unknown>;
@@ -175,6 +143,7 @@ export class DaemonRelayBridge {
   private daemonIssueToken: string | null;
   private requiredProfile: RelayHandshakeProfile = 'noise-ik';
   private pairingSecret: Buffer | undefined;
+  private readonly relayTokenSigningKeys: Record<string, string>;
   private readonly relaySessions = new Map<string, RelaySessionState>();
   private consecutiveIssueFailures = 0;
   private circuitOpenUntilMs = 0;
@@ -187,6 +156,12 @@ export class DaemonRelayBridge {
   constructor(private readonly options: DaemonRelayBridgeOptions) {
     this.relayEndpoint = options.relayEndpoint;
     this.daemonIssueToken = options.issueToken ?? null;
+    this.relayTokenSigningKeys =
+      options.relayTokenSigningKeys && Object.keys(options.relayTokenSigningKeys).length > 0
+        ? options.relayTokenSigningKeys
+        : {
+            v1: 'viewport-poc-signing-key-change-me',
+          };
   }
 
   getStatus(): DaemonRelayBridgeStatus {
@@ -335,6 +310,7 @@ export class DaemonRelayBridge {
         relayUrl,
         this.options.relayTlsVerify ?? 'auto',
         this.options.relayCaCertPath,
+        this.options.relayTlsPins,
       );
       const relayWs = new WebSocket(relayUrl, relayTlsOptions);
       await wsOpen(relayWs);
@@ -558,6 +534,22 @@ export class DaemonRelayBridge {
       return true;
     }
 
+    if (parsed.type === 'relay_key_update_required') {
+      const session = this.relaySessions.get(parsed.sessionId);
+      if (!session) {
+        out.warn(`[relay] key update request ignored for unknown session ${parsed.sessionId}`);
+        return true;
+      }
+      if (!Number.isInteger(parsed.nextEpoch) || parsed.nextEpoch !== session.epoch + 1) {
+        out.warn(
+          `[relay] key update request rejected for session ${parsed.sessionId}: invalid nextEpoch=${parsed.nextEpoch} expected=${session.epoch + 1}`,
+        );
+        return true;
+      }
+      session.keyRotationRequested = true;
+      return true;
+    }
+
     return true;
   }
 
@@ -574,10 +566,30 @@ export class DaemonRelayBridge {
       return;
     }
 
-    const previous = init.previousSessionId
-      ? this.relaySessions.get(init.previousSessionId)
-      : undefined;
-    const nextEpoch = previous && previous.profile === init.profile ? previous.epoch + 1 : 1;
+    let previous: RelaySessionState | undefined;
+    let nextEpoch = 1;
+    if (init.previousSessionId) {
+      previous = this.relaySessions.get(init.previousSessionId);
+      if (!previous) {
+        out.warn(
+          `[relay] key exchange rejected: unknown previous session ${init.previousSessionId}`,
+        );
+        return;
+      }
+      if (previous.profile !== init.profile) {
+        out.warn(
+          `[relay] key exchange rejected: profile mismatch for previous session ${init.previousSessionId}`,
+        );
+        return;
+      }
+      if (!previous.keyRotationRequested) {
+        out.warn(
+          `[relay] key exchange rejected: previous session ${init.previousSessionId} has no pending key rotation`,
+        );
+        return;
+      }
+      nextEpoch = previous.epoch + 1;
+    }
 
     try {
       const derived = deriveSessionFromKeyExchange({
@@ -586,7 +598,7 @@ export class DaemonRelayBridge {
         nextEpoch,
         pairingSecret: this.requiredProfile === 'noise-ikpsk2' ? this.pairingSecret : undefined,
       });
-      if (init.previousSessionId) {
+      if (previous && init.previousSessionId) {
         this.relaySessions.delete(init.previousSessionId);
       }
       this.relaySessions.set(derived.session.sessionId, {
@@ -656,7 +668,12 @@ export class DaemonRelayBridge {
       throw new BridgeError('TOKEN_ISSUE_FAILED', `issue relay token failed: ${reason}`);
     }
 
-    const tokenClaims = decodeJwtPayloadClaims(parsed.relayToken);
+    const tokenClaims = verifyRelayTokenClaims(parsed.relayToken, {
+      issuer: this.options.relayTokenIssuer ?? 'viewport-server-poc',
+      audience: this.options.relayTokenAudience ?? 'viewport-relay',
+      signingKeys: this.relayTokenSigningKeys,
+      clockSkewSec: this.options.relayTokenClockSkewSec ?? 30,
+    });
     const profile = parseRelayHandshakeProfile(tokenClaims.e2eeProfile ?? 'noise-ik');
     if (!profile) {
       throw new BridgeError('TOKEN_RESPONSE_INVALID', 'missing/invalid e2eeProfile claim');

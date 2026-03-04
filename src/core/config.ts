@@ -107,6 +107,11 @@ export interface ViewportConfig {
       issueToken?: string;
       tlsVerify?: 'auto' | '0' | '1';
       caCertPath?: string;
+      tlsPins?: string[];
+      tokenIssuer?: string;
+      tokenAudience?: string;
+      signingKeys?: Record<string, string>;
+      tokenClockSkewSec?: number;
     };
   };
 }
@@ -295,6 +300,11 @@ export class ConfigManager {
           issueToken?: string;
           tlsVerify?: 'auto' | '0' | '1';
           caCertPath?: string;
+          tlsPins?: string[];
+          tokenIssuer?: string;
+          tokenAudience?: string;
+          signingKeys?: Record<string, string>;
+          tokenClockSkewSec?: number;
         };
       }
     | undefined {

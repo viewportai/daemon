@@ -66,6 +66,51 @@ function parseRelayTlsVerify(value: string | undefined): 'auto' | '0' | '1' | un
   throw new Error(`Invalid relay tls verify value: ${value}. Expected auto|0|1.`);
 }
 
+function parseCsvList(value: string | undefined): string[] | undefined {
+  if (!value) return undefined;
+  const entries = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return entries.length > 0 ? entries : undefined;
+}
+
+function parsePositiveInt(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`Invalid non-negative integer value: ${value}`);
+  }
+  return parsed;
+}
+
+function parseSigningKeys(value: string | undefined): Record<string, string> | undefined {
+  if (!value) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (error) {
+    throw new Error(
+      `Invalid relay token signing keys JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Invalid relay token signing keys JSON: expected object');
+  }
+  const result: Record<string, string> = {};
+  for (const [kid, key] of Object.entries(parsed)) {
+    if (typeof kid !== 'string' || typeof key !== 'string') continue;
+    const normalizedKid = kid.trim();
+    const normalizedKey = key.trim();
+    if (!normalizedKid || !normalizedKey) continue;
+    result[normalizedKid] = normalizedKey;
+  }
+  if (Object.keys(result).length === 0) {
+    throw new Error('Invalid relay token signing keys JSON: no non-empty keys found');
+  }
+  return result;
+}
+
 function envValue(...keys: string[]): string | undefined {
   for (const key of keys) {
     const value = process.env[key];
@@ -189,6 +234,30 @@ export async function resolveDaemonSettingsFromSources(): Promise<DaemonResolved
     getFlag('relay-ca-cert') ??
     envValue('VPD_RELAY_CA_CERT', 'VIEWPORT_RELAY_CA_CERT') ??
     daemonConfig?.relay?.caCertPath;
+  const relayTlsPins =
+    parseCsvList(getFlag('relay-tls-pins')) ??
+    parseCsvList(envValue('VPD_RELAY_TLS_PINS', 'VIEWPORT_RELAY_TLS_PINS')) ??
+    daemonConfig?.relay?.tlsPins;
+  const relayTokenIssuer =
+    getFlag('relay-token-issuer') ??
+    envValue('VPD_RELAY_TOKEN_ISSUER', 'VIEWPORT_RELAY_TOKEN_ISSUER') ??
+    daemonConfig?.relay?.tokenIssuer;
+  const relayTokenAudience =
+    getFlag('relay-token-audience') ??
+    envValue('VPD_RELAY_TOKEN_AUDIENCE', 'VIEWPORT_RELAY_TOKEN_AUDIENCE') ??
+    daemonConfig?.relay?.tokenAudience;
+  const relayTokenSigningKeys =
+    parseSigningKeys(getFlag('relay-token-signing-keys-json')) ??
+    parseSigningKeys(
+      envValue('VPD_RELAY_TOKEN_SIGNING_KEYS_JSON', 'VIEWPORT_RELAY_TOKEN_SIGNING_KEYS_JSON'),
+    ) ??
+    daemonConfig?.relay?.signingKeys;
+  const relayTokenClockSkewSec =
+    parsePositiveInt(getFlag('relay-token-clock-skew-sec')) ??
+    parsePositiveInt(
+      envValue('VPD_RELAY_TOKEN_CLOCK_SKEW_SEC', 'VIEWPORT_RELAY_TOKEN_CLOCK_SKEW_SEC'),
+    ) ??
+    daemonConfig?.relay?.tokenClockSkewSec;
 
   const launch: RuntimeLaunchConfig = {
     listen: listenTarget.listen,
@@ -210,6 +279,11 @@ export async function resolveDaemonSettingsFromSources(): Promise<DaemonResolved
     relayIssueToken,
     relayTlsVerify,
     relayCaCertPath,
+    relayTlsPins,
+    relayTokenIssuer,
+    relayTokenAudience,
+    relayTokenSigningKeys,
+    relayTokenClockSkewSec,
   };
 
   return {

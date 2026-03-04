@@ -367,6 +367,11 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
         daemonAuthToken: daemonToken ?? undefined,
         relayTlsVerify: config.relayTlsVerify ?? 'auto',
         relayCaCertPath: config.relayCaCertPath,
+        relayTlsPins: config.relayTlsPins,
+        relayTokenIssuer: config.relayTokenIssuer,
+        relayTokenAudience: config.relayTokenAudience,
+        relayTokenSigningKeys: config.relayTokenSigningKeys,
+        relayTokenClockSkewSec: config.relayTokenClockSkewSec,
       });
       await relayBridge.start();
       logger.log(

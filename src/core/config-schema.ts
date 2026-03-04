@@ -68,6 +68,11 @@ export const ViewportConfigSchema = z
             issueToken: z.string().optional(),
             tlsVerify: z.enum(['auto', '0', '1']).optional(),
             caCertPath: z.string().optional(),
+            tlsPins: z.array(z.string()).optional(),
+            tokenIssuer: z.string().optional(),
+            tokenAudience: z.string().optional(),
+            signingKeys: z.record(z.string(), z.string()).optional(),
+            tokenClockSkewSec: z.number().int().nonnegative().optional(),
           })
           .strict()
           .optional(),

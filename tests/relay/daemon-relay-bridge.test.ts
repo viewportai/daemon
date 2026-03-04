@@ -118,10 +118,25 @@ function deriveClientInitProof(params: {
   );
 }
 
-function makeUnsignedJwt(payload: Record<string, unknown>): string {
-  const header = toBase64Url(Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' }), 'utf8'));
+function makeRelayJwt(
+  payload: Record<string, unknown>,
+  options?: { kid?: string; key?: string; tamperPayloadAfterSign?: Record<string, unknown> },
+): string {
+  const kid = options?.kid ?? 'v1';
+  const key = options?.key ?? 'viewport-poc-signing-key-change-me';
+  const header = toBase64Url(
+    Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT', kid }), 'utf8'),
+  );
   const body = toBase64Url(Buffer.from(JSON.stringify(payload), 'utf8'));
-  return `${header}.${body}.signature`;
+  const signingInput = `${header}.${body}`;
+  const signature = toBase64Url(crypto.createHmac('sha256', key).update(signingInput).digest());
+  if (!options?.tamperPayloadAfterSign) {
+    return `${signingInput}.${signature}`;
+  }
+  const tamperedBody = toBase64Url(
+    Buffer.from(JSON.stringify(options.tamperPayloadAfterSign), 'utf8'),
+  );
+  return `${header}.${tamperedBody}.${signature}`;
 }
 
 describe('daemon relay bridge helpers', () => {
@@ -234,10 +249,15 @@ describe('daemon relay bridge helpers', () => {
       new Response(
         JSON.stringify({
           ok: true,
-          relayToken: makeUnsignedJwt({
+          relayToken: makeRelayJwt({
             role: 'workspace-daemon',
             workspaceId: 'workspace_demo',
             e2eeProfile: 'noise-ik',
+            iss: 'viewport-server-poc',
+            aud: 'viewport-relay',
+            exp: Math.floor(Date.now() / 1000) + 120,
+            iat: Math.floor(Date.now() / 1000) - 5,
+            jti: 'jti-1',
           }),
           claims: {
             e2eeProfile: 'noise-ik',
@@ -266,11 +286,16 @@ describe('daemon relay bridge helpers', () => {
     });
 
     const pairingSecret = toBase64Url(crypto.randomBytes(32));
-    const relayToken = makeUnsignedJwt({
+    const relayToken = makeRelayJwt({
       role: 'workspace-daemon',
       workspaceId: 'workspace_demo',
       e2eeProfile: 'noise-ikpsk2',
       pairingSecret,
+      iss: 'viewport-server-poc',
+      aud: 'viewport-relay',
+      exp: Math.floor(Date.now() / 1000) + 120,
+      iat: Math.floor(Date.now() / 1000) - 5,
+      jti: 'jti-2',
     });
 
     global.fetch = vi.fn().mockResolvedValue(
@@ -290,6 +315,92 @@ describe('daemon relay bridge helpers', () => {
     const issued = await (bridge as any).issueRelayToken();
     expect(issued.profile).toBe('noise-ikpsk2');
     expect(toBase64Url(issued.pairingSecret)).toBe(pairingSecret);
+  });
+
+  it('issueRelayToken rejects relay tokens with invalid signature', async () => {
+    const bridge = new DaemonRelayBridge({
+      relayEndpoint: 'ws://127.0.0.1:7781/ws',
+      relayServerUrl: 'http://127.0.0.1:7780',
+      workspaceId: 'workspace_demo',
+      enrollToken: 'enroll-token-not-for-issue',
+      issueToken: 'daemon-issue-token',
+      daemonWsUrl: 'ws://127.0.0.1:7070/ws',
+      relayTokenSigningKeys: {
+        v1: 'expected-signing-key',
+      },
+      relayTokenIssuer: 'viewport-server-poc',
+      relayTokenAudience: 'viewport-relay',
+    });
+
+    const validPayload = {
+      role: 'workspace-daemon',
+      workspaceId: 'workspace_demo',
+      e2eeProfile: 'noise-ik',
+      iss: 'viewport-server-poc',
+      aud: 'viewport-relay',
+      exp: Math.floor(Date.now() / 1000) + 120,
+      iat: Math.floor(Date.now() / 1000) - 5,
+      jti: 'jti-invalid-signature',
+    };
+
+    const tamperedToken = makeRelayJwt(validPayload, {
+      key: 'expected-signing-key',
+      tamperPayloadAfterSign: { ...validPayload, e2eeProfile: 'noise-ikpsk2' },
+    });
+
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: true,
+          relayToken: tamperedToken,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    ) as typeof fetch;
+
+    await expect((bridge as any).issueRelayToken()).rejects.toThrow('signature');
+  });
+
+  it('issueRelayToken rejects relay tokens with wrong issuer', async () => {
+    const bridge = new DaemonRelayBridge({
+      relayEndpoint: 'ws://127.0.0.1:7781/ws',
+      relayServerUrl: 'http://127.0.0.1:7780',
+      workspaceId: 'workspace_demo',
+      enrollToken: 'enroll-token-not-for-issue',
+      issueToken: 'daemon-issue-token',
+      daemonWsUrl: 'ws://127.0.0.1:7070/ws',
+      relayTokenSigningKeys: {
+        v1: 'expected-signing-key',
+      },
+      relayTokenIssuer: 'viewport-server-poc',
+      relayTokenAudience: 'viewport-relay',
+    });
+
+    const relayToken = makeRelayJwt(
+      {
+        role: 'workspace-daemon',
+        workspaceId: 'workspace_demo',
+        e2eeProfile: 'noise-ik',
+        iss: 'other-issuer',
+        aud: 'viewport-relay',
+        exp: Math.floor(Date.now() / 1000) + 120,
+        iat: Math.floor(Date.now() / 1000) - 5,
+        jti: 'jti-wrong-issuer',
+      },
+      { key: 'expected-signing-key' },
+    );
+
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: true,
+          relayToken,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    ) as typeof fetch;
+
+    await expect((bridge as any).issueRelayToken()).rejects.toThrow('issuer');
   });
 
   it('deriveSessionFromKeyExchange returns proof verifiable by client for noise-ik', () => {
@@ -463,6 +574,110 @@ describe('daemon relay bridge helpers', () => {
     expect((bridge as any).acceptInboundSeq(session, 1)).toBe(true);
     expect((bridge as any).acceptInboundSeq(session, 1)).toBe(false);
     expect((bridge as any).acceptInboundSeq(session, RELAY_REPLAY_WINDOW + 10)).toBe(false);
+  });
+
+  it('rejects key exchange rekey requests for unknown previous session ids', () => {
+    const bridge = new DaemonRelayBridge({
+      relayEndpoint: 'ws://127.0.0.1:7781/ws',
+      relayServerUrl: 'http://127.0.0.1:7780',
+      workspaceId: 'workspace_demo',
+      enrollToken: 'enroll-token',
+      daemonWsUrl: 'ws://127.0.0.1:7070/ws',
+    });
+    const daemon = crypto.createECDH('prime256v1');
+    const daemonPublic = daemon.generateKeys();
+    const daemonPrivate = daemon.getPrivateKey();
+    (bridge as any).daemonIdentity = {
+      algorithm: 'p256',
+      publicKey: toBase64Url(daemonPublic),
+      privateKey: toBase64Url(daemonPrivate),
+    };
+    (bridge as any).requiredProfile = 'noise-ik';
+
+    const client = crypto.createECDH('prime256v1');
+    const clientPublic = client.generateKeys();
+    const clientPrivate = client.getPrivateKey();
+    const requestId = 'kex-unknown-previous';
+    const clientNonce = toBase64Url(crypto.randomBytes(16));
+    const clientPublicKey = toBase64Url(clientPublic);
+
+    const init = parseRelayKeyExchangeInitFrame({
+      type: 'relay_key_exchange_init',
+      version: 2,
+      profile: 'noise-ik',
+      requestId,
+      clientPublicKey,
+      clientNonce,
+      previousSessionId: 'missing-session-id',
+      clientProof: deriveClientInitProof({
+        daemonPublicKey: toBase64Url(daemonPublic),
+        clientPrivateKey: clientPrivate,
+        profile: 'noise-ik',
+        requestId,
+        clientPublicKey,
+        clientNonce,
+        previousSessionId: 'missing-session-id',
+      }),
+    });
+    expect(init).toBeTruthy();
+
+    const relayWs = {
+      readyState: 1,
+      send: vi.fn(),
+    };
+    (bridge as any).handleKeyExchangeInit(init!, relayWs);
+    expect((bridge as any).relaySessions.size).toBe(0);
+    expect(relayWs.send).not.toHaveBeenCalled();
+  });
+
+  it('validates relay_key_update_required epoch transitions before enabling rekey', () => {
+    const bridge = new DaemonRelayBridge({
+      relayEndpoint: 'ws://127.0.0.1:7781/ws',
+      relayServerUrl: 'http://127.0.0.1:7780',
+      workspaceId: 'workspace_demo',
+      enrollToken: 'enroll-token',
+      daemonWsUrl: 'ws://127.0.0.1:7070/ws',
+    });
+
+    (bridge as any).relaySessions.set('session-1', {
+      key: Buffer.alloc(32, 9),
+      profile: 'noise-ik',
+      sessionId: 'session-1',
+      epoch: 2,
+      txSeq: 10,
+      rxHighestSeq: 10,
+      rxSeenSeq: new Set<number>(),
+      lastActivityAt: Date.now(),
+      keyRotationRequested: false,
+    });
+
+    const handledInvalid = (bridge as any).handleRelayControlFrame(
+      JSON.stringify({
+        type: 'relay_key_update_required',
+        sessionId: 'session-1',
+        nextEpoch: 4,
+        reason: 'message_threshold',
+      }),
+      { readyState: 1, close: vi.fn() },
+      { readyState: 1, close: vi.fn() },
+    );
+
+    expect(handledInvalid).toBe(true);
+    expect((bridge as any).relaySessions.get('session-1')?.keyRotationRequested).toBe(false);
+
+    const handledValid = (bridge as any).handleRelayControlFrame(
+      JSON.stringify({
+        type: 'relay_key_update_required',
+        sessionId: 'session-1',
+        nextEpoch: 3,
+        reason: 'message_threshold',
+      }),
+      { readyState: 1, close: vi.fn() },
+      { readyState: 1, close: vi.fn() },
+    );
+
+    expect(handledValid).toBe(true);
+    expect((bridge as any).relaySessions.get('session-1')?.keyRotationRequested).toBe(true);
   });
 
   it('bounds pending outbound queue by bytes as well as message count', () => {
