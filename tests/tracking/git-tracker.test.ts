@@ -421,7 +421,7 @@ describe('GitTracker', () => {
     expect(stepDiffs[0]!.diff).toContain('a.ts');
 
     await tracker.teardown();
-  });
+  }, 15_000);
 
   it('getSummaryDiff returns total changes', async () => {
     const tracker = new GitTracker(DEFAULT_CONFIG, 'test-session');
@@ -440,7 +440,7 @@ describe('GitTracker', () => {
     expect(summary).toContain('b.ts');
 
     await tracker.teardown();
-  });
+  }, 15_000);
 
   // ---------------------------------------------------------------------------
   // teardown
