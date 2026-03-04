@@ -272,10 +272,14 @@ describe('HTTP security and lifecycle routes', () => {
     expect(authorized.statusCode).toBe(200);
   });
 
-  it('exposes lifecycle endpoints and invokes shutdown/restart handlers', async () => {
+  it('requires auth for lifecycle endpoints and invokes handlers when authorized', async () => {
     let shutdownCalled = 0;
     let restartCalled = 0;
     await setup({
+      auth: {
+        validate: async (token: string) => token === 'good-token',
+        getDisplayToken: () => null,
+      },
       onLifecycleShutdown: async () => {
         shutdownCalled += 1;
       },
@@ -284,9 +288,18 @@ describe('HTTP security and lifecycle routes', () => {
       },
     });
 
+    const unauthorized = await app!.inject({
+      method: 'POST',
+      url: '/api/lifecycle/shutdown',
+    });
+    expect(unauthorized.statusCode).toBe(401);
+
     const shutdownRes = await app!.inject({
       method: 'POST',
       url: '/api/lifecycle/shutdown',
+      headers: {
+        authorization: 'Bearer good-token',
+      },
     });
     expect(shutdownRes.statusCode).toBe(200);
     expect(JSON.parse(shutdownRes.payload).status).toBe('shutdown_requested');
@@ -294,6 +307,9 @@ describe('HTTP security and lifecycle routes', () => {
     const restartRes = await app!.inject({
       method: 'POST',
       url: '/api/lifecycle/restart',
+      headers: {
+        authorization: 'Bearer good-token',
+      },
     });
     expect(restartRes.statusCode).toBe(200);
     expect(JSON.parse(restartRes.payload).status).toBe('restart_requested');

@@ -125,6 +125,18 @@ export function registerHttpRoutes(
 
     if (url === '/health') return;
     if (!url.startsWith('/api/')) return;
+    const isLifecycleUrl = url === '/api/lifecycle/shutdown' || url === '/api/lifecycle/restart';
+
+    if (isLifecycleUrl) {
+      if (!auth) {
+        return reply.status(401).send({ error: 'Unauthorized' });
+      }
+      const token = extractBearerToken(request.headers.authorization);
+      if (!token || !(await auth.validate(token))) {
+        return reply.status(401).send({ error: 'Unauthorized' });
+      }
+      return;
+    }
 
     if (url === '/api/hook' && isHookAuthBypassAllowed(securityProfile)) {
       return;

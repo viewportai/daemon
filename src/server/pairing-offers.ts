@@ -688,9 +688,11 @@ function hashSecret(secret: string): string {
 function secureSecretCompare(a: string, b: string): boolean {
   const left = Buffer.from(a, 'utf-8');
   const right = Buffer.from(b, 'utf-8');
-  if (left.length !== right.length) {
-    crypto.timingSafeEqual(left, left);
-    return false;
-  }
-  return crypto.timingSafeEqual(left, right);
+  const compareLength = Math.max(left.length, right.length, 1);
+  const paddedLeft = Buffer.alloc(compareLength);
+  const paddedRight = Buffer.alloc(compareLength);
+  left.copy(paddedLeft);
+  right.copy(paddedRight);
+  const equal = crypto.timingSafeEqual(paddedLeft, paddedRight);
+  return equal && left.length === right.length;
 }

@@ -196,10 +196,7 @@ export function registerWsServer(
       }
     }
     if (auth) {
-      const allowQueryToken = securityProfile
-        ? securityProfile.profile === 'local' ||
-          process.env['VIEWPORT_ALLOW_QUERY_TOKEN_NON_LOCAL'] === '1'
-        : true;
+      const allowQueryToken = securityProfile ? securityProfile.profile === 'local' : true;
       const token = extractTokenFromRequest({
         authorization:
           typeof request.headers.authorization === 'string'
