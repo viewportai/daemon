@@ -94,6 +94,8 @@ function decodeRuntimeConfig(raw: string | undefined): RuntimeLaunchConfig {
       typeof parsed.relayTokenIssuer === 'string' ? parsed.relayTokenIssuer : undefined,
     relayTokenAudience:
       typeof parsed.relayTokenAudience === 'string' ? parsed.relayTokenAudience : undefined,
+    relayTokenJwksUrl:
+      typeof parsed.relayTokenJwksUrl === 'string' ? parsed.relayTokenJwksUrl : undefined,
     relayTokenSigningKeys:
       parsed.relayTokenSigningKeys &&
       typeof parsed.relayTokenSigningKeys === 'object' &&

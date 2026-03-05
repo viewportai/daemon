@@ -71,6 +71,7 @@ export const ViewportConfigSchema = z
             tlsPins: z.array(z.string()).optional(),
             tokenIssuer: z.string().optional(),
             tokenAudience: z.string().optional(),
+            tokenJwksUrl: z.string().optional(),
             signingKeys: z.record(z.string(), z.string()).optional(),
             tokenClockSkewSec: z.number().int().nonnegative().optional(),
           })

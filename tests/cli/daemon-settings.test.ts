@@ -23,6 +23,7 @@ describe('daemon settings resolution', () => {
     delete process.env['VPD_RELAY_ENROLL_TOKEN'];
     delete process.env['VPD_RELAY_TLS_VERIFY'];
     delete process.env['VPD_RELAY_CA_CERT'];
+    delete process.env['VPD_RELAY_TOKEN_JWKS_URL'];
   });
 
   afterEach(async () => {
@@ -40,6 +41,7 @@ describe('daemon settings resolution', () => {
     delete process.env['VPD_RELAY_ENROLL_TOKEN'];
     delete process.env['VPD_RELAY_TLS_VERIFY'];
     delete process.env['VPD_RELAY_CA_CERT'];
+    delete process.env['VPD_RELAY_TOKEN_JWKS_URL'];
     await fs.rm(homeDir, { recursive: true, force: true });
     vi.resetModules();
   });
@@ -191,5 +193,8 @@ describe('daemon settings resolution', () => {
     expect(resolved.launch.relayEnrollToken).toBe('cli-token');
     expect(resolved.launch.relayTlsVerify).toBe('auto');
     expect(resolved.launch.relayCaCertPath).toBe('/cli/ca.pem');
+    expect(resolved.launch.relayTokenJwksUrl).toBe(
+      'https://cli-server.test/api/.well-known/jwks.json',
+    );
   });
 });

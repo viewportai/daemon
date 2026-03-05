@@ -139,6 +139,41 @@ function makeRelayJwt(
   return `${header}.${tamperedBody}.${signature}`;
 }
 
+function makeRelayJwtRs256(
+  payload: Record<string, unknown>,
+  options: {
+    privateKeyPem: string;
+    kid?: string;
+    tamperPayloadAfterSign?: Record<string, unknown>;
+  },
+): string {
+  const kid = options.kid ?? 'v1';
+  const header = toBase64Url(
+    Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid }), 'utf8'),
+  );
+  const body = toBase64Url(Buffer.from(JSON.stringify(payload), 'utf8'));
+  const signingInput = `${header}.${body}`;
+  const signature = toBase64Url(
+    crypto.sign('RSA-SHA256', Buffer.from(signingInput, 'utf8'), options.privateKeyPem),
+  );
+  if (!options.tamperPayloadAfterSign) {
+    return `${signingInput}.${signature}`;
+  }
+  const tamperedBody = toBase64Url(
+    Buffer.from(JSON.stringify(options.tamperPayloadAfterSign), 'utf8'),
+  );
+  return `${header}.${tamperedBody}.${signature}`;
+}
+
+function rsaPublicJwkFromPrivatePem(privateKeyPem: string): { n: string; e: string } {
+  const publicKey = crypto.createPublicKey(privateKeyPem);
+  const exported = publicKey.export({ format: 'jwk' }) as { n?: string; e?: string };
+  if (!exported?.n || !exported?.e) {
+    throw new Error('failed to export RSA JWK');
+  }
+  return { n: exported.n, e: exported.e };
+}
+
 describe('daemon relay bridge helpers', () => {
   const originalFetch = global.fetch;
 
@@ -401,6 +436,70 @@ describe('daemon relay bridge helpers', () => {
     ) as typeof fetch;
 
     await expect((bridge as any).issueRelayToken()).rejects.toThrow('issuer');
+  });
+
+  it('issueRelayToken validates RS256 relay token signatures using JWKS', async () => {
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const privateKeyPem = privateKey.export({ format: 'pem', type: 'pkcs1' }).toString();
+    const jwk = rsaPublicJwkFromPrivatePem(privateKeyPem);
+
+    const bridge = new DaemonRelayBridge({
+      relayEndpoint: 'ws://127.0.0.1:7781/ws',
+      relayServerUrl: 'http://127.0.0.1:7780',
+      workspaceId: 'workspace_demo',
+      enrollToken: 'enroll-token-not-for-issue',
+      issueToken: 'daemon-issue-token',
+      daemonWsUrl: 'ws://127.0.0.1:7070/ws',
+      relayTokenIssuer: 'viewport-server-poc',
+      relayTokenAudience: 'viewport-relay',
+      relayTokenJwksUrl: 'https://server.test/api/.well-known/jwks.json',
+    });
+
+    const relayToken = makeRelayJwtRs256(
+      {
+        role: 'workspace-daemon',
+        workspaceId: 'workspace_demo',
+        e2eeProfile: 'noise-ik',
+        iss: 'viewport-server-poc',
+        aud: 'viewport-relay',
+        exp: Math.floor(Date.now() / 1000) + 120,
+        iat: Math.floor(Date.now() / 1000) - 5,
+        jti: 'jti-rs256',
+      },
+      { privateKeyPem, kid: 'v1' },
+    );
+
+    global.fetch = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            ok: true,
+            relayToken,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            keys: [
+              {
+                kty: 'RSA',
+                kid: 'v1',
+                alg: 'RS256',
+                n: jwk.n,
+                e: jwk.e,
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      ) as typeof fetch;
+
+    const issued = await (bridge as any).issueRelayToken();
+    expect(issued.profile).toBe('noise-ik');
+    expect((global.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
   });
 
   it('deriveSessionFromKeyExchange returns proof verifiable by client for noise-ik', () => {

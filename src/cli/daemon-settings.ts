@@ -246,6 +246,13 @@ export async function resolveDaemonSettingsFromSources(): Promise<DaemonResolved
     getFlag('relay-token-audience') ??
     envValue('VPD_RELAY_TOKEN_AUDIENCE', 'VIEWPORT_RELAY_TOKEN_AUDIENCE') ??
     daemonConfig?.relay?.tokenAudience;
+  const relayTokenJwksUrl =
+    getFlag('relay-token-jwks-url') ??
+    envValue('VPD_RELAY_TOKEN_JWKS_URL', 'VIEWPORT_RELAY_TOKEN_JWKS_URL') ??
+    daemonConfig?.relay?.tokenJwksUrl ??
+    (relayServerUrl
+      ? `${relayServerUrl.replace(/\/+$/, '')}/api/.well-known/jwks.json`
+      : undefined);
   const relayTokenSigningKeys =
     parseSigningKeys(getFlag('relay-token-signing-keys-json')) ??
     parseSigningKeys(
@@ -282,6 +289,7 @@ export async function resolveDaemonSettingsFromSources(): Promise<DaemonResolved
     relayTlsPins,
     relayTokenIssuer,
     relayTokenAudience,
+    relayTokenJwksUrl,
     relayTokenSigningKeys,
     relayTokenClockSkewSec,
   };

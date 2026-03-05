@@ -27,6 +27,7 @@ export interface RuntimeLaunchConfig {
   relayTlsPins?: string[];
   relayTokenIssuer?: string;
   relayTokenAudience?: string;
+  relayTokenJwksUrl?: string;
   relayTokenSigningKeys?: Record<string, string>;
   relayTokenClockSkewSec?: number;
 }

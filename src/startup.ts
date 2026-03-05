@@ -48,6 +48,7 @@ import { loadAgents, autoRegisterDirectories, decodeAutoRegisterEntry } from './
 import { startDiscoveryWatchers } from './startup-watchers.js';
 import { maybeOfferAgentPrerequisites } from './startup-prereqs.js';
 import { setupSessionPersistence } from './startup-session-persistence.js';
+import { validateRelayRuntimeSecurity } from './startup-relay-security.js';
 import { DaemonRelayBridge } from './relay/daemon-relay-bridge.js';
 import { configDir } from './core/config.js';
 
@@ -349,6 +350,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
   logger.log(`  Agents:    ${registry.getIds().join(', ') || 'none'}`);
 
   if (config.relayEnabled) {
+    validateRelayRuntimeSecurity(config);
     const missing: string[] = [];
     if (!config.relayEndpoint) missing.push('relay endpoint');
     if (!config.relayServerUrl) missing.push('relay server URL');
@@ -378,6 +380,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
         relayTlsPins: config.relayTlsPins,
         relayTokenIssuer: config.relayTokenIssuer,
         relayTokenAudience: config.relayTokenAudience,
+        relayTokenJwksUrl: config.relayTokenJwksUrl,
         relayTokenSigningKeys: config.relayTokenSigningKeys,
         relayTokenClockSkewSec: config.relayTokenClockSkewSec,
         keyRotateAfterMessages: parsePositiveIntEnv('VIEWPORT_RELAY_KEY_ROTATE_AFTER_MESSAGES'),

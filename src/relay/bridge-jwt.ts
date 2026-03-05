@@ -113,7 +113,7 @@ export function verifyRelayTokenClaims(
   if (!header || typeof header !== 'object' || Array.isArray(header)) {
     throw new BridgeError('TOKEN_RESPONSE_INVALID', 'relay token header is invalid');
   }
-  if (header.alg !== 'HS256') {
+  if (header.alg !== 'HS256' && header.alg !== 'RS256') {
     throw new BridgeError(
       'TOKEN_RESPONSE_INVALID',
       `unsupported relay token alg: ${String(header.alg)}`,
@@ -126,11 +126,32 @@ export function verifyRelayTokenClaims(
     throw new BridgeError('TOKEN_RESPONSE_INVALID', `relay token key id ${kid} is not trusted`);
   }
 
-  const expectedSignature = Buffer.from(
-    crypto.createHmac('sha256', signingKey).update(`${headerPart}.${payloadPart}`).digest(),
-  ).toString('base64url');
-  if (!secureCompare(expectedSignature, signaturePart)) {
-    throw new BridgeError('TOKEN_RESPONSE_INVALID', 'relay token signature invalid');
+  if (header.alg === 'HS256') {
+    const expectedSignature = Buffer.from(
+      crypto.createHmac('sha256', signingKey).update(`${headerPart}.${payloadPart}`).digest(),
+    ).toString('base64url');
+    if (!secureCompare(expectedSignature, signaturePart)) {
+      throw new BridgeError('TOKEN_RESPONSE_INVALID', 'relay token signature invalid');
+    }
+  } else {
+    let signatureRaw: Buffer;
+    try {
+      signatureRaw = Buffer.from(signaturePart, 'base64url');
+    } catch (error) {
+      throw new BridgeError(
+        'TOKEN_RESPONSE_INVALID',
+        `relay token signature decode failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const valid = crypto.verify(
+      'RSA-SHA256',
+      Buffer.from(`${headerPart}.${payloadPart}`, 'utf8'),
+      signingKey,
+      signatureRaw,
+    );
+    if (!valid) {
+      throw new BridgeError('TOKEN_RESPONSE_INVALID', 'relay token signature invalid');
+    }
   }
 
   const payload = parseBase64UrlJson<Record<string, unknown>>(payloadPart, 'payload');

@@ -110,6 +110,7 @@ export interface ViewportConfig {
       tlsPins?: string[];
       tokenIssuer?: string;
       tokenAudience?: string;
+      tokenJwksUrl?: string;
       signingKeys?: Record<string, string>;
       tokenClockSkewSec?: number;
     };
