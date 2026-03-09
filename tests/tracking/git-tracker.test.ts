@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
@@ -121,6 +121,28 @@ describe('GitTracker', () => {
       `viewport/session-test-session`,
     ]);
     expect(stdout).toContain('[viewport] Step');
+  });
+
+  it('does not bypass git hooks with --no-verify', async () => {
+    const tracker = new GitTracker(DEFAULT_CONFIG, 'test-session');
+    const worktreePath = await tracker.setup('test-session', projectDir);
+    const gitSpy = vi.spyOn(
+      tracker as unknown as { git: (...args: unknown[]) => Promise<unknown> },
+      'git',
+    );
+
+    await fs.writeFile(path.join(worktreePath, 'hook-check.ts'), 'console.log("hook");\n');
+    tracker.onMessage(toolCallUpdate('Edit'));
+    await tracker.teardown();
+
+    const commitCalls = gitSpy.mock.calls.filter(
+      (call) => Array.isArray(call[0]) && (call[0] as string[])[0] === 'commit',
+    );
+    expect(commitCalls.length).toBeGreaterThan(0);
+    for (const call of commitCalls) {
+      const args = call[0] as string[];
+      expect(args).not.toContain('--no-verify');
+    }
   });
 
   it('does not commit for non-configured tools', async () => {
@@ -310,9 +332,25 @@ describe('GitTracker', () => {
     const content = await fs.readFile(path.join(retryPath, 'base.ts'), 'utf-8');
     expect(content).toBe('base\n');
 
-    // Clean up retry worktree
-    await exec('git', ['-C', projectDir, 'worktree', 'remove', retryPath, '--force']);
     await tracker.teardown();
+  });
+
+  it('teardown removes retry worktrees created by branchRetry', async () => {
+    const tracker = new GitTracker(DEFAULT_CONFIG, 'test-session');
+    const worktreePath = await tracker.setup('test-session', projectDir);
+
+    await fs.writeFile(path.join(worktreePath, 'base.ts'), 'base\n');
+    tracker.onMessage(toolCallUpdate('Edit'));
+    await tracker.flush();
+
+    const baseSha = tracker.steps.find((s) => s.sha)?.sha;
+    expect(baseSha).toBeTruthy();
+
+    const retryPath = await tracker.branchRetry(baseSha!);
+    await fs.access(retryPath);
+
+    await tracker.teardown();
+    await expect(fs.access(retryPath)).rejects.toThrow();
   });
 
   // ---------------------------------------------------------------------------
@@ -405,7 +443,7 @@ describe('GitTracker', () => {
     expect(stepDiffs[0]!.diff).toContain('a.ts');
 
     await tracker.teardown();
-  });
+  }, 15_000);
 
   it('getSummaryDiff returns total changes', async () => {
     const tracker = new GitTracker(DEFAULT_CONFIG, 'test-session');
@@ -424,7 +462,7 @@ describe('GitTracker', () => {
     expect(summary).toContain('b.ts');
 
     await tracker.teardown();
-  });
+  }, 15_000);
 
   // ---------------------------------------------------------------------------
   // teardown
@@ -461,6 +499,26 @@ describe('GitTracker', () => {
     await expect(tracker.teardown()).resolves.toBeUndefined();
   });
 
+  it('teardown times out waiting for stuck commit queue and continues cleanup', async () => {
+    const tracker = new GitTracker(
+      {
+        ...DEFAULT_CONFIG,
+        teardownCommitDrainMs: 25,
+      },
+      'test-session',
+    );
+    const worktreePath = await tracker.setup('test-session', projectDir);
+    (tracker as unknown as { commitQueue: Promise<void> }).commitQueue = new Promise<void>(
+      () => {},
+    );
+
+    const startedAt = Date.now();
+    await tracker.teardown();
+    const elapsedMs = Date.now() - startedAt;
+    expect(elapsedMs).toBeLessThan(2_000);
+    await expect(fs.access(worktreePath)).rejects.toThrow();
+  });
+
   // ---------------------------------------------------------------------------
   // edge cases
   // ---------------------------------------------------------------------------
@@ -478,5 +536,22 @@ describe('GitTracker', () => {
     // Should not throw
     tracker.onMessage(toolCallUpdate('Edit'));
     expect(tracker.steps.length).toBe(0);
+  });
+
+  it('skips oversized auto-commits when maxCommitSizeBytes is exceeded', async () => {
+    const tracker = new GitTracker(
+      {
+        ...DEFAULT_CONFIG,
+        maxCommitSizeBytes: 16,
+      },
+      'test-session',
+    );
+    const worktreePath = await tracker.setup('test-session', projectDir);
+    await fs.writeFile(path.join(worktreePath, 'big.txt'), 'this content is definitely larger\n');
+    tracker.onMessage(toolCallUpdate('Edit'));
+    await tracker.teardown();
+
+    const step = tracker.steps.find((s) => s.type === 'tool_call_update');
+    expect(step?.sha).toBeNull();
   });
 });

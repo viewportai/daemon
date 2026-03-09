@@ -70,6 +70,44 @@ function decodeRuntimeConfig(raw: string | undefined): RuntimeLaunchConfig {
     logPath: typeof parsed.logPath === 'string' ? parsed.logPath : undefined,
     relayEnabled: typeof parsed.relayEnabled === 'boolean' ? parsed.relayEnabled : undefined,
     relayEndpoint: typeof parsed.relayEndpoint === 'string' ? parsed.relayEndpoint : undefined,
+    relayServerUrl: typeof parsed.relayServerUrl === 'string' ? parsed.relayServerUrl : undefined,
+    relayWorkspaceId:
+      typeof parsed.relayWorkspaceId === 'string' ? parsed.relayWorkspaceId : undefined,
+    relayEnrollToken:
+      typeof parsed.relayEnrollToken === 'string' ? parsed.relayEnrollToken : undefined,
+    relayIssueToken:
+      typeof parsed.relayIssueToken === 'string' ? parsed.relayIssueToken : undefined,
+    relayTlsVerify:
+      parsed.relayTlsVerify === 'auto' ||
+      parsed.relayTlsVerify === '0' ||
+      parsed.relayTlsVerify === '1'
+        ? parsed.relayTlsVerify
+        : undefined,
+    relayCaCertPath:
+      typeof parsed.relayCaCertPath === 'string' ? parsed.relayCaCertPath : undefined,
+    relayTlsPins:
+      Array.isArray(parsed.relayTlsPins) &&
+      parsed.relayTlsPins.every((entry) => typeof entry === 'string')
+        ? parsed.relayTlsPins
+        : undefined,
+    relayTokenIssuer:
+      typeof parsed.relayTokenIssuer === 'string' ? parsed.relayTokenIssuer : undefined,
+    relayTokenAudience:
+      typeof parsed.relayTokenAudience === 'string' ? parsed.relayTokenAudience : undefined,
+    relayTokenJwksUrl:
+      typeof parsed.relayTokenJwksUrl === 'string' ? parsed.relayTokenJwksUrl : undefined,
+    relayTokenSigningKeys:
+      parsed.relayTokenSigningKeys &&
+      typeof parsed.relayTokenSigningKeys === 'object' &&
+      !Array.isArray(parsed.relayTokenSigningKeys)
+        ? (parsed.relayTokenSigningKeys as Record<string, string>)
+        : undefined,
+    relayTokenClockSkewSec:
+      typeof parsed.relayTokenClockSkewSec === 'number' &&
+      Number.isInteger(parsed.relayTokenClockSkewSec) &&
+      parsed.relayTokenClockSkewSec >= 0
+        ? parsed.relayTokenClockSkewSec
+        : undefined,
   };
 }
 
@@ -188,6 +226,9 @@ async function writeState(config: RuntimeLaunchConfig, workerPid?: number): Prom
     allowedOriginsRaw: config.allowedOriginsRaw,
     relayEnabled: config.relayEnabled,
     relayEndpoint: config.relayEndpoint,
+    relayServerUrl: config.relayServerUrl,
+    relayWorkspaceId: config.relayWorkspaceId,
+    relayTlsVerify: config.relayTlsVerify,
   });
 }
 

@@ -39,6 +39,9 @@ export interface DaemonRuntimeState {
   allowedOriginsRaw?: string;
   relayEnabled?: boolean;
   relayEndpoint?: string;
+  relayServerUrl?: string;
+  relayWorkspaceId?: string;
+  relayTlsVerify?: 'auto' | '0' | '1';
 }
 
 function daemonStatePath(): string {
@@ -103,6 +106,15 @@ export async function readDaemonRuntimeState(): Promise<DaemonRuntimeState | nul
         typeof parsed.allowedOriginsRaw === 'string' ? parsed.allowedOriginsRaw : undefined,
       relayEnabled: typeof parsed.relayEnabled === 'boolean' ? parsed.relayEnabled : undefined,
       relayEndpoint: typeof parsed.relayEndpoint === 'string' ? parsed.relayEndpoint : undefined,
+      relayServerUrl: typeof parsed.relayServerUrl === 'string' ? parsed.relayServerUrl : undefined,
+      relayWorkspaceId:
+        typeof parsed.relayWorkspaceId === 'string' ? parsed.relayWorkspaceId : undefined,
+      relayTlsVerify:
+        parsed.relayTlsVerify === 'auto' ||
+        parsed.relayTlsVerify === '0' ||
+        parsed.relayTlsVerify === '1'
+          ? parsed.relayTlsVerify
+          : undefined,
     };
   } catch {
     return null;
@@ -131,7 +143,10 @@ export async function writeDaemonRuntimeState(state: DaemonRuntimeState): Promis
           ? `unix://${state.socketPath}`
           : `${state.host}:${state.port}`,
   };
-  await fs.writeFile(daemonStatePath(), JSON.stringify(normalized, null, 2) + '\n', 'utf-8');
+  await fs.writeFile(daemonStatePath(), JSON.stringify(normalized, null, 2) + '\n', {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
 }
 
 export async function clearDaemonRuntimeState(): Promise<void> {

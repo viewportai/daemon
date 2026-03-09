@@ -11,7 +11,9 @@ import Fastify from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import fastifyCors from '@fastify/cors';
 import path from 'node:path';
+import os from 'node:os';
 import fs from 'node:fs/promises';
+import { readFileSync, existsSync } from 'node:fs';
 import { logger } from './core/output.js';
 import { Daemon } from './core/daemon.js';
 import { GitTracker } from './tracking/git-tracker.js';
@@ -21,12 +23,6 @@ import { HookRouter, SupervisionManager } from './hooks/index.js';
 import { LocalAuthProvider } from './server/auth.js';
 import type { AuthProvider } from './server/auth.js';
 import type { GitTrackerConfig } from './core/types.js';
-import {
-  loadPersistedSessions,
-  savePersistedSessions,
-  clearPersistedSessions,
-} from './core/session-state-file.js';
-import type { PersistedSession } from './core/session-state-file.js';
 import { hasFlag } from './cli/args.js';
 import {
   readDaemonRuntimeState,
@@ -53,6 +49,10 @@ import { resolveDaemonSettingsFromSources } from './cli/daemon-settings.js';
 import { loadAgents, autoRegisterDirectories, decodeAutoRegisterEntry } from './startup-agents.js';
 import { startDiscoveryWatchers } from './startup-watchers.js';
 import { maybeOfferAgentPrerequisites } from './startup-prereqs.js';
+import { setupSessionPersistence } from './startup-session-persistence.js';
+import { validateRelayRuntimeSecurity } from './startup-relay-security.js';
+import { DaemonRelayBridge } from './relay/daemon-relay-bridge.js';
+import { configDir } from './core/config.js';
 
 export { decodeAutoRegisterEntry };
 
@@ -65,6 +65,67 @@ export const HTTP_LOG_REDACT_PATHS = [
   'req.headers.cookie',
   'res.headers["set-cookie"]',
 ] as const;
+
+async function readDaemonAuthToken(): Promise<string | null> {
+  try {
+    const raw = await fs.readFile(path.join(configDir(), 'auth-token'), 'utf-8');
+    const token = raw.trim();
+    return token.length > 0 ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+function localDaemonWsUrl(config: RuntimeLaunchConfig): string | null {
+  if (config.socketPath) {
+    // ws+unix is not currently supported by the ws client in this relay bridge.
+    return null;
+  }
+  const tls = resolveTlsOptions();
+  const host = config.host === '0.0.0.0' || config.host === '::' ? '127.0.0.1' : config.host;
+  return tls ? `wss://${tls.tlsHost}:${config.port}/ws` : `ws://${host}:${config.port}/ws`;
+}
+
+function resolveTlsOptions(): { cert: Buffer; key: Buffer; tlsHost: string } | null {
+  const tlsEnv = (process.env['VIEWPORT_TLS'] ?? 'auto').toLowerCase();
+  if (tlsEnv === '0' || tlsEnv === 'false' || tlsEnv === 'off') return null;
+
+  const tlsHost = process.env['VIEWPORT_TLS_HOST'] ?? 'getviewport.test';
+  const certDir = path.join(
+    os.homedir(),
+    'Library',
+    'Application Support',
+    'Herd',
+    'config',
+    'valet',
+    'Certificates',
+  );
+  const certPath = process.env['VIEWPORT_TLS_CERT'] ?? path.join(certDir, `${tlsHost}.crt`);
+  const keyPath = process.env['VIEWPORT_TLS_KEY'] ?? path.join(certDir, `${tlsHost}.key`);
+
+  if (tlsEnv === 'auto' && (!existsSync(certPath) || !existsSync(keyPath))) return null;
+  if (tlsEnv === '1' || tlsEnv === 'true' || tlsEnv === 'on') {
+    if (!existsSync(certPath) || !existsSync(keyPath)) {
+      throw new Error(
+        `VIEWPORT_TLS enabled but certs not found (cert=${certPath}, key=${keyPath})`,
+      );
+    }
+  }
+
+  return {
+    cert: readFileSync(certPath),
+    key: readFileSync(keyPath),
+    tlsHost,
+  };
+}
+
+function parsePositiveIntEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) return undefined;
+  return parsed;
+}
 
 async function isRuntimeResponsive(): Promise<boolean> {
   const res = await daemonFetch('/health', { timeoutMs: 1_200 });
@@ -196,69 +257,18 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
       new GitTracker(trackerConfig, sessionId),
   );
 
-  // Wire session persistence
-  const PERSIST_DEBOUNCE_MS = 2000;
-  let persistTimer: ReturnType<typeof setTimeout> | null = null;
-  const sessionMeta = new Map<string, { startedAt: number; lastStateChange: number }>();
+  const sessionPersistence = await setupSessionPersistence(daemon);
 
-  const persistSessions = async () => {
-    try {
-      const activeSessions = daemon.getActiveSessions();
-      const entries: PersistedSession[] = activeSessions.map((sid) => {
-        const info = daemon.getSessionInfo(sid);
-        const dir = daemon.directoryManager.get(info.directoryId);
-        const meta = sessionMeta.get(sid);
-        return {
-          sessionId: sid,
-          directoryId: info.directoryId,
-          agent: info.agent,
-          startedAt: meta?.startedAt ?? Date.now(),
-          lastStateChange: meta?.lastStateChange ?? Date.now(),
-          state: info.state,
-          cwd: dir?.path ?? '',
-        };
-      });
-      await savePersistedSessions(entries);
-    } catch (err) {
-      logger.warn('persistSessions failed:', err);
-    }
-  };
+  const tls = resolveTlsOptions();
 
-  const debouncedPersist = () => {
-    if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => {
-      persistTimer = null;
-      persistSessions().catch((err) => logger.warn('persistSessions failed:', err));
-    }, PERSIST_DEBOUNCE_MS);
-  };
-
-  daemon.on('session:started', ({ sessionId }) => {
-    const now = Date.now();
-    sessionMeta.set(sessionId, { startedAt: now, lastStateChange: now });
-    debouncedPersist();
-  });
-  daemon.on('session:ended', ({ sessionId }) => {
-    sessionMeta.delete(sessionId);
-    debouncedPersist();
-  });
-  daemon.on('session:state-changed', ({ sessionId }) => {
-    const existing = sessionMeta.get(sessionId);
-    if (!existing) return;
-    existing.lastStateChange = Date.now();
-    debouncedPersist();
-  });
-
-  const orphaned = await loadPersistedSessions();
-  if (orphaned.length > 0) {
-    logger.log(`Found ${orphaned.length} orphaned session(s) from previous run (cleaned up)`);
-    await clearPersistedSessions();
-  }
-
+  // When TLS is enabled, automatically allow the TLS hostname + its subdomains
+  // so that app.getviewport.test can reach wss://getviewport.test:7070
+  const tlsHostAllowance = tls ? `,${tls.tlsHost},.${tls.tlsHost}` : '';
   const securityProfile = buildSecurityProfile({
     profile: config.profile,
     host: config.host,
-    allowedHostsRaw: config.allowedHostsRaw,
-    allowedOriginsRaw: config.allowedOriginsRaw,
+    allowedHostsRaw: (config.allowedHostsRaw ?? '') + tlsHostAllowance,
+    allowedOriginsRaw: (config.allowedOriginsRaw ?? '') + tlsHostAllowance,
     explicitAuthFlag: config.authEnabled,
   });
 
@@ -277,7 +287,12 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
   const supervision = new SupervisionManager();
   const hookRouter = new HookRouter(daemon, supervision);
 
+  if (tls) {
+    logger.log(`TLS:     enabled (host=${tls.tlsHost})`);
+  }
+
   const app = Fastify({
+    ...(tls ? { https: { cert: tls.cert, key: tls.key } } : {}),
     logger: {
       level: process.env['VIEWPORT_HTTP_LOG_LEVEL'] ?? 'info',
       // Prevent auth material from landing in request logs.
@@ -298,6 +313,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
   let shutdownExitCode = 0;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | null = null;
+  let relayBridge: DaemonRelayBridge | null = null;
 
   const shutdown = async (exitCode = 0) => {
     if (shuttingDown) return;
@@ -305,15 +321,15 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
     shutdownExitCode = exitCode;
     logger.log('\nShutting down...');
 
-    if (persistTimer) {
-      clearTimeout(persistTimer);
-      persistTimer = null;
-    }
-    await persistSessions();
+    await sessionPersistence.flush();
     discoveryWatches.stop();
     hookRouter.shutdown();
+    if (relayBridge) {
+      await relayBridge.stop();
+      relayBridge = null;
+    }
     await daemon.shutdown();
-    await clearPersistedSessions();
+    await sessionPersistence.clearPersistedState();
     await app.close();
     if (socketPath) {
       await fs.rm(socketPath, { force: true }).catch(() => undefined);
@@ -378,6 +394,49 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
     logger.log(`  WebSocket: ${address.replace('http', 'ws')}/ws`);
   }
   logger.log(`  Agents:    ${registry.getIds().join(', ') || 'none'}`);
+
+  if (config.relayEnabled) {
+    validateRelayRuntimeSecurity(config);
+    const missing: string[] = [];
+    if (!config.relayEndpoint) missing.push('relay endpoint');
+    if (!config.relayServerUrl) missing.push('relay server URL');
+    if (!config.relayWorkspaceId) missing.push('relay workspace ID');
+    if (!config.relayEnrollToken) missing.push('relay enroll token');
+    const daemonWsUrl = localDaemonWsUrl(config);
+    if (!daemonWsUrl) {
+      missing.push(
+        'tcp listen target (relay runtime currently requires tcp listen, not unix socket)',
+      );
+    }
+
+    if (missing.length > 0) {
+      logger.warn(`[relay] disabled due to incomplete config: ${missing.join(', ')}`);
+    } else {
+      const daemonToken = securityProfile.requireAuth ? await readDaemonAuthToken() : null;
+      relayBridge = new DaemonRelayBridge({
+        relayEndpoint: config.relayEndpoint!,
+        relayServerUrl: config.relayServerUrl!,
+        workspaceId: config.relayWorkspaceId!,
+        enrollToken: config.relayEnrollToken!,
+        issueToken: config.relayIssueToken,
+        daemonWsUrl: daemonWsUrl!,
+        daemonAuthToken: daemonToken ?? undefined,
+        relayTlsVerify: config.relayTlsVerify ?? 'auto',
+        relayCaCertPath: config.relayCaCertPath,
+        relayTlsPins: config.relayTlsPins,
+        relayTokenIssuer: config.relayTokenIssuer,
+        relayTokenAudience: config.relayTokenAudience,
+        relayTokenJwksUrl: config.relayTokenJwksUrl,
+        relayTokenSigningKeys: config.relayTokenSigningKeys,
+        relayTokenClockSkewSec: config.relayTokenClockSkewSec,
+        keyRotateAfterMessages: parsePositiveIntEnv('VIEWPORT_RELAY_KEY_ROTATE_AFTER_MESSAGES'),
+      });
+      await relayBridge.start();
+      logger.log(
+        `[relay] enabled (workspace=${config.relayWorkspaceId}, endpoint=${config.relayEndpoint})`,
+      );
+    }
+  }
 
   process.on('SIGINT', () => {
     if (!shutdownPromise) {

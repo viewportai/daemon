@@ -27,6 +27,7 @@ import {
 import { logger } from '../core/logger.js';
 
 const log = logger.child({ module: 'hook-router' });
+const MAX_PENDING_PERMISSION_REQUESTS = 512;
 
 // ---------------------------------------------------------------------------
 // Pending permission request — held while waiting for supervisor response
@@ -218,6 +219,20 @@ export class HookRouter {
     data: Record<string, unknown>,
     ctx: { sessionId: string; adapter: string; cwd?: string; timeoutMs: number },
   ): Promise<HookResponse> {
+    if (this.pending.size >= MAX_PENDING_PERMISSION_REQUESTS) {
+      log.warn(
+        { sessionId: ctx.sessionId, pending: this.pending.size },
+        'Permission request queue full; denying request defensively',
+      );
+      return Promise.resolve({
+        passthrough: false,
+        decision: {
+          behavior: 'deny',
+          message: 'Permission supervision queue is full',
+        },
+      });
+    }
+
     const hookRequestId = `hk-${++this.hookRequestCounter}-${Date.now()}`;
     const toolName = (data.tool_name as string) ?? 'unknown';
     const toolInput = data.tool_input;

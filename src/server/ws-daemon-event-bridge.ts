@@ -15,6 +15,7 @@ const log = logger.child({ module: 'ws-daemon-event-bridge' });
 const MAX_DISCOVERED_BROADCAST = 1_000;
 const BUFFER_EVICTION_MS = 60_000;
 const BUFFER_CLEANUP_INTERVAL_MS = 30_000;
+const MAX_ENDED_SESSION_TRACKING = 4096;
 
 function isErrorReason(reason: string): boolean {
   const normalized = reason.toLowerCase();
@@ -55,6 +56,13 @@ export function registerWsDaemonEventBridge(
   } = options;
 
   const sessionEndTimes = new Map<string, number>();
+  const enforceEndedSessionTrackingCapacity = (): void => {
+    while (sessionEndTimes.size > MAX_ENDED_SESSION_TRACKING) {
+      const oldest = sessionEndTimes.keys().next();
+      if (oldest.done) break;
+      sessionEndTimes.delete(oldest.value);
+    }
+  };
   const resolveDirectoryId = (sessionId: string): string | undefined => {
     try {
       return daemon.getSessionInfo(sessionId).directoryId;
@@ -98,13 +106,14 @@ export function registerWsDaemonEventBridge(
   });
 
   daemon.on('session:state-changed', ({ sessionId, state }) => {
-    broadcastUpdate(sessionId, { updateType: 'state-change', state });
+    const stateChangedAt = Date.now();
+    broadcastUpdate(sessionId, { updateType: 'state-change', state, timestamp: stateChangedAt });
     if (state === 'errored') {
       broadcastUpdate(sessionId, {
         updateType: 'attention',
         requiresAttention: true,
         reason: 'errored',
-        timestamp: Date.now(),
+        timestamp: stateChangedAt,
       });
     }
   });
@@ -116,6 +125,7 @@ export function registerWsDaemonEventBridge(
       updateType: 'state-change',
       state: errored ? 'errored' : 'completed',
       reason,
+      timestamp: endedAt,
     });
     broadcastUpdate(sessionId, {
       updateType: 'attention',
@@ -146,6 +156,7 @@ export function registerWsDaemonEventBridge(
 
     sessionStreaming.delete(sessionId);
     sessionEndTimes.set(sessionId, Date.now());
+    enforceEndedSessionTrackingCapacity();
   });
 
   daemon.on('step:committed', ({ sessionId, step }) => {

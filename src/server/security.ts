@@ -95,7 +95,10 @@ function normalizeHostHeader(hostHeader: string): string {
 function hostMatchesRule(host: string, rule: string): boolean {
   if (rule === host) return true;
   if (rule.startsWith('.')) {
-    return host.endsWith(rule);
+    const suffix = rule.slice(1);
+    // Guard against over-broad rules like ".com" / ".local" that match too much.
+    if (!suffix.includes('.')) return false;
+    return host === suffix || host.endsWith(rule);
   }
   return false;
 }

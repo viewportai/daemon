@@ -343,6 +343,13 @@ export interface GitTrackerConfig {
   maxCommitsPerSession: number;
   /** Root directory for worktrees, relative to project root. */
   worktreeRoot: string;
+  /** Max estimated staged bytes per auto-commit; commits above this are skipped. */
+  maxCommitSizeBytes?: number;
+  /**
+   * Max time to wait for pending commit queue during teardown before forcing cleanup.
+   * Use 0/negative to wait indefinitely.
+   */
+  teardownCommitDrainMs?: number;
 }
 
 export interface PermissionsConfig {

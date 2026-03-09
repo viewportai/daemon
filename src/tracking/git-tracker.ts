@@ -22,6 +22,8 @@ const log = logger.child({ module: 'git-tracker' });
 const execGit = promisify(execFile);
 
 const GIT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_COMMIT_SIZE_BYTES = 5 * 1024 * 1024;
+const DEFAULT_TEARDOWN_DRAIN_MS = 10_000;
 
 export class GitTracker implements RunTracker {
   private worktreePath: string | null = null;
@@ -32,6 +34,7 @@ export class GitTracker implements RunTracker {
   private _steps: Step[] = [];
   private commitQueue: Promise<void> = Promise.resolve();
   private tornDown = false;
+  private retryWorktreePaths = new Set<string>();
 
   /** Callback fired after each successful commit. */
   onStepCommitted?: (step: Step) => void;
@@ -113,6 +116,7 @@ export class GitTracker implements RunTracker {
 
     await fs.mkdir(path.dirname(retryPath), { recursive: true });
     await this.git(['worktree', 'add', retryPath, '-b', retryBranch, fromSha], this.projectPath!);
+    this.retryWorktreePaths.add(retryPath);
 
     return retryPath;
   }
@@ -155,22 +159,22 @@ export class GitTracker implements RunTracker {
   async teardown(): Promise<void> {
     if (this.tornDown) return;
 
-    // Flush pending commits before marking as torn down
-    await this.commitQueue;
+    // Flush pending commits before marking as torn down, but avoid hanging teardown forever.
+    await this.awaitCommitQueueWithDeadline();
     this.tornDown = true;
 
     if (this.worktreePath && this.projectPath) {
       // Write step log to branch
       await this.writeStepLog();
 
-      // Remove the worktree
-      try {
-        await this.git(['worktree', 'remove', this.worktreePath, '--force'], this.projectPath);
-      } catch {
-        // If worktree removal fails (e.g., already removed), just clean up
-        await fs.rm(this.worktreePath, { recursive: true, force: true });
-        await this.git(['worktree', 'prune'], this.projectPath).catch(() => {});
+      // Remove any retry worktrees created via branchRetry.
+      for (const retryPath of this.retryWorktreePaths) {
+        await this.removeWorktree(retryPath, this.projectPath);
       }
+      this.retryWorktreePaths.clear();
+
+      // Remove the primary session worktree.
+      await this.removeWorktree(this.worktreePath, this.projectPath);
     }
   }
 
@@ -264,12 +268,28 @@ export class GitTracker implements RunTracker {
     );
     if (!staged.trim()) return; // All changes were ignored
 
+    const maxCommitSizeBytes = this.config.maxCommitSizeBytes ?? DEFAULT_MAX_COMMIT_SIZE_BYTES;
+    if (maxCommitSizeBytes > 0) {
+      const estimatedBytes = await this.estimateStagedBytes();
+      if (estimatedBytes > maxCommitSizeBytes) {
+        metrics.increment('git.commits.skipped_oversize');
+        log.warn(
+          {
+            sessionId: this._sessionId,
+            step: step.step,
+            estimatedBytes,
+            maxCommitSizeBytes,
+          },
+          'Skipping auto-commit because staged content exceeds maxCommitSizeBytes',
+        );
+        return;
+      }
+    }
+
     // Commit
     const message = `[viewport] Step ${step.step}: ${step.description}`;
-    // We skip local git hooks because daemon-generated commits must be non-interactive and deterministic.
-    // Operators should enforce secret scanning via centralized CI/push protection.
     await this.git(
-      ['commit', '-m', message, '--author', this.config.commitAuthor, '--no-verify'],
+      ['commit', '-m', message, '--author', this.config.commitAuthor],
       this.worktreePath,
     );
 
@@ -315,8 +335,6 @@ export class GitTracker implements RunTracker {
           `[viewport] Session log: ${this._steps.length} steps`,
           '--author',
           this.config.commitAuthor,
-          // Keep session-log commits non-interactive for the same reason as step commits.
-          '--no-verify',
         ],
         this.worktreePath,
       );
@@ -328,6 +346,66 @@ export class GitTracker implements RunTracker {
   private ensureWorktree(): void {
     if (!this.worktreePath) {
       throw new Error('GitTracker not set up. Call setup() first.');
+    }
+  }
+
+  private async estimateStagedBytes(): Promise<number> {
+    if (!this.worktreePath) return 0;
+    const { stdout } = await this.git(['diff', '--cached', '--name-only', '-z'], this.worktreePath);
+    if (!stdout) return 0;
+    const files = stdout.split('\0').filter((entry) => entry.length > 0);
+    let total = 0;
+    for (const file of files) {
+      const absolute = path.resolve(this.worktreePath, file);
+      try {
+        const stat = await fs.stat(absolute);
+        if (stat.isFile()) total += stat.size;
+      } catch {
+        // File may be deleted or moved in index; skip.
+      }
+    }
+    return total;
+  }
+
+  private async awaitCommitQueueWithDeadline(): Promise<void> {
+    const configured = this.config.teardownCommitDrainMs;
+    const drainMs =
+      typeof configured === 'number' && Number.isFinite(configured)
+        ? Math.max(0, Math.floor(configured))
+        : DEFAULT_TEARDOWN_DRAIN_MS;
+
+    if (drainMs <= 0) {
+      await this.commitQueue;
+      return;
+    }
+
+    let timedOut = false;
+    await Promise.race([
+      this.commitQueue,
+      new Promise<void>((resolve) =>
+        setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, drainMs),
+      ),
+    ]);
+
+    if (timedOut) {
+      metrics.increment('git.teardown_commit_drain_timeout');
+      log.warn(
+        { sessionId: this._sessionId, drainMs },
+        'Timed out waiting for commit queue during teardown; forcing worktree cleanup',
+      );
+    }
+  }
+
+  private async removeWorktree(worktreePath: string, projectPath: string): Promise<void> {
+    try {
+      await this.git(['worktree', 'remove', worktreePath, '--force'], projectPath);
+    } catch {
+      // If worktree removal fails (e.g., already removed), just clean up.
+      await fs.rm(worktreePath, { recursive: true, force: true });
+      await this.git(['worktree', 'prune'], projectPath).catch(() => {});
     }
   }
 

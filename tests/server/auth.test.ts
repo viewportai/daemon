@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -69,6 +70,29 @@ describe('LocalAuthProvider', () => {
     await provider.initialize();
 
     expect(await provider.validate('wrong-token')).toBe(false);
+  });
+
+  it('validate() never compares a token buffer against itself on length mismatch', async () => {
+    const provider = new LocalAuthProvider();
+    await provider.initialize();
+
+    const calls: Array<[NodeJS.ArrayBufferView, NodeJS.ArrayBufferView]> = [];
+    const spy = vi
+      .spyOn(crypto, 'timingSafeEqual')
+      .mockImplementation((a: NodeJS.ArrayBufferView, b: NodeJS.ArrayBufferView) => {
+        calls.push([a, b]);
+        return false;
+      });
+
+    try {
+      expect(await provider.validate('x')).toBe(false);
+      expect(calls.length).toBeGreaterThan(0);
+      for (const [left, right] of calls) {
+        expect(left === right).toBe(false);
+      }
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('validate() returns false before initialization', async () => {

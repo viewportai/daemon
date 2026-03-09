@@ -310,6 +310,46 @@ describe('HookRouter', () => {
     expect(router.getPendingPermissions().size).toBe(0);
   });
 
+  it('denies new permission requests when pending queue is at capacity', async () => {
+    const client = mockClient();
+    supervision.supervise('s1', client);
+
+    router.registerDefinition({
+      kind: 'PermissionRequest',
+      blocking: true,
+      defaultTimeoutMs: 60_000,
+    });
+
+    const pending: Array<Promise<unknown>> = [];
+    for (let i = 0; i < 512; i += 1) {
+      pending.push(
+        router.handleEvent({
+          hook_event_name: 'PermissionRequest',
+          session_id: 's1',
+          tool_name: `Tool-${i}`,
+          tool_input: { n: i },
+        }),
+      );
+    }
+
+    expect(router.getPendingPermissions().size).toBe(512);
+
+    const overflow = await router.handleEvent({
+      hook_event_name: 'PermissionRequest',
+      session_id: 's1',
+      tool_name: 'Overflow',
+      tool_input: {},
+    });
+    expect(overflow.passthrough).toBe(false);
+    expect(overflow.decision).toEqual({
+      behavior: 'deny',
+      message: 'Permission supervision queue is full',
+    });
+
+    router.shutdown();
+    await Promise.all(pending);
+  });
+
   // -------------------------------------------------------------------------
   // Adapter parameter
   // -------------------------------------------------------------------------

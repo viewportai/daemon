@@ -39,6 +39,7 @@ import {
   worktree,
   service,
   setup,
+  remote,
 } from './cli/commands.js';
 import { hookNotify } from './cli/hook-command.js';
 import { start, runSupervisorCommand, runWorkerCommand } from './startup.js';
@@ -65,6 +66,7 @@ const commands: Record<string, () => Promise<void>> = {
   worktree,
   service,
   setup,
+  remote,
 };
 
 const command = getCommand();
@@ -111,6 +113,8 @@ if (command === 'hook') {
       handler = agent;
     } else if (command === 'worktree') {
       handler = worktree;
+    } else if (command === 'remote') {
+      handler = remote;
     }
     if (!handler) {
       if (command !== 'help') {

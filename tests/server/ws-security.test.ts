@@ -117,18 +117,107 @@ describe('WebSocket security', () => {
   });
 
   it('accepts ws token from query parameter', async () => {
+    const profile: SecurityProfile = {
+      profile: 'local',
+      host: '127.0.0.1',
+      allowedHosts: [],
+      requireAuth: false,
+    };
     registerWsServer(app, daemon, undefined, {
       auth: {
         validate: async (token: string) => token === 'good-token',
         getDisplayToken: () => null,
       },
+      securityProfile: profile,
     });
     await app.ready();
 
-    const client = await connect('/ws?token=good-token');
+    const client = await connect('/ws?token=good-token', {
+      headers: {
+        host: '127.0.0.1:7070',
+      },
+    });
     const hello = await client.nextMessage(1000);
     expect(hello.type).toBe('hello');
     client.close();
+  });
+
+  it('rejects query token for non-local profiles and accepts Authorization header', async () => {
+    const profile: SecurityProfile = {
+      profile: 'relay',
+      host: '127.0.0.1',
+      allowedHosts: true,
+      requireAuth: true,
+    };
+    registerWsServer(app, daemon, undefined, {
+      auth: {
+        validate: async (token: string) => token === 'good-token',
+        getDisplayToken: () => null,
+      },
+      securityProfile: profile,
+    });
+    await app.ready();
+
+    const rejected = await connect(
+      '/ws?token=good-token',
+      {
+        headers: {
+          host: '127.0.0.1:7070',
+        },
+      },
+      { waitForOpen: false },
+    );
+    await expect(rejected.waitForOpen(300)).rejects.toThrow('Timeout waiting for open');
+    rejected.close();
+
+    const accepted = await connect('/ws', {
+      headers: {
+        host: '127.0.0.1:7070',
+        authorization: 'Bearer good-token',
+      },
+    });
+    const hello = await accepted.nextMessage(1000);
+    expect(hello.type).toBe('hello');
+    accepted.close();
+  });
+
+  it('does not allow query token in non-local profiles even when override env is set', async () => {
+    const previous = process.env['VIEWPORT_ALLOW_QUERY_TOKEN_NON_LOCAL'];
+    process.env['VIEWPORT_ALLOW_QUERY_TOKEN_NON_LOCAL'] = '1';
+    try {
+      const profile: SecurityProfile = {
+        profile: 'relay',
+        host: '127.0.0.1',
+        allowedHosts: true,
+        requireAuth: true,
+      };
+      registerWsServer(app, daemon, undefined, {
+        auth: {
+          validate: async (token: string) => token === 'good-token',
+          getDisplayToken: () => null,
+        },
+        securityProfile: profile,
+      });
+      await app.ready();
+
+      const rejected = await connect(
+        '/ws?token=good-token',
+        {
+          headers: {
+            host: '127.0.0.1:7070',
+          },
+        },
+        { waitForOpen: false },
+      );
+      await expect(rejected.waitForOpen(300)).rejects.toThrow('Timeout waiting for open');
+      rejected.close();
+    } finally {
+      if (previous === undefined) {
+        delete process.env['VIEWPORT_ALLOW_QUERY_TOKEN_NON_LOCAL'];
+      } else {
+        process.env['VIEWPORT_ALLOW_QUERY_TOKEN_NON_LOCAL'] = previous;
+      }
+    }
   });
 
   it('rejects disallowed host/origin by security profile before hello', async () => {

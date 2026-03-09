@@ -618,6 +618,10 @@ export function showHelp(): void {
   console.log('  update [--json] [--yes]      Update daemon package, optionally restart');
   console.log('  service <install|uninstall|status> [--json]');
   console.log('                               Manage OS user service (launchd/systemd)');
+  console.log(
+    '  remote <login|status|enable|disable|logout> [--server <url>] [--workspace <id>] [--token <enroll-token>] [--user <id>]',
+  );
+  console.log('                               Configure daemon-native relay transport');
   console.log('  help                         Show this help message');
   console.log('');
   console.log('Agents are auto-detected from the built-in registry.');

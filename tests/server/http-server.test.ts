@@ -3,9 +3,10 @@ import Fastify from 'fastify';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { registerHttpRoutes } from '../../src/server/http-server.js';
+import { recordRedeemAttempt, registerHttpRoutes } from '../../src/server/http-server.js';
 import { Daemon } from '../../src/core/daemon.js';
 import type { DiscoveredSession, SessionDiscovery } from '../../src/core/interfaces.js';
+import { RingBuffer } from '../../src/server/ring-buffer.js';
 import {
   createPairingClientIdentity,
   createPairingRedeemProof,
@@ -175,6 +176,38 @@ describe('HTTP Server', () => {
     expect(res.statusCode).toBe(404);
   });
 
+  it('GET /api/directories/:directoryId/sessions/:sessionId/messages returns journal-backed active history', async () => {
+    const directory = await daemon.directoryManager.register(testDir);
+    const buffer = new RingBuffer({ sessionId: 'active-history-session' });
+    buffer.setDirectoryId(directory.id);
+    buffer.push('active-history-session', {
+      updateType: 'user-message',
+      messageId: 'active-user-1',
+      text: 'offline prompt',
+      timestamp: Date.now(),
+    });
+    buffer.push('active-history-session', {
+      updateType: 'agent-message',
+      messageId: 'active-agent-1',
+      text: 'offline reply',
+      timestamp: Date.now(),
+    });
+    await buffer.flushPersistence();
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/directories/${directory.id}/sessions/active-history-session/messages`,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.payload) as {
+      messages: Array<{ kind: string; text?: string }>;
+    };
+    expect(body.messages.map((message) => message.text).filter(Boolean)).toEqual([
+      'offline prompt',
+      'offline reply',
+    ]);
+  });
+
   it('POST /api/sessions/:id/stop stops active session', async () => {
     (daemon as unknown as { killSession: (id: string) => Promise<void> }).killSession = vi
       .fn()
@@ -222,17 +255,17 @@ describe('HTTP Server', () => {
     });
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.payload) as {
-      token?: string;
       offerId?: string;
-      trustAnchor?: string;
       daemonDeviceId?: string;
       daemonPublicKey?: string;
       peerId?: string;
       serverSignature?: string;
+      relayPairingSecret?: string;
     };
     expect(body.offerId).toBe(offer.offerId);
-    expect(body.token).toBeTruthy();
-    expect(body.trustAnchor).toBe(offer.trustAnchor);
+    expect(body).not.toHaveProperty('token');
+    expect(body).not.toHaveProperty('trustAnchor');
+    expect(body.relayPairingSecret).toBeUndefined();
     expect(body.daemonDeviceId).toBe(offer.daemonDeviceId);
     expect(body.daemonPublicKey).toBe(offer.daemonPublicKey);
     expect(body.peerId).toBe(clientIdentity.peerId);
@@ -246,6 +279,99 @@ describe('HTTP Server', () => {
       payload: { offerId: 'abc' },
     });
     expect(res.statusCode).toBe(400);
+  });
+
+  it('POST /api/pair/redeem rate limiting ignores spoofed x-forwarded-for', async () => {
+    await rotateAuthToken();
+    const offer = await issuePairingOffer({
+      connection: {
+        host: '127.0.0.1',
+        port: 7070,
+        listen: '127.0.0.1:7070',
+        profile: 'local',
+      },
+      ttlSeconds: 300,
+    });
+    const clientIdentity = createPairingClientIdentity();
+
+    let finalStatus = 0;
+    for (let i = 0; i < 13; i += 1) {
+      const wrongProof = createPairingRedeemProof({
+        offerId: offer.offerId,
+        redeemSecret: `wrong-proof-${i}`,
+        trustAnchor: offer.trustAnchor,
+        clientIdentity,
+      });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/pair/redeem',
+        headers: {
+          'x-forwarded-for': `203.0.113.${i + 1}`,
+        },
+        payload: {
+          offerId: offer.offerId,
+          proof: `wrong-proof-${i}`,
+          trustAnchor: offer.trustAnchor,
+          clientPublicKey: wrongProof.clientPublicKey,
+          clientProof: wrongProof.clientProof,
+        },
+      });
+      finalStatus = res.statusCode;
+    }
+
+    expect(finalStatus).toBe(429);
+  });
+
+  it('POST /api/hook validates payload shape when hook router is enabled', async () => {
+    const localApp = Fastify();
+    const hookRouter = {
+      handleEvent: vi.fn().mockResolvedValue({ allowFallback: false }),
+    };
+    registerHttpRoutes(localApp, daemon, undefined, { hookRouter: hookRouter as never });
+    await localApp.ready();
+
+    try {
+      const invalid = await localApp.inject({
+        method: 'POST',
+        url: '/api/hook',
+        payload: { adapter: 'claude' },
+      });
+      expect(invalid.statusCode).toBe(400);
+
+      const valid = await localApp.inject({
+        method: 'POST',
+        url: '/api/hook',
+        payload: {
+          adapter: 'claude',
+          hook_event_name: 'SessionStart',
+          session_id: 'session-1',
+        },
+      });
+      expect(valid.statusCode).toBe(200);
+      expect(hookRouter.handleEvent).toHaveBeenCalledTimes(1);
+    } finally {
+      await localApp.close();
+    }
+  });
+
+  it('recordRedeemAttempt prunes stale entries and caps tracked IP cardinality', () => {
+    const attempts = new Map<
+      string,
+      {
+        attempts: number[];
+        updatedAt: number;
+      }
+    >();
+    const now = Date.now();
+    for (let i = 0; i < 2_300; i += 1) {
+      const ip = `198.51.100.${i}`;
+      recordRedeemAttempt(attempts, ip, now - 120_000);
+    }
+    expect(attempts.size).toBe(2_048);
+
+    const recentCount = recordRedeemAttempt(attempts, '203.0.113.10', now);
+    expect(recentCount).toBe(1);
+    expect(attempts.size).toBeLessThanOrEqual(2_048);
   });
 
   it('GET /api/sessions/:id/mode returns current session mode', async () => {

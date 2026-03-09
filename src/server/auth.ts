@@ -36,13 +36,15 @@ export class LocalAuthProvider implements AuthProvider {
 
   async validate(token: string): Promise<boolean> {
     if (this.token === null) return false;
-    const a = Buffer.from(token);
-    const b = Buffer.from(this.token);
-    if (a.length !== b.length) {
-      crypto.timingSafeEqual(a, a); // constant-time regardless of length match
-      return false;
-    }
-    return crypto.timingSafeEqual(a, b);
+    const a = Buffer.from(token, 'utf8');
+    const b = Buffer.from(this.token, 'utf8');
+    const compareLength = Math.max(a.length, b.length, 1);
+    const paddedA = Buffer.alloc(compareLength);
+    const paddedB = Buffer.alloc(compareLength);
+    a.copy(paddedA);
+    b.copy(paddedB);
+    const equal = crypto.timingSafeEqual(paddedA, paddedB);
+    return equal && a.length === b.length;
   }
 
   getDisplayToken(): string | null {

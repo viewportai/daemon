@@ -38,6 +38,14 @@ export interface LoadedPlugin {
   path: string;
 }
 
+function isPathWithin(parentDir: string, targetPath: string): boolean {
+  const parent = path.resolve(parentDir);
+  const target = path.resolve(targetPath);
+  const relative = path.relative(parent, target);
+  if (relative === '') return true;
+  return !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
 // ---------------------------------------------------------------------------
 // Plugin directories
 // ---------------------------------------------------------------------------
@@ -142,6 +150,12 @@ async function loadPlugin(manifest: PluginManifest, pkgDir: string): Promise<Loa
     const pkg = JSON.parse(raw) as Record<string, unknown>;
     const main = (pkg['main'] as string) ?? 'index.js';
     const entryPath = path.resolve(pkgDir, main);
+    const resolvedPkgDir = await fs.realpath(pkgDir).catch(() => path.resolve(pkgDir));
+    const resolvedEntryPath = await fs.realpath(entryPath).catch(() => entryPath);
+    if (!isPathWithin(resolvedPkgDir, resolvedEntryPath)) {
+      logger.warn(`Plugin ${manifest.name}: invalid main entry path (outside package dir)`);
+      return null;
+    }
 
     // Dynamic import
     const mod = await import(entryPath);

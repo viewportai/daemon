@@ -19,8 +19,9 @@
 - Host header allowlist enforcement.
 - Origin allowlist enforcement.
 - Token auth (`~/.viewport/auth-token`) for protected API/WS.
-- WS auth supports `?token=` query fallback for browser compatibility.
-  - Tradeoff: query tokens can leak via logs/history.
+- WS auth supports `?token=` query fallback only in `local` profile by default.
+  - In `lan`/`relay`, query-token auth is disabled unless `VIEWPORT_ALLOW_QUERY_TOKEN_NON_LOCAL=1`.
+  - Tradeoff: query tokens can leak via logs/history, so use `Authorization: Bearer ...` whenever possible.
   - Preferred path is `Authorization: Bearer ...`.
 - WebSocket payload limits, backpressure handling, and rate limiting.
 - Path traversal protection for file APIs.

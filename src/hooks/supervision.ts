@@ -12,15 +12,30 @@ import type { ConnectedClient } from '../server/hello-builder.js';
 import { logger } from '../core/logger.js';
 
 const log = logger.child({ module: 'supervision' });
+const DEFAULT_MAX_SUPERVISED_SESSIONS = 4096;
 
 export class SupervisionManager {
   /** sessionId → set of supervising clients */
   private readonly supervisors = new Map<string, Set<ConnectedClient>>();
+  private readonly maxSupervisedSessions: number;
+
+  constructor(maxSupervisedSessions = DEFAULT_MAX_SUPERVISED_SESSIONS) {
+    this.maxSupervisedSessions = Math.max(1, Math.floor(maxSupervisedSessions));
+  }
 
   /** Start supervising a session. */
   supervise(sessionId: string, client: ConnectedClient): void {
     let clients = this.supervisors.get(sessionId);
     if (!clients) {
+      while (this.supervisors.size >= this.maxSupervisedSessions) {
+        const oldest = this.supervisors.keys().next();
+        if (oldest.done) break;
+        this.supervisors.delete(oldest.value);
+        log.warn(
+          { sessionId: oldest.value, maxSupervisedSessions: this.maxSupervisedSessions },
+          'Evicted oldest supervised session to enforce cap',
+        );
+      }
       clients = new Set();
       this.supervisors.set(sessionId, clients);
     }

@@ -57,6 +57,60 @@ function parseBoolean(value: string | undefined): boolean | undefined {
   throw new Error(`Invalid boolean value: ${value}`);
 }
 
+function parseRelayTlsVerify(value: string | undefined): 'auto' | '0' | '1' | undefined {
+  if (!value) return undefined;
+  const lowered = value.trim().toLowerCase();
+  if (lowered === 'auto') return 'auto';
+  if (lowered === '1' || lowered === 'true' || lowered === 'yes' || lowered === 'on') return '1';
+  if (lowered === '0' || lowered === 'false' || lowered === 'no' || lowered === 'off') return '0';
+  throw new Error(`Invalid relay tls verify value: ${value}. Expected auto|0|1.`);
+}
+
+function parseCsvList(value: string | undefined): string[] | undefined {
+  if (!value) return undefined;
+  const entries = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return entries.length > 0 ? entries : undefined;
+}
+
+function parsePositiveInt(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`Invalid non-negative integer value: ${value}`);
+  }
+  return parsed;
+}
+
+function parseSigningKeys(value: string | undefined): Record<string, string> | undefined {
+  if (!value) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (error) {
+    throw new Error(
+      `Invalid relay token signing keys JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Invalid relay token signing keys JSON: expected object');
+  }
+  const result: Record<string, string> = {};
+  for (const [kid, key] of Object.entries(parsed)) {
+    if (typeof kid !== 'string' || typeof key !== 'string') continue;
+    const normalizedKid = kid.trim();
+    const normalizedKey = key.trim();
+    if (!normalizedKid || !normalizedKey) continue;
+    result[normalizedKid] = normalizedKey;
+  }
+  if (Object.keys(result).length === 0) {
+    throw new Error('Invalid relay token signing keys JSON: no non-empty keys found');
+  }
+  return result;
+}
+
 function envValue(...keys: string[]): string | undefined {
   for (const key of keys) {
     const value = process.env[key];
@@ -146,13 +200,71 @@ export async function resolveDaemonSettingsFromSources(): Promise<DaemonResolved
     undefined;
 
   const relayEnabledFromEnv = parseBoolean(envValue('VPD_RELAY_ENABLED', 'VIEWPORT_RELAY_ENABLED'));
-  const relayEnabled = hasFlag('no-relay')
-    ? false
-    : (relayEnabledFromEnv ?? daemonConfig?.relay?.enabled ?? false);
+  const relayEnabled = hasFlag('relay')
+    ? true
+    : hasFlag('no-relay')
+      ? false
+      : (relayEnabledFromEnv ?? daemonConfig?.relay?.enabled ?? false);
   const relayEndpoint =
     getFlag('relay-endpoint') ??
     envValue('VPD_RELAY_ENDPOINT', 'VIEWPORT_RELAY_ENDPOINT') ??
     daemonConfig?.relay?.endpoint;
+  const relayServerUrl =
+    getFlag('relay-server') ??
+    envValue('VPD_RELAY_SERVER', 'VIEWPORT_RELAY_SERVER') ??
+    daemonConfig?.relay?.serverUrl;
+  const relayWorkspaceId =
+    getFlag('relay-workspace') ??
+    envValue('VPD_RELAY_WORKSPACE', 'VIEWPORT_RELAY_WORKSPACE') ??
+    daemonConfig?.relay?.workspaceId;
+  const relayEnrollToken =
+    getFlag('relay-enroll-token') ??
+    envValue('VPD_RELAY_ENROLL_TOKEN', 'VIEWPORT_RELAY_ENROLL_TOKEN') ??
+    daemonConfig?.relay?.enrollToken;
+  const relayIssueToken =
+    getFlag('relay-issue-token') ??
+    envValue('VPD_RELAY_ISSUE_TOKEN', 'VIEWPORT_RELAY_ISSUE_TOKEN') ??
+    daemonConfig?.relay?.issueToken;
+  const relayTlsVerify =
+    parseRelayTlsVerify(getFlag('relay-tls-verify')) ??
+    parseRelayTlsVerify(envValue('VPD_RELAY_TLS_VERIFY', 'VIEWPORT_RELAY_TLS_VERIFY')) ??
+    daemonConfig?.relay?.tlsVerify ??
+    'auto';
+  const relayCaCertPath =
+    getFlag('relay-ca-cert') ??
+    envValue('VPD_RELAY_CA_CERT', 'VIEWPORT_RELAY_CA_CERT') ??
+    daemonConfig?.relay?.caCertPath;
+  const relayTlsPins =
+    parseCsvList(getFlag('relay-tls-pins')) ??
+    parseCsvList(envValue('VPD_RELAY_TLS_PINS', 'VIEWPORT_RELAY_TLS_PINS')) ??
+    daemonConfig?.relay?.tlsPins;
+  const relayTokenIssuer =
+    getFlag('relay-token-issuer') ??
+    envValue('VPD_RELAY_TOKEN_ISSUER', 'VIEWPORT_RELAY_TOKEN_ISSUER') ??
+    daemonConfig?.relay?.tokenIssuer;
+  const relayTokenAudience =
+    getFlag('relay-token-audience') ??
+    envValue('VPD_RELAY_TOKEN_AUDIENCE', 'VIEWPORT_RELAY_TOKEN_AUDIENCE') ??
+    daemonConfig?.relay?.tokenAudience;
+  const relayTokenJwksUrl =
+    getFlag('relay-token-jwks-url') ??
+    envValue('VPD_RELAY_TOKEN_JWKS_URL', 'VIEWPORT_RELAY_TOKEN_JWKS_URL') ??
+    daemonConfig?.relay?.tokenJwksUrl ??
+    (relayServerUrl
+      ? `${relayServerUrl.replace(/\/+$/, '')}/api/.well-known/jwks.json`
+      : undefined);
+  const relayTokenSigningKeys =
+    parseSigningKeys(getFlag('relay-token-signing-keys-json')) ??
+    parseSigningKeys(
+      envValue('VPD_RELAY_TOKEN_SIGNING_KEYS_JSON', 'VIEWPORT_RELAY_TOKEN_SIGNING_KEYS_JSON'),
+    ) ??
+    daemonConfig?.relay?.signingKeys;
+  const relayTokenClockSkewSec =
+    parsePositiveInt(getFlag('relay-token-clock-skew-sec')) ??
+    parsePositiveInt(
+      envValue('VPD_RELAY_TOKEN_CLOCK_SKEW_SEC', 'VIEWPORT_RELAY_TOKEN_CLOCK_SKEW_SEC'),
+    ) ??
+    daemonConfig?.relay?.tokenClockSkewSec;
 
   const launch: RuntimeLaunchConfig = {
     listen: listenTarget.listen,
@@ -168,6 +280,18 @@ export async function resolveDaemonSettingsFromSources(): Promise<DaemonResolved
     logPath,
     relayEnabled,
     relayEndpoint,
+    relayServerUrl,
+    relayWorkspaceId,
+    relayEnrollToken,
+    relayIssueToken,
+    relayTlsVerify,
+    relayCaCertPath,
+    relayTlsPins,
+    relayTokenIssuer,
+    relayTokenAudience,
+    relayTokenJwksUrl,
+    relayTokenSigningKeys,
+    relayTokenClockSkewSec,
   };
 
   return {

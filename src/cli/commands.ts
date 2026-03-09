@@ -24,3 +24,4 @@ export { agent } from './agent-commands.js';
 export { worktree } from './worktree-commands.js';
 export { service } from './service-commands.js';
 export { setup } from './setup-command.js';
+export { remote } from './remote-commands.js';

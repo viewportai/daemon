@@ -13,6 +13,8 @@ import os from 'node:os';
 import type { SessionConfig } from './types.js';
 import type { AgentRegistry } from './agent-registry.js';
 import { ViewportConfigSchema } from './config-schema.js';
+import type { RuntimeLaunchConfig } from '../cli/supervisor-protocol.js';
+import { validateRelayRuntimeSecurity } from '../startup-relay-security.js';
 
 // ---------------------------------------------------------------------------
 // Built-in defaults — AGENT-AGNOSTIC framework defaults only.
@@ -57,6 +59,7 @@ export function deepMerge<T>(...sources: Array<Partial<T> | undefined>): T {
   for (const source of sources) {
     if (!source) continue;
     for (const [key, value] of Object.entries(source as Record<string, unknown>)) {
+      if (isUnsafeMergeKey(key)) continue;
       if (value === undefined) continue;
       const existing = result[key];
       if (isPlainObject(existing) && isPlainObject(value)) {
@@ -70,8 +73,47 @@ export function deepMerge<T>(...sources: Array<Partial<T> | undefined>): T {
   return result as T;
 }
 
+function toRuntimeConfigForDaemonValidation(
+  daemonConfig: NonNullable<ViewportConfig['daemon']>,
+): RuntimeLaunchConfig {
+  const relay = daemonConfig.relay ?? {};
+  return {
+    listen: daemonConfig.listen ?? '127.0.0.1:7070',
+    host: '127.0.0.1',
+    port: 7070,
+    version: 'config-manager',
+    profile: daemonConfig.profile ?? 'local',
+    authEnabled: daemonConfig.authEnabled ?? true,
+    detached: false,
+    relayEnabled: relay.enabled ?? false,
+    relayEndpoint: relay.endpoint,
+    relayServerUrl: relay.serverUrl,
+    relayWorkspaceId: relay.workspaceId,
+    relayEnrollToken: relay.enrollToken,
+    relayIssueToken: relay.issueToken,
+    relayTlsVerify: relay.tlsVerify ?? 'auto',
+    relayCaCertPath: relay.caCertPath,
+    relayTlsPins: relay.tlsPins,
+    relayTokenIssuer: relay.tokenIssuer,
+    relayTokenAudience: relay.tokenAudience,
+    relayTokenJwksUrl:
+      relay.tokenJwksUrl ??
+      (relay.serverUrl
+        ? `${relay.serverUrl.replace(/\/+$/, '')}/api/.well-known/jwks.json`
+        : undefined),
+    relayTokenSigningKeys: relay.signingKeys,
+    relayTokenClockSkewSec: relay.tokenClockSkewSec,
+  };
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function isUnsafeMergeKey(key: string): boolean {
+  return key === '__proto__' || key === 'prototype' || key === 'constructor';
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +143,18 @@ export interface ViewportConfig {
       enabled?: boolean;
       endpoint?: string;
       publicEndpoint?: string;
+      serverUrl?: string;
+      workspaceId?: string;
+      enrollToken?: string;
+      issueToken?: string;
+      tlsVerify?: 'auto' | '0' | '1';
+      caCertPath?: string;
+      tlsPins?: string[];
+      tokenIssuer?: string;
+      tokenAudience?: string;
+      tokenJwksUrl?: string;
+      signingKeys?: Record<string, string>;
+      tokenClockSkewSec?: number;
     };
   };
 }
@@ -159,7 +213,10 @@ export async function loadConfig(): Promise<ViewportConfig> {
 export async function saveConfig(config: ViewportConfig): Promise<void> {
   const dir = configDir();
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(configFilePath(), JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  await fs.writeFile(configFilePath(), JSON.stringify(config, null, 2) + '\n', {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +340,17 @@ export class ConfigManager {
           enabled?: boolean;
           endpoint?: string;
           publicEndpoint?: string;
+          serverUrl?: string;
+          workspaceId?: string;
+          enrollToken?: string;
+          issueToken?: string;
+          tlsVerify?: 'auto' | '0' | '1';
+          caCertPath?: string;
+          tlsPins?: string[];
+          tokenIssuer?: string;
+          tokenAudience?: string;
+          signingKeys?: Record<string, string>;
+          tokenClockSkewSec?: number;
         };
       }
     | undefined {
@@ -293,7 +361,12 @@ export class ConfigManager {
   /** Merge daemon runtime settings into config. */
   async setDaemonConfig(daemonConfig: NonNullable<ViewportConfig['daemon']>): Promise<void> {
     this.ensureLoaded();
-    this.config.daemon = deepMerge(this.config.daemon ?? {}, daemonConfig);
+    const merged = deepMerge<NonNullable<ViewportConfig['daemon']>>(
+      this.config.daemon ?? {},
+      daemonConfig,
+    );
+    validateRelayRuntimeSecurity(toRuntimeConfigForDaemonValidation(merged));
+    this.config.daemon = merged;
     await saveConfig(this.config);
   }
 

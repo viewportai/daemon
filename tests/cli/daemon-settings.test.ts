@@ -16,6 +16,14 @@ describe('daemon settings resolution', () => {
     delete process.env['VPD_ALLOWED_ORIGINS'];
     delete process.env['VPD_PROFILE'];
     delete process.env['VPD_AUTH'];
+    delete process.env['VPD_RELAY_ENABLED'];
+    delete process.env['VPD_RELAY_ENDPOINT'];
+    delete process.env['VPD_RELAY_SERVER'];
+    delete process.env['VPD_RELAY_WORKSPACE'];
+    delete process.env['VPD_RELAY_ENROLL_TOKEN'];
+    delete process.env['VPD_RELAY_TLS_VERIFY'];
+    delete process.env['VPD_RELAY_CA_CERT'];
+    delete process.env['VPD_RELAY_TOKEN_JWKS_URL'];
   });
 
   afterEach(async () => {
@@ -26,6 +34,14 @@ describe('daemon settings resolution', () => {
     delete process.env['VPD_ALLOWED_ORIGINS'];
     delete process.env['VPD_PROFILE'];
     delete process.env['VPD_AUTH'];
+    delete process.env['VPD_RELAY_ENABLED'];
+    delete process.env['VPD_RELAY_ENDPOINT'];
+    delete process.env['VPD_RELAY_SERVER'];
+    delete process.env['VPD_RELAY_WORKSPACE'];
+    delete process.env['VPD_RELAY_ENROLL_TOKEN'];
+    delete process.env['VPD_RELAY_TLS_VERIFY'];
+    delete process.env['VPD_RELAY_CA_CERT'];
+    delete process.env['VPD_RELAY_TOKEN_JWKS_URL'];
     await fs.rm(homeDir, { recursive: true, force: true });
     vi.resetModules();
   });
@@ -118,5 +134,67 @@ describe('daemon settings resolution', () => {
     expect(resolved.launch.profile).toBe('lan');
     expect(resolved.launch.authEnabled).toBe(true);
     expect(resolved.launch.allowedHostsRaw).toBe('config.example.test,cli.example.test');
+  });
+
+  it('resolves relay runtime settings from config/env/cli', async () => {
+    await fs.mkdir(homeDir, { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, 'config.json'),
+      JSON.stringify({
+        daemon: {
+          relay: {
+            enabled: false,
+            endpoint: 'wss://config-relay.test:7781/ws',
+            serverUrl: 'https://config-server.test',
+            workspaceId: 'config-workspace',
+            enrollToken: 'config-token',
+            tlsVerify: '1',
+            caCertPath: '/config/ca.pem',
+          },
+        },
+      }),
+      'utf-8',
+    );
+
+    process.env['VPD_RELAY_ENABLED'] = '1';
+    process.env['VPD_RELAY_ENDPOINT'] = 'wss://env-relay.test:7781/ws';
+    process.env['VPD_RELAY_SERVER'] = 'https://env-server.test';
+    process.env['VPD_RELAY_WORKSPACE'] = 'env-workspace';
+    process.env['VPD_RELAY_ENROLL_TOKEN'] = 'env-token';
+    process.env['VPD_RELAY_TLS_VERIFY'] = '0';
+    process.env['VPD_RELAY_CA_CERT'] = '/env/ca.pem';
+
+    process.argv = [
+      'node',
+      'vpd',
+      'start',
+      '--relay',
+      '--relay-endpoint',
+      'wss://cli-relay.test:7781/ws',
+      '--relay-server',
+      'https://cli-server.test',
+      '--relay-workspace',
+      'cli-workspace',
+      '--relay-enroll-token',
+      'cli-token',
+      '--relay-tls-verify',
+      'auto',
+      '--relay-ca-cert',
+      '/cli/ca.pem',
+    ];
+
+    const { resolveDaemonSettingsFromSources } = await import('../../src/cli/daemon-settings.js');
+    const resolved = await resolveDaemonSettingsFromSources();
+
+    expect(resolved.launch.relayEnabled).toBe(true);
+    expect(resolved.launch.relayEndpoint).toBe('wss://cli-relay.test:7781/ws');
+    expect(resolved.launch.relayServerUrl).toBe('https://cli-server.test');
+    expect(resolved.launch.relayWorkspaceId).toBe('cli-workspace');
+    expect(resolved.launch.relayEnrollToken).toBe('cli-token');
+    expect(resolved.launch.relayTlsVerify).toBe('auto');
+    expect(resolved.launch.relayCaCertPath).toBe('/cli/ca.pem');
+    expect(resolved.launch.relayTokenJwksUrl).toBe(
+      'https://cli-server.test/api/.well-known/jwks.json',
+    );
   });
 });
