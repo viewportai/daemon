@@ -1,3 +1,10 @@
+# [0.2.0](https://github.com/viewportai/daemon/compare/v0.1.0...v0.2.0) (2026-03-09)
+
+
+### Features
+
+* **relay:** add native remote runtime bridge ([#2](https://github.com/viewportai/daemon/issues/2)) ([61c0cbb](https://github.com/viewportai/daemon/commit/61c0cbb9163785fff6d42b9a2a429424802bd989))
+
 # [0.1.0](https://github.com/viewportai/daemon/compare/v0.0.0...v0.1.0) (2026-03-03)
 
 
