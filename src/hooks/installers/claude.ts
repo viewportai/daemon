@@ -163,5 +163,8 @@ async function readSettings(filePath: string): Promise<Record<string, unknown>> 
 
 async function writeSettings(filePath: string, settings: Record<string, unknown>): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+  await fs.writeFile(filePath, JSON.stringify(settings, null, 2) + '\n', {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
 }

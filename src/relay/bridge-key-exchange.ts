@@ -20,6 +20,7 @@ export interface RelayKeyExchangeInitFrame {
   clientPublicKey: string;
   clientNonce: string;
   clientProof: string;
+  pairingPeerId?: string;
   previousSessionId?: string;
 }
 
@@ -238,6 +239,11 @@ export function parseRelayKeyExchangeInitFrame(value: unknown): RelayKeyExchange
   }
   const previousSessionId =
     typeof frame['previousSessionId'] === 'string' ? frame['previousSessionId'] : undefined;
+  const pairingPeerId =
+    typeof frame['pairingPeerId'] === 'string' ? frame['pairingPeerId'] : undefined;
+  if (profile === 'noise-ikpsk2' && (!pairingPeerId || pairingPeerId.trim().length === 0)) {
+    return null;
+  }
   return {
     type: 'relay_key_exchange_init',
     version: 2,
@@ -246,6 +252,7 @@ export function parseRelayKeyExchangeInitFrame(value: unknown): RelayKeyExchange
     clientPublicKey: frame['clientPublicKey'],
     clientNonce: frame['clientNonce'],
     clientProof: frame['clientProof'],
+    pairingPeerId,
     previousSessionId,
   };
 }

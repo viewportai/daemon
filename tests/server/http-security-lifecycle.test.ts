@@ -133,7 +133,10 @@ describe('HTTP security and lifecycle routes', () => {
       headers: {
         host: '127.0.0.1',
       },
-      payload: { event: 'dummy' },
+      payload: {
+        hook_event_name: 'Notification',
+        session_id: 'session-local',
+      },
     });
     expect(res.statusCode).toBe(200);
   });
@@ -157,7 +160,10 @@ describe('HTTP security and lifecycle routes', () => {
         host: 'example.test',
         origin: 'https://example.test',
       },
-      payload: { event: 'dummy' },
+      payload: {
+        hook_event_name: 'Notification',
+        session_id: 'session-lan',
+      },
     });
     expect(res.statusCode).toBe(401);
   });

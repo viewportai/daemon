@@ -35,6 +35,7 @@ const log = logger.child({ module: 'ws-server' });
 const MAX_WS_MESSAGE_BYTES = 1_048_576;
 const MAX_CLIENT_PENDING_BYTES = 4 * 1_048_576;
 const COMMAND_TIMEOUT_MS = 60_000;
+const MAX_RING_BUFFERS = 2048;
 
 export interface WsServerOptions {
   hookRouter?: HookRouter;
@@ -76,11 +77,30 @@ export function registerWsServer(
   // Backpressure: drop non-critical updates for slow clients
   const HIGH_WATERMARK_BYTES = 1024 * 1024;
 
+  function enforceRingBufferCapacity(): void {
+    while (ringBuffers.size > MAX_RING_BUFFERS) {
+      const oldest = ringBuffers.keys().next();
+      if (oldest.done) break;
+      ringBuffers.delete(oldest.value);
+    }
+  }
+
   function getOrCreateBuffer(sessionId: string): RingBuffer {
     let buffer = ringBuffers.get(sessionId);
     if (!buffer) {
-      buffer = new RingBuffer();
+      enforceRingBufferCapacity();
+      let directoryId: string | undefined;
+      try {
+        directoryId = daemon.getSessionInfo(sessionId).directoryId;
+      } catch {
+        directoryId = undefined;
+      }
+      buffer = new RingBuffer({ sessionId });
+      if (directoryId) {
+        buffer.setDirectoryId(directoryId);
+      }
       ringBuffers.set(sessionId, buffer);
+      enforceRingBufferCapacity();
     }
     return buffer;
   }
@@ -365,8 +385,9 @@ export function registerWsServer(
   });
 
   // Clean up intervals when Fastify shuts down
-  app.addHook('onClose', () => {
+  app.addHook('onClose', async () => {
     cleanupBridge();
+    await Promise.all([...ringBuffers.values()].map((buffer) => buffer.flushPersistence()));
   });
 }
 

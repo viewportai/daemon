@@ -310,4 +310,53 @@ describe('ws-command-handlers', () => {
     expect(sendAck).toHaveBeenCalledWith(client, 'watch-1', 'ok');
     expect(sendAck).toHaveBeenCalledWith(client, 'unwatch-1', 'ok');
   });
+
+  it('bounds per-client subscription tracking to avoid unbounded growth', async () => {
+    const { client } = createClient();
+    const daemon = {} as Record<string, unknown>;
+    const sendAck = vi.fn();
+    const handlers = createWsCommandHandlers({
+      daemon: daemon as any,
+      sendAck,
+      getOrCreateBuffer: getOrCreateBuffer as any,
+    });
+
+    for (let i = 0; i < 1100; i += 1) {
+      await handlers['subscribe'](client, {
+        type: 'subscribe',
+        sessionId: `session-${i}`,
+        requestId: `req-${i}`,
+      });
+    }
+
+    expect(client.subscriptions.size).toBeLessThanOrEqual(1024);
+    expect(client.subscriptions.has('session-0')).toBe(false);
+    expect(client.subscriptions.has('session-1099')).toBe(true);
+  });
+
+  it('bounds discovered watch tracking to avoid unbounded growth', async () => {
+    const { client } = createClient();
+    const daemon = {} as Record<string, unknown>;
+    const sendAck = vi.fn();
+    const handlers = createWsCommandHandlers({
+      daemon: daemon as any,
+      sendAck,
+      getOrCreateBuffer: getOrCreateBuffer as any,
+    });
+
+    for (let i = 0; i < 2100; i += 1) {
+      await handlers['watch-discovered-session'](client, {
+        type: 'watch-discovered-session',
+        sessionId: `disc-${i}`,
+        directoryId: 'dir-1',
+        requestId: `watch-${i}`,
+      });
+    }
+
+    expect(client.watchedDiscoveredSessions.size).toBeLessThanOrEqual(2048);
+    expect(client.watchedDiscoveredSessions.has(discoveredWatchKey('disc-0', 'dir-1'))).toBe(false);
+    expect(client.watchedDiscoveredSessions.has(discoveredWatchKey('disc-2099', 'dir-1'))).toBe(
+      true,
+    );
+  });
 });

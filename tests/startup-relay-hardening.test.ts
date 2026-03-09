@@ -40,6 +40,15 @@ describe('startup relay hardening', () => {
     expect(() => validateRelayRuntimeSecurity(config)).toThrow('relay token verification');
   });
 
+  it('allows loopback http JWKS URL for local relay-enabled development', () => {
+    const config = baseLaunch({
+      profile: 'local',
+      relayTokenSigningKeys: undefined,
+      relayTokenJwksUrl: 'http://127.0.0.1:7780/api/.well-known/jwks.json',
+    });
+    expect(() => validateRelayRuntimeSecurity(config)).not.toThrow();
+  });
+
   it('requires strict TLS verification in relay profile', () => {
     const config = baseLaunch({ relayTlsVerify: '0' });
     expect(() => validateRelayRuntimeSecurity(config)).toThrow('relay tls verify');
@@ -50,13 +59,29 @@ describe('startup relay hardening', () => {
     expect(() => validateRelayRuntimeSecurity(config)).toThrow('relay tls pins');
   });
 
-  it('allows local profile without strict relay controls', () => {
+  it('requires trusted token verification material even outside relay profile', () => {
     const config = baseLaunch({
       profile: 'local',
       relayTokenSigningKeys: undefined,
+      relayTokenJwksUrl: undefined,
+    });
+    expect(() => validateRelayRuntimeSecurity(config)).toThrow('relay token verification');
+  });
+
+  it('allows local profile to skip relay-profile-only TLS/pinning controls', () => {
+    const config = baseLaunch({
+      profile: 'local',
       relayTlsVerify: '0',
       relayTlsPins: [],
     });
     expect(() => validateRelayRuntimeSecurity(config)).not.toThrow();
+  });
+
+  it('requires wss relay endpoint for lan profile when relay is enabled', () => {
+    const config = baseLaunch({
+      profile: 'lan',
+      relayEndpoint: 'ws://relay.example.com/ws',
+    });
+    expect(() => validateRelayRuntimeSecurity(config)).toThrow('relay endpoint must use wss');
   });
 });

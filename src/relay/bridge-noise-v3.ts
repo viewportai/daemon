@@ -11,6 +11,7 @@ export interface RelayKeyExchangeInitFrameV3 {
   requestId: string;
   clientEphemeralPublicKey: string;
   encryptedClientStatic: string;
+  pairingPeerId?: string;
   previousSessionId?: string;
 }
 
@@ -33,6 +34,7 @@ export interface NoiseV3InitState {
   daemonPublicKey: string;
   clientStaticPrivateKey: Buffer;
   clientEphemeralPrivateKey: Buffer;
+  pairingPeerId?: string;
   ck: Buffer;
   h: Buffer;
   k: Buffer | null;
@@ -177,6 +179,18 @@ function decryptAndHash(state: NoiseSymmetricState, ciphertext: Buffer): Buffer 
   return plaintext;
 }
 
+function timingSafeEqualBase64Url(left: string, right: string): boolean {
+  const leftBytes = fromBase64Url(left);
+  const rightBytes = fromBase64Url(right);
+  const compareLength = Math.max(leftBytes.length, rightBytes.length, 1);
+  const paddedLeft = Buffer.alloc(compareLength);
+  const paddedRight = Buffer.alloc(compareLength);
+  leftBytes.copy(paddedLeft);
+  rightBytes.copy(paddedRight);
+  const equal = crypto.timingSafeEqual(paddedLeft, paddedRight);
+  return equal && leftBytes.length === rightBytes.length;
+}
+
 function split(state: NoiseSymmetricState): [Buffer, Buffer] {
   const [k1, k2] = hkdfOutputs(state.ck, EMPTY, 2);
   return [k1, k2];
@@ -275,6 +289,14 @@ export function parseRelayKeyExchangeInitFrameV3(
 
   const previousSessionId =
     typeof frame['previousSessionId'] === 'string' ? frame['previousSessionId'] : undefined;
+  const pairingPeerId =
+    typeof frame['pairingPeerId'] === 'string' ? frame['pairingPeerId'] : undefined;
+  if (
+    frame['profile'] === 'noise-ikpsk2' &&
+    (!pairingPeerId || pairingPeerId.trim().length === 0)
+  ) {
+    return null;
+  }
 
   return {
     type: 'relay_key_exchange_init',
@@ -283,6 +305,7 @@ export function parseRelayKeyExchangeInitFrameV3(
     requestId: frame['requestId'],
     clientEphemeralPublicKey: frame['clientEphemeralPublicKey'],
     encryptedClientStatic: frame['encryptedClientStatic'],
+    pairingPeerId,
     previousSessionId,
   };
 }
@@ -311,6 +334,7 @@ export function isRelayKeyExchangeResponseFrameV3(
 export function createNoiseV3Init(params: {
   profile: NoiseV3HandshakeProfile;
   daemonPublicKey: string;
+  pairingPeerId?: string;
   requestId?: string;
   previousSessionId?: string;
   pairingSecret?: Buffer;
@@ -320,7 +344,6 @@ export function createNoiseV3Init(params: {
   if (params.profile === 'noise-ikpsk2' && !params.pairingSecret) {
     throw new Error('pairing secret required for noise-ikpsk2');
   }
-
   const daemonPublicKeyRaw = fromBase64Url(params.daemonPublicKey);
   validatePublicKey(daemonPublicKeyRaw, 'daemon');
 
@@ -367,6 +390,7 @@ export function createNoiseV3Init(params: {
       requestId,
       clientEphemeralPublicKey: toBase64Url(ephemeralKeys.publicKey),
       encryptedClientStatic: toBase64Url(encryptedClientStatic),
+      pairingPeerId: params.pairingPeerId,
       previousSessionId: params.previousSessionId,
     },
     state: {
@@ -375,6 +399,7 @@ export function createNoiseV3Init(params: {
       daemonPublicKey: params.daemonPublicKey,
       clientStaticPrivateKey: staticKeys.privateKey,
       clientEphemeralPrivateKey: ephemeralKeys.privateKey,
+      pairingPeerId: params.pairingPeerId,
       ck: Buffer.from(state.ck),
       h: Buffer.from(state.h),
       k: state.k ? Buffer.from(state.k) : null,
@@ -526,7 +551,7 @@ export function finalizeNoiseV3Response(params: {
   }
 
   const expectedProof = toBase64Url(state.h);
-  if (expectedProof !== params.response.proof) {
+  if (!timingSafeEqualBase64Url(expectedProof, params.response.proof)) {
     throw new Error('noise handshake proof mismatch');
   }
 

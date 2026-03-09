@@ -51,7 +51,10 @@ async function saveSetupState(plan: SetupPlan): Promise<void> {
     plan,
   };
   await fs.mkdir(configDir(), { recursive: true });
-  await fs.writeFile(setupStatePath(), JSON.stringify(state, null, 2) + '\n', 'utf-8');
+  await fs.writeFile(setupStatePath(), JSON.stringify(state, null, 2) + '\n', {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
 }
 
 async function promptYesNo(question: string, defaultYes = true): Promise<boolean> {

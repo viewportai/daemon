@@ -53,6 +53,31 @@ describe('deepMerge', () => {
     const result = deepMerge({ a: 1 }, null as any, { b: 2 });
     expect(result).toEqual({ a: 1, b: 2 });
   });
+
+  it('ignores prototype pollution keys', () => {
+    const payload = JSON.parse('{"__proto__":{"polluted":true},"constructor":{"x":1}}') as Record<
+      string,
+      unknown
+    >;
+    const result = deepMerge({ safe: true }, payload);
+    expect((result as Record<string, unknown>)['safe']).toBe(true);
+    expect((result as Record<string, unknown>)['polluted']).toBeUndefined();
+    expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
+  });
+
+  it('does not deep-merge objects with non-standard prototypes', () => {
+    const customProto = { inherited: true };
+    const custom = Object.create(customProto) as Record<string, unknown>;
+    custom['value'] = 3;
+
+    const result = deepMerge({ nested: { safe: 1 } }, { nested: custom }) as Record<
+      string,
+      unknown
+    >;
+    const nested = result['nested'] as Record<string, unknown>;
+    expect(nested['value']).toBe(3);
+    expect(nested['safe']).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -184,6 +209,9 @@ describe('Config I/O', () => {
     const parsed = JSON.parse(raw);
     expect(parsed.machineId).toBe('test-machine');
     expect(parsed.defaults.agent).toBe('claude');
+
+    const stat = await fs.stat(configPath);
+    expect(stat.mode & 0o777).toBe(0o600);
   });
 
   it('loadConfig reads back what saveConfig wrote', async () => {
@@ -341,5 +369,43 @@ describe('ConfigManager', () => {
 
     const config = mgr.resolveSessionConfig();
     expect(config.model).toBe('claude-opus-4-6');
+  });
+
+  it('rejects insecure relay runtime config on setDaemonConfig', async () => {
+    const mgr = new ConfigManager();
+    await mgr.load();
+
+    await expect(
+      mgr.setDaemonConfig({
+        profile: 'lan',
+        relay: {
+          enabled: true,
+          endpoint: 'ws://relay.getviewport.test/ws',
+          tlsVerify: '0',
+          signingKeys: {
+            k1: 'a'.repeat(32),
+          },
+        },
+      }),
+    ).rejects.toThrow('relay tls verify');
+  });
+
+  it('accepts local relay config when signing keys are present', async () => {
+    const mgr = new ConfigManager();
+    await mgr.load();
+
+    await expect(
+      mgr.setDaemonConfig({
+        profile: 'local',
+        relay: {
+          enabled: true,
+          endpoint: 'ws://127.0.0.1:7781/ws',
+          tlsVerify: 'auto',
+          signingKeys: {
+            k1: 'b'.repeat(32),
+          },
+        },
+      }),
+    ).resolves.toBeUndefined();
   });
 });

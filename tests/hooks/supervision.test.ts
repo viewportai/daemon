@@ -86,4 +86,17 @@ describe('SupervisionManager', () => {
     const client = mockClient();
     expect(mgr.removeClient(client)).toEqual([]);
   });
+
+  it('evicts oldest supervised sessions when cap is reached', () => {
+    const mgr = new SupervisionManager(2);
+    const client = mockClient();
+    mgr.supervise('session-1', client);
+    mgr.supervise('session-2', client);
+    mgr.supervise('session-3', client);
+
+    expect(mgr.isSupervised('session-1')).toBe(false);
+    expect(mgr.isSupervised('session-2')).toBe(true);
+    expect(mgr.isSupervised('session-3')).toBe(true);
+    expect(mgr.getSupervisedSessions().sort()).toEqual(['session-2', 'session-3']);
+  });
 });

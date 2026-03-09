@@ -53,7 +53,9 @@ export async function loadPersistedSessions(): Promise<PersistedSession[]> {
 
 export async function savePersistedSessions(sessions: PersistedSession[]): Promise<void> {
   await fs.mkdir(configDir(), { recursive: true });
-  await fs.writeFile(stateFilePath(), JSON.stringify(sessions, null, 2) + '\n');
+  await fs.writeFile(stateFilePath(), JSON.stringify(sessions, null, 2) + '\n', {
+    mode: 0o600,
+  });
 }
 
 export async function clearPersistedSessions(): Promise<void> {

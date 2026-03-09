@@ -7,6 +7,19 @@ import type { IncomingMessage } from './ws-protocol.js';
 import { discoveredWatchKey, removeDiscoveredWatch } from './discovered-watch-key.js';
 import { ErrorCodes } from '../core/error-codes.js';
 
+const MAX_CLIENT_SUBSCRIPTIONS = 1024;
+const MAX_CLIENT_DISCOVERED_WATCHES = 2048;
+
+function addBoundedSetEntry(set: Set<string>, value: string, maxEntries: number): void {
+  if (set.has(value)) return;
+  while (set.size >= maxEntries) {
+    const oldest = set.values().next();
+    if (oldest.done) break;
+    set.delete(oldest.value);
+  }
+  set.add(value);
+}
+
 type IncomingByType<T extends IncomingMessage['type']> = Extract<IncomingMessage, { type: T }>;
 
 export interface AckSender {
@@ -66,7 +79,7 @@ export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
       if (initialPrompt.length > 0) {
         await daemon.sendPrompt(sessionId, initialPrompt);
       }
-      client.subscriptions.add(sessionId);
+      addBoundedSetEntry(client.subscriptions, sessionId, MAX_CLIENT_SUBSCRIPTIONS);
 
       const dir = daemon.directoryManager.get(msg.directoryId);
       client.send(
@@ -123,7 +136,7 @@ export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
     },
 
     subscribe: async (client, msg) => {
-      client.subscriptions.add(msg.sessionId);
+      addBoundedSetEntry(client.subscriptions, msg.sessionId, MAX_CLIENT_SUBSCRIPTIONS);
       const buffer = getOrCreateBuffer(msg.sessionId);
       const replayWindow = buffer.getReplayWindow(msg.lastSeq ?? 0);
 
@@ -138,9 +151,8 @@ export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
         );
       }
 
-      const lastEntry = replayWindow.entries[replayWindow.entries.length - 1];
       sendAck(client, msg.requestId, 'ok', undefined, {
-        lastSeq: lastEntry?.seq ?? msg.lastSeq ?? 0,
+        lastSeq: replayWindow.latestAvailableSeq,
         replayCount: replayWindow.entries.length,
         droppedWindow: replayWindow.droppedWindow,
         requestedLastSeq: replayWindow.requestedLastSeq,
@@ -227,7 +239,7 @@ export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
       if (initialPrompt.length > 0) {
         await daemon.sendPrompt(resumeSessionId, initialPrompt);
       }
-      client.subscriptions.add(resumeSessionId);
+      addBoundedSetEntry(client.subscriptions, resumeSessionId, MAX_CLIENT_SUBSCRIPTIONS);
       client.send(
         JSON.stringify({
           type: 'session-started',
@@ -243,7 +255,11 @@ export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
     },
 
     'watch-discovered-session': async (client, msg) => {
-      client.watchedDiscoveredSessions.add(discoveredWatchKey(msg.sessionId, msg.directoryId));
+      addBoundedSetEntry(
+        client.watchedDiscoveredSessions,
+        discoveredWatchKey(msg.sessionId, msg.directoryId),
+        MAX_CLIENT_DISCOVERED_WATCHES,
+      );
       sendAck(client, msg.requestId, 'ok');
     },
 

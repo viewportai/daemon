@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
@@ -121,6 +121,28 @@ describe('GitTracker', () => {
       `viewport/session-test-session`,
     ]);
     expect(stdout).toContain('[viewport] Step');
+  });
+
+  it('does not bypass git hooks with --no-verify', async () => {
+    const tracker = new GitTracker(DEFAULT_CONFIG, 'test-session');
+    const worktreePath = await tracker.setup('test-session', projectDir);
+    const gitSpy = vi.spyOn(
+      tracker as unknown as { git: (...args: unknown[]) => Promise<unknown> },
+      'git',
+    );
+
+    await fs.writeFile(path.join(worktreePath, 'hook-check.ts'), 'console.log("hook");\n');
+    tracker.onMessage(toolCallUpdate('Edit'));
+    await tracker.teardown();
+
+    const commitCalls = gitSpy.mock.calls.filter(
+      (call) => Array.isArray(call[0]) && (call[0] as string[])[0] === 'commit',
+    );
+    expect(commitCalls.length).toBeGreaterThan(0);
+    for (const call of commitCalls) {
+      const args = call[0] as string[];
+      expect(args).not.toContain('--no-verify');
+    }
   });
 
   it('does not commit for non-configured tools', async () => {

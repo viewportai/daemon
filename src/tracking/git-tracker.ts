@@ -288,10 +288,8 @@ export class GitTracker implements RunTracker {
 
     // Commit
     const message = `[viewport] Step ${step.step}: ${step.description}`;
-    // We skip local git hooks because daemon-generated commits must be non-interactive and deterministic.
-    // Operators should enforce secret scanning via centralized CI/push protection.
     await this.git(
-      ['commit', '-m', message, '--author', this.config.commitAuthor, '--no-verify'],
+      ['commit', '-m', message, '--author', this.config.commitAuthor],
       this.worktreePath,
     );
 
@@ -337,8 +335,6 @@ export class GitTracker implements RunTracker {
           `[viewport] Session log: ${this._steps.length} steps`,
           '--author',
           this.config.commitAuthor,
-          // Keep session-log commits non-interactive for the same reason as step commits.
-          '--no-verify',
         ],
         this.worktreePath,
       );

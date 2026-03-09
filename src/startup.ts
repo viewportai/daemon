@@ -11,7 +11,9 @@ import Fastify from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import fastifyCors from '@fastify/cors';
 import path from 'node:path';
+import os from 'node:os';
 import fs from 'node:fs/promises';
+import { readFileSync, existsSync } from 'node:fs';
 import { logger } from './core/output.js';
 import { Daemon } from './core/daemon.js';
 import { GitTracker } from './tracking/git-tracker.js';
@@ -79,8 +81,42 @@ function localDaemonWsUrl(config: RuntimeLaunchConfig): string | null {
     // ws+unix is not currently supported by the ws client in this relay bridge.
     return null;
   }
+  const tls = resolveTlsOptions();
   const host = config.host === '0.0.0.0' || config.host === '::' ? '127.0.0.1' : config.host;
-  return `ws://${host}:${config.port}/ws`;
+  return tls ? `wss://${tls.tlsHost}:${config.port}/ws` : `ws://${host}:${config.port}/ws`;
+}
+
+function resolveTlsOptions(): { cert: Buffer; key: Buffer; tlsHost: string } | null {
+  const tlsEnv = (process.env['VIEWPORT_TLS'] ?? 'auto').toLowerCase();
+  if (tlsEnv === '0' || tlsEnv === 'false' || tlsEnv === 'off') return null;
+
+  const tlsHost = process.env['VIEWPORT_TLS_HOST'] ?? 'getviewport.test';
+  const certDir = path.join(
+    os.homedir(),
+    'Library',
+    'Application Support',
+    'Herd',
+    'config',
+    'valet',
+    'Certificates',
+  );
+  const certPath = process.env['VIEWPORT_TLS_CERT'] ?? path.join(certDir, `${tlsHost}.crt`);
+  const keyPath = process.env['VIEWPORT_TLS_KEY'] ?? path.join(certDir, `${tlsHost}.key`);
+
+  if (tlsEnv === 'auto' && (!existsSync(certPath) || !existsSync(keyPath))) return null;
+  if (tlsEnv === '1' || tlsEnv === 'true' || tlsEnv === 'on') {
+    if (!existsSync(certPath) || !existsSync(keyPath)) {
+      throw new Error(
+        `VIEWPORT_TLS enabled but certs not found (cert=${certPath}, key=${keyPath})`,
+      );
+    }
+  }
+
+  return {
+    cert: readFileSync(certPath),
+    key: readFileSync(keyPath),
+    tlsHost,
+  };
 }
 
 function parsePositiveIntEnv(name: string): number | undefined {
@@ -223,11 +259,16 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
 
   const sessionPersistence = await setupSessionPersistence(daemon);
 
+  const tls = resolveTlsOptions();
+
+  // When TLS is enabled, automatically allow the TLS hostname + its subdomains
+  // so that app.getviewport.test can reach wss://getviewport.test:7070
+  const tlsHostAllowance = tls ? `,${tls.tlsHost},.${tls.tlsHost}` : '';
   const securityProfile = buildSecurityProfile({
     profile: config.profile,
     host: config.host,
-    allowedHostsRaw: config.allowedHostsRaw,
-    allowedOriginsRaw: config.allowedOriginsRaw,
+    allowedHostsRaw: (config.allowedHostsRaw ?? '') + tlsHostAllowance,
+    allowedOriginsRaw: (config.allowedOriginsRaw ?? '') + tlsHostAllowance,
     explicitAuthFlag: config.authEnabled,
   });
 
@@ -246,7 +287,12 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
   const supervision = new SupervisionManager();
   const hookRouter = new HookRouter(daemon, supervision);
 
+  if (tls) {
+    logger.log(`TLS:     enabled (host=${tls.tlsHost})`);
+  }
+
   const app = Fastify({
+    ...(tls ? { https: { cert: tls.cert, key: tls.key } } : {}),
     logger: {
       level: process.env['VIEWPORT_HTTP_LOG_LEVEL'] ?? 'info',
       // Prevent auth material from landing in request logs.

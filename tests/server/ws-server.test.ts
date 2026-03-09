@@ -812,52 +812,90 @@ describe('WebSocket Server', () => {
     client2.close();
   });
 
-  it('marks droppedWindow when subscribe lastSeq is older than retained replay window', async () => {
-    const producer = await connect();
-    await producer.nextMessage(); // hello
-    producer.send(
-      JSON.stringify({
-        type: 'subscribe',
-        sessionId: 'replay-drop-session',
-        requestId: 'drop-sub',
-      }),
-    );
-    await producer.nextMessage(); // ack
+  it('replays durable history after server restart from the persisted journal', async () => {
+    const sessionId = 'restart-replay-session';
 
-    for (let i = 1; i <= 520; i++) {
-      daemon.emit('session:message', {
-        sessionId: 'replay-drop-session',
-        message: {
-          type: 'agent_message',
-          text: `m${i}`,
-          messageId: `m${i}`,
-          timestamp: Date.now(),
+    const firstDaemon = new Daemon();
+    await firstDaemon.initialize();
+    const firstApp = Fastify();
+    await firstApp.register(fastifyWebsocket);
+    registerWsServer(firstApp, firstDaemon);
+    await firstApp.ready();
+
+    firstDaemon.emit('session:message', {
+      sessionId,
+      message: {
+        type: 'user_message',
+        text: 'persisted prompt',
+        messageId: 'persisted-user',
+        timestamp: Date.now(),
+      },
+    });
+    firstDaemon.emit('session:message', {
+      sessionId,
+      message: {
+        type: 'agent_message_chunk',
+        text: 'transient chunk',
+        messageId: 'persisted-chunk',
+        timestamp: Date.now(),
+      },
+    });
+    firstDaemon.emit('session:message', {
+      sessionId,
+      message: {
+        type: 'agent_message',
+        text: 'persisted reply',
+        messageId: 'persisted-agent',
+        timestamp: Date.now(),
+      },
+    });
+
+    await firstDaemon.shutdown();
+    await firstApp.close();
+
+    const secondDaemon = new Daemon();
+    await secondDaemon.initialize();
+    const secondApp = Fastify();
+    await secondApp.register(fastifyWebsocket);
+    registerWsServer(secondApp, secondDaemon);
+    await secondApp.ready();
+
+    let restartedClient: BufferedWs | null = null;
+    const restartedWs = (await secondApp.injectWS(
+      '/ws',
+      {},
+      {
+        onInit: (rawWs) => {
+          restartedClient = new BufferedWs(rawWs as unknown as WebSocket);
         },
-      });
-    }
+      },
+    )) as unknown as WebSocket;
+    const client = restartedClient ?? new BufferedWs(restartedWs);
+    await client.waitForOpen();
+    await client.nextMessage(); // hello
 
-    await producer.collectMessages(520);
-    producer.close();
-
-    const consumer = await connect();
-    await consumer.nextMessage(); // hello
-    consumer.send(
+    client.send(
       JSON.stringify({
         type: 'subscribe',
-        sessionId: 'replay-drop-session',
-        lastSeq: 1,
-        requestId: 'drop-replay',
+        sessionId,
+        lastSeq: 0,
+        requestId: 'restart-replay',
       }),
     );
 
-    const msgs = await consumer.collectMessages(501); // 500 replay + 1 ack
-    const ack = msgs.find((m) => m.type === 'ack');
-    expect(ack).toBeDefined();
-    expect((ack as Record<string, unknown>).droppedWindow).toBe(true);
-    expect((ack as Record<string, unknown>).replayCount).toBe(500);
-    expect((ack as Record<string, unknown>).earliestAvailableSeq).toBe(21);
-    expect((ack as Record<string, unknown>).latestAvailableSeq).toBe(520);
+    const messages = await client.collectMessages(3);
+    const replayed = messages.filter((message) => message.type === 'session-update');
+    const ack = messages.find((message) => message.type === 'ack');
 
-    consumer.close();
+    expect(replayed).toHaveLength(2);
+    expect(replayed.map((message) => Number(message.seq))).toEqual([1, 4]);
+    expect(
+      replayed.map((message) => (message.update as Record<string, unknown>)?.['text']),
+    ).toEqual(['persisted prompt', 'persisted reply']);
+    expect((ack as Record<string, unknown>).latestAvailableSeq).toBe(5);
+
+    client.close();
+    await secondDaemon.shutdown();
+    await secondApp.close();
   });
 });

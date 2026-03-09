@@ -143,7 +143,10 @@ export async function writeDaemonRuntimeState(state: DaemonRuntimeState): Promis
           ? `unix://${state.socketPath}`
           : `${state.host}:${state.port}`,
   };
-  await fs.writeFile(daemonStatePath(), JSON.stringify(normalized, null, 2) + '\n', 'utf-8');
+  await fs.writeFile(daemonStatePath(), JSON.stringify(normalized, null, 2) + '\n', {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
 }
 
 export async function clearDaemonRuntimeState(): Promise<void> {

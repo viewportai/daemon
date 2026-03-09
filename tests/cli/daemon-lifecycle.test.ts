@@ -36,6 +36,10 @@ describe('daemon lifecycle helpers', () => {
       version: '0.1.0',
     });
 
+    const statePath = path.join(tempHome, '.viewport', 'daemon-state.json');
+    const stat = await fs.stat(statePath);
+    expect(stat.mode & 0o777).toBe(0o600);
+
     const state = await readDaemonRuntimeState();
     expect(state?.pid).toBe(1234);
     expect(state?.port).toBe(7070);

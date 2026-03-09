@@ -35,6 +35,12 @@ import {
 import { BridgeError, type BridgeErrorCode } from './bridge-errors.js';
 import { type RelayTokenClaims, verifyRelayTokenClaims } from './bridge-jwt.js';
 import { closeQuietly, resolveRelayTlsOptions, wsOpen } from './bridge-network.js';
+import {
+  issuePairingOffer,
+  redeemPairingOffer,
+  resolveRelayPairingSecret,
+} from '../server/pairing-offers.js';
+import { loadConfig, saveConfig } from '../core/config.js';
 import { logger as out } from '../core/output.js';
 
 interface RelayTokenResponse {
@@ -59,8 +65,25 @@ interface RelayKeyUpdateRequiredFrame {
   reason: 'message_threshold';
 }
 
+interface RelayPairingOfferRequestFrame {
+  type: 'relay_pairing_offer_request';
+  requestId: string;
+  ttlSeconds?: number;
+  clientChannelPublicKey: string;
+}
+
+interface RelayPairingRedeemRequestFrame {
+  type: 'relay_pairing_redeem_request';
+  requestId: string;
+  offerId: string;
+  encIv: string;
+  encTag: string;
+  encCiphertext: string;
+}
+
 type RelayControlFrame = RelayStatusFrame | RelayKeyUpdateRequiredFrame;
 type JwksResponse = { keys?: Array<Record<string, unknown>> };
+const MAX_JWKS_KEYS = 64;
 
 export interface DaemonRelayBridgeOptions {
   relayEndpoint: string;
@@ -81,6 +104,9 @@ export interface DaemonRelayBridgeOptions {
   maxPendingOutbound?: number;
   maxPendingOutboundBytes?: number;
   keyRotateAfterMessages?: number;
+  pairingChannelTtlMs?: number;
+  pairingChannelMaxEntries?: number;
+  relaySessionMaxEntries?: number;
 }
 
 interface RelaySessionState {
@@ -99,6 +125,10 @@ type RelayWs = WsType;
 
 export { CIRCUIT_BREAKER_MS } from './bridge-constants.js';
 export { computeBackoffMs, decryptEnvelope, encryptEnvelope, fromBase64Url, toBase64Url };
+
+const DEFAULT_PAIRING_CHANNEL_TTL_MS = 10 * 60_000;
+const DEFAULT_PAIRING_CHANNEL_MAX_ENTRIES = 2_048;
+const DEFAULT_RELAY_SESSION_MAX_ENTRIES = 4_096;
 
 export interface DaemonRelayBridgeStatus {
   state: 'stopped' | 'connecting' | 'connected' | 'waiting_retry' | 'circuit_open';
@@ -131,13 +161,119 @@ function isRelayControlFrame(value: unknown): value is RelayControlFrame {
   );
 }
 
-function decodePairingSecret(input: string | undefined): Buffer | undefined {
-  if (!input || input.trim().length === 0) return undefined;
-  const decoded = fromBase64Url(input);
-  if (decoded.length !== 32) {
-    throw new Error('pairing secret must be 32 bytes');
+function parsePairingOfferRequestFrame(value: unknown): RelayPairingOfferRequestFrame | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const frame = value as Record<string, unknown>;
+  if (frame['type'] !== 'relay_pairing_offer_request') return null;
+  if (typeof frame['requestId'] !== 'string' || frame['requestId'].trim().length === 0) {
+    return null;
   }
-  return decoded;
+  const ttlSeconds = frame['ttlSeconds'];
+  if (
+    typeof ttlSeconds !== 'undefined' &&
+    (!Number.isInteger(ttlSeconds) || (ttlSeconds as number) < 30 || (ttlSeconds as number) > 3600)
+  ) {
+    return null;
+  }
+  if (
+    typeof frame['clientChannelPublicKey'] !== 'string' ||
+    frame['clientChannelPublicKey'].trim().length === 0
+  ) {
+    return null;
+  }
+  return {
+    type: 'relay_pairing_offer_request',
+    requestId: frame['requestId'],
+    ttlSeconds: typeof ttlSeconds === 'number' ? ttlSeconds : undefined,
+    clientChannelPublicKey: frame['clientChannelPublicKey'],
+  };
+}
+
+function parsePairingRedeemRequestFrame(value: unknown): RelayPairingRedeemRequestFrame | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const frame = value as Record<string, unknown>;
+  if (frame['type'] !== 'relay_pairing_redeem_request') return null;
+  if (
+    typeof frame['requestId'] !== 'string' ||
+    typeof frame['offerId'] !== 'string' ||
+    typeof frame['encIv'] !== 'string' ||
+    typeof frame['encTag'] !== 'string' ||
+    typeof frame['encCiphertext'] !== 'string'
+  ) {
+    return null;
+  }
+  if (
+    frame['requestId'].trim().length === 0 ||
+    frame['offerId'].trim().length === 0 ||
+    frame['encIv'].trim().length === 0 ||
+    frame['encTag'].trim().length === 0 ||
+    frame['encCiphertext'].trim().length === 0
+  ) {
+    return null;
+  }
+  return {
+    type: 'relay_pairing_redeem_request',
+    requestId: frame['requestId'],
+    offerId: frame['offerId'],
+    encIv: frame['encIv'],
+    encTag: frame['encTag'],
+    encCiphertext: frame['encCiphertext'],
+  };
+}
+
+function derivePairingChannelKey(sharedSecret: Buffer, saltLabel: string): Buffer {
+  const salt = crypto.createHash('sha256').update(saltLabel, 'utf8').digest();
+  const raw = crypto.hkdfSync(
+    'sha256',
+    sharedSecret,
+    salt,
+    Buffer.from('viewport-relay-pairing-channel-v1', 'utf8'),
+    32,
+  );
+  return Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+}
+
+function encryptPairingPayload(
+  key: Buffer,
+  plaintext: string,
+  aadLabel: string,
+): { encIv: string; encTag: string; encCiphertext: string } {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  cipher.setAAD(Buffer.from(aadLabel, 'utf8'));
+  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    encIv: toBase64Url(iv),
+    encTag: toBase64Url(tag),
+    encCiphertext: toBase64Url(ciphertext),
+  };
+}
+
+function decryptPairingPayload(
+  key: Buffer,
+  encrypted: { encIv: string; encTag: string; encCiphertext: string },
+  aadLabel: string,
+): string {
+  const iv = fromBase64Url(encrypted.encIv);
+  const tag = fromBase64Url(encrypted.encTag);
+  const ciphertext = fromBase64Url(encrypted.encCiphertext);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAAD(Buffer.from(aadLabel, 'utf8'));
+  decipher.setAuthTag(tag);
+  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return plaintext.toString('utf8');
+}
+
+function profileStrength(profile: RelayHandshakeProfile): number {
+  return profile === 'noise-ikpsk2' ? 2 : 1;
+}
+
+function isCompatibleProfile(
+  required: RelayHandshakeProfile,
+  requested: RelayHandshakeProfile,
+): boolean {
+  return profileStrength(requested) >= profileStrength(required);
 }
 
 export class DaemonRelayBridge {
@@ -151,12 +287,12 @@ export class DaemonRelayBridge {
   private daemonIdentity: DaemonRelayIdentity | null = null;
   private daemonIssueToken: string | null;
   private requiredProfile: RelayHandshakeProfile = 'noise-ik';
-  private pairingSecret: Buffer | undefined;
   private readonly relayTokenJwksUrl: string | undefined;
   private readonly relayTokenSigningKeys: Record<string, string>;
   private jwksCacheExpiresAt = 0;
   private jwksCacheKeys: Record<string, string> = {};
   private readonly relaySessions = new Map<string, RelaySessionState>();
+  private readonly pairingChannelKeys = new Map<string, { key: Buffer; createdAt: number }>();
   private consecutiveIssueFailures = 0;
   private circuitOpenUntilMs = 0;
   private lastErrorCode: BridgeErrorCode | undefined;
@@ -165,6 +301,9 @@ export class DaemonRelayBridge {
   private state: DaemonRelayBridgeStatus['state'] = 'stopped';
   private relayEndpoint: string;
   private readonly keyRotateAfterMessages: number;
+  private readonly pairingChannelTtlMs: number;
+  private readonly pairingChannelMaxEntries: number;
+  private readonly relaySessionMaxEntries: number;
 
   constructor(private readonly options: DaemonRelayBridgeOptions) {
     this.relayEndpoint = options.relayEndpoint;
@@ -174,14 +313,27 @@ export class DaemonRelayBridge {
       options.keyRotateAfterMessages >= 1
         ? options.keyRotateAfterMessages
         : RELAY_KEY_ROTATE_AFTER_MESSAGES;
+    this.pairingChannelTtlMs =
+      typeof options.pairingChannelTtlMs === 'number' &&
+      Number.isInteger(options.pairingChannelTtlMs) &&
+      options.pairingChannelTtlMs >= 1_000
+        ? options.pairingChannelTtlMs
+        : DEFAULT_PAIRING_CHANNEL_TTL_MS;
+    this.pairingChannelMaxEntries =
+      typeof options.pairingChannelMaxEntries === 'number' &&
+      Number.isInteger(options.pairingChannelMaxEntries) &&
+      options.pairingChannelMaxEntries >= 1
+        ? options.pairingChannelMaxEntries
+        : DEFAULT_PAIRING_CHANNEL_MAX_ENTRIES;
+    this.relaySessionMaxEntries =
+      typeof options.relaySessionMaxEntries === 'number' &&
+      Number.isInteger(options.relaySessionMaxEntries) &&
+      options.relaySessionMaxEntries >= 1
+        ? options.relaySessionMaxEntries
+        : DEFAULT_RELAY_SESSION_MAX_ENTRIES;
     this.daemonIssueToken = options.issueToken ?? null;
     this.relayTokenJwksUrl = options.relayTokenJwksUrl;
-    this.relayTokenSigningKeys =
-      options.relayTokenSigningKeys && Object.keys(options.relayTokenSigningKeys).length > 0
-        ? options.relayTokenSigningKeys
-        : {
-            v1: 'viewport-poc-signing-key-change-me',
-          };
+    this.relayTokenSigningKeys = options.relayTokenSigningKeys ?? {};
   }
 
   getStatus(): DaemonRelayBridgeStatus {
@@ -213,6 +365,7 @@ export class DaemonRelayBridge {
     this.pendingOutbound.length = 0;
     this.pendingOutboundBytes = 0;
     this.relaySessions.clear();
+    this.pairingChannelKeys.clear();
     this.state = 'stopped';
   }
 
@@ -241,6 +394,7 @@ export class DaemonRelayBridge {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           credential: this.options.enrollToken,
+          issueCredential: this.daemonIssueToken ?? undefined,
           daemonPublicKey: this.daemonIdentity.publicKey,
         }),
         signal: controller.signal,
@@ -269,12 +423,32 @@ export class DaemonRelayBridge {
       );
     }
     if (!parsed?.daemonIssueToken || parsed.daemonIssueToken.trim().length === 0) {
+      if (this.daemonIssueToken && this.daemonIssueToken.trim().length > 0) {
+        return;
+      }
       throw new BridgeError(
         'DAEMON_KEY_REGISTER_FAILED',
         'daemon key registration succeeded but daemon issue token was missing',
       );
     }
     this.daemonIssueToken = parsed.daemonIssueToken;
+    await this.persistIssueToken(parsed.daemonIssueToken);
+  }
+
+  private async persistIssueToken(issueToken: string): Promise<void> {
+    const normalized = issueToken.trim();
+    if (normalized.length === 0) return;
+    try {
+      const config = await loadConfig();
+      config.daemon = config.daemon ?? {};
+      config.daemon.relay = config.daemon.relay ?? {};
+      config.daemon.relay.issueToken = normalized;
+      await saveConfig(config);
+    } catch (error) {
+      out.warn(
+        `[relay] failed to persist daemon issue token: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   private async connectLoop(reason: string): Promise<void> {
@@ -305,7 +479,6 @@ export class DaemonRelayBridge {
       }
 
       this.requiredProfile = issue.profile;
-      this.pairingSecret = issue.pairingSecret;
       this.relaySessions.clear();
 
       this.consecutiveIssueFailures = 0;
@@ -410,10 +583,10 @@ export class DaemonRelayBridge {
       }
     });
 
-    relayWs.on('message', (raw) => {
+    relayWs.on('message', async (raw) => {
       const text = raw.toString('utf8');
 
-      const handledControl = this.handleRelayControlFrame(text, relayWs, daemonWs);
+      const handledControl = await this.handleRelayControlFrame(text, relayWs, daemonWs);
       if (handledControl) return;
 
       let envelope;
@@ -519,7 +692,23 @@ export class DaemonRelayBridge {
     }
   }
 
-  private handleRelayControlFrame(text: string, relayWs: RelayWs, daemonWs: RelayWs): boolean {
+  private enforceRelaySessionCapacity(): void {
+    this.pruneIdleSessions();
+    while (this.relaySessions.size > this.relaySessionMaxEntries) {
+      const oldestSessionId = this.relaySessions.keys().next().value;
+      if (!oldestSessionId) break;
+      this.relaySessions.delete(oldestSessionId);
+      out.warn(
+        `[relay] evicted relay session ${oldestSessionId} due to relay session cap (${this.relaySessionMaxEntries})`,
+      );
+    }
+  }
+
+  private async handleRelayControlFrame(
+    text: string,
+    relayWs: RelayWs,
+    daemonWs: RelayWs,
+  ): Promise<boolean> {
     let parsedUnknown: unknown;
     try {
       parsedUnknown = JSON.parse(text);
@@ -527,15 +716,27 @@ export class DaemonRelayBridge {
       return false;
     }
 
+    const pairingOfferRequest = parsePairingOfferRequestFrame(parsedUnknown);
+    if (pairingOfferRequest) {
+      await this.handlePairingOfferRequest(pairingOfferRequest, relayWs);
+      return true;
+    }
+
+    const pairingRedeemRequest = parsePairingRedeemRequestFrame(parsedUnknown);
+    if (pairingRedeemRequest) {
+      await this.handlePairingRedeemRequest(pairingRedeemRequest, relayWs);
+      return true;
+    }
+
     const keyExchangeInitV3 = parseRelayKeyExchangeInitFrameV3(parsedUnknown);
     if (keyExchangeInitV3) {
-      this.handleKeyExchangeInitV3(keyExchangeInitV3, relayWs);
+      await this.handleKeyExchangeInitV3(keyExchangeInitV3, relayWs);
       return true;
     }
 
     const keyExchangeInit = parseRelayKeyExchangeInitFrame(parsedUnknown);
     if (keyExchangeInit) {
-      this.handleKeyExchangeInit(keyExchangeInit, relayWs);
+      await this.handleKeyExchangeInit(keyExchangeInit, relayWs);
       return true;
     }
 
@@ -583,13 +784,16 @@ export class DaemonRelayBridge {
     return true;
   }
 
-  private handleKeyExchangeInit(init: RelayKeyExchangeInitFrame, relayWs: RelayWs): void {
+  private async handleKeyExchangeInit(
+    init: RelayKeyExchangeInitFrame,
+    relayWs: RelayWs,
+  ): Promise<void> {
     if (!this.daemonIdentity) {
       out.warn('[relay] key exchange init ignored: daemon identity not ready');
       return;
     }
 
-    if (init.profile !== this.requiredProfile) {
+    if (!isCompatibleProfile(this.requiredProfile, init.profile)) {
       out.warn(
         `[relay] key exchange profile mismatch (got=${init.profile}, expected=${this.requiredProfile})`,
       );
@@ -621,12 +825,23 @@ export class DaemonRelayBridge {
       nextEpoch = previous.epoch + 1;
     }
 
+    let pairingSecret: Buffer | undefined;
+    if (init.profile === 'noise-ikpsk2') {
+      pairingSecret = await this.resolvePolicyCPairingSecret(init.pairingPeerId);
+      if (!pairingSecret) {
+        out.warn(
+          `[relay] key exchange rejected: missing local pairing binding for peer ${init.pairingPeerId ?? '<none>'}`,
+        );
+        return;
+      }
+    }
+
     try {
       const derived = deriveSessionFromKeyExchange({
         init,
         daemonIdentity: this.daemonIdentity,
         nextEpoch,
-        pairingSecret: this.requiredProfile === 'noise-ikpsk2' ? this.pairingSecret : undefined,
+        pairingSecret,
       });
       if (previous && init.previousSessionId) {
         this.relaySessions.delete(init.previousSessionId);
@@ -639,6 +854,7 @@ export class DaemonRelayBridge {
         lastActivityAt: Date.now(),
         keyRotationRequested: false,
       });
+      this.enforceRelaySessionCapacity();
       if (relayWs.readyState === WebSocket.OPEN) {
         relayWs.send(JSON.stringify(derived.response));
       }
@@ -649,13 +865,16 @@ export class DaemonRelayBridge {
     }
   }
 
-  private handleKeyExchangeInitV3(init: RelayKeyExchangeInitFrameV3, relayWs: RelayWs): void {
+  private async handleKeyExchangeInitV3(
+    init: RelayKeyExchangeInitFrameV3,
+    relayWs: RelayWs,
+  ): Promise<void> {
     if (!this.daemonIdentity) {
       out.warn('[relay] noise-v3 key exchange init ignored: daemon identity not ready');
       return;
     }
 
-    if (init.profile !== this.requiredProfile) {
+    if (!isCompatibleProfile(this.requiredProfile, init.profile)) {
       out.warn(
         `[relay] noise-v3 key exchange profile mismatch (got=${init.profile}, expected=${this.requiredProfile})`,
       );
@@ -687,12 +906,23 @@ export class DaemonRelayBridge {
       nextEpoch = previous.epoch + 1;
     }
 
+    let pairingSecret: Buffer | undefined;
+    if (init.profile === 'noise-ikpsk2') {
+      pairingSecret = await this.resolvePolicyCPairingSecret(init.pairingPeerId);
+      if (!pairingSecret) {
+        out.warn(
+          `[relay] noise-v3 key exchange rejected: missing local pairing binding for peer ${init.pairingPeerId ?? '<none>'}`,
+        );
+        return;
+      }
+    }
+
     try {
       const derived = deriveNoiseV3SessionFromInit({
         init,
         daemonIdentity: this.daemonIdentity,
         nextEpoch,
-        pairingSecret: this.requiredProfile === 'noise-ikpsk2' ? this.pairingSecret : undefined,
+        pairingSecret,
       });
       if (previous && init.previousSessionId) {
         this.relaySessions.delete(init.previousSessionId);
@@ -706,6 +936,7 @@ export class DaemonRelayBridge {
         lastActivityAt: Date.now(),
         keyRotationRequested: false,
       });
+      this.enforceRelaySessionCapacity();
       if (relayWs.readyState === WebSocket.OPEN) {
         relayWs.send(JSON.stringify(derived.response));
       }
@@ -713,6 +944,183 @@ export class DaemonRelayBridge {
       const message = error instanceof Error ? error.message : String(error);
       this.recordError('KEY_EXCHANGE_FAILED', message);
       out.warn(`[relay] noise-v3 key exchange failed [KEY_EXCHANGE_FAILED]: ${message}`);
+    }
+  }
+
+  private async handlePairingOfferRequest(
+    frame: RelayPairingOfferRequestFrame,
+    relayWs: RelayWs,
+  ): Promise<void> {
+    const requestId = frame.requestId;
+    const reply = (payload: Record<string, unknown>): void => {
+      if (relayWs.readyState === WebSocket.OPEN) {
+        relayWs.send(JSON.stringify(payload));
+      }
+    };
+
+    try {
+      this.prunePairingChannelKeys();
+      const clientChannelPublicKey = fromBase64Url(frame.clientChannelPublicKey);
+      if (clientChannelPublicKey.length !== 65) {
+        throw new Error('invalid clientChannelPublicKey');
+      }
+      const daemonChannel = crypto.createECDH('prime256v1');
+      daemonChannel.generateKeys();
+      const shared = daemonChannel.computeSecret(clientChannelPublicKey);
+      const channelKey = derivePairingChannelKey(shared, `offer:${frame.requestId}`);
+
+      const daemonUrl = new URL(this.options.daemonWsUrl);
+      const issued = await issuePairingOffer({
+        ttlSeconds: frame.ttlSeconds ?? 600,
+        connection: {
+          host: daemonUrl.hostname || '127.0.0.1',
+          port: daemonUrl.port ? Number(daemonUrl.port) : 7070,
+          listen: `relay:${this.options.workspaceId}`,
+          profile: 'relay',
+        },
+      });
+      this.pairingChannelKeys.set(issued.offerId, { key: channelKey, createdAt: Date.now() });
+      const encryptedOffer = encryptPairingPayload(
+        channelKey,
+        JSON.stringify({
+          offerId: issued.offerId,
+          createdAt: issued.createdAt,
+          expiresAt: issued.expiresAt,
+          redeemSecret: issued.redeemSecret,
+          trustAnchor: issued.trustAnchor,
+          daemonDeviceId: issued.daemonDeviceId,
+          daemonPublicKey: issued.daemonPublicKey,
+        }),
+        `offer:${frame.requestId}`,
+      );
+      reply({
+        type: 'relay_pairing_offer_response',
+        requestId,
+        ok: true,
+        daemonChannelPublicKey: toBase64Url(daemonChannel.getPublicKey()),
+        ...encryptedOffer,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      reply({
+        type: 'relay_pairing_offer_response',
+        requestId,
+        ok: false,
+        errorCode: 'PAIRING_OFFER_FAILED',
+        error: message,
+      });
+    }
+  }
+
+  private async handlePairingRedeemRequest(
+    frame: RelayPairingRedeemRequestFrame,
+    relayWs: RelayWs,
+  ): Promise<void> {
+    const requestId = frame.requestId;
+    const reply = (payload: Record<string, unknown>): void => {
+      if (relayWs.readyState === WebSocket.OPEN) {
+        relayWs.send(JSON.stringify(payload));
+      }
+    };
+
+    try {
+      this.prunePairingChannelKeys();
+      const channel = this.pairingChannelKeys.get(frame.offerId);
+      if (!channel) {
+        throw new Error('pairing channel missing or expired');
+      }
+      const decrypted = decryptPairingPayload(
+        channel.key,
+        {
+          encIv: frame.encIv,
+          encTag: frame.encTag,
+          encCiphertext: frame.encCiphertext,
+        },
+        `redeem:${frame.requestId}:${frame.offerId}`,
+      );
+      const parsed = JSON.parse(decrypted) as {
+        redeemSecret?: string;
+        trustAnchor?: string;
+        clientPublicKey?: string;
+        clientProof?: string;
+      };
+      if (
+        typeof parsed.redeemSecret !== 'string' ||
+        typeof parsed.trustAnchor !== 'string' ||
+        typeof parsed.clientPublicKey !== 'string' ||
+        typeof parsed.clientProof !== 'string' ||
+        parsed.redeemSecret.trim().length === 0 ||
+        parsed.trustAnchor.trim().length === 0 ||
+        parsed.clientPublicKey.trim().length === 0 ||
+        parsed.clientProof.trim().length === 0
+      ) {
+        throw new Error('invalid encrypted pairing payload');
+      }
+      const redeemed = await redeemPairingOffer(
+        frame.offerId,
+        parsed.redeemSecret,
+        parsed.trustAnchor,
+        parsed.clientPublicKey,
+        parsed.clientProof,
+      );
+      if (!redeemed) {
+        reply({
+          type: 'relay_pairing_redeem_response',
+          requestId,
+          ok: false,
+          errorCode: 'PAIRING_REDEEM_FAILED',
+          error: 'offer not found or no longer valid',
+        });
+        return;
+      }
+
+      reply({
+        type: 'relay_pairing_redeem_response',
+        requestId,
+        ok: true,
+        redeemed: {
+          offerId: redeemed.offerId,
+          createdAt: redeemed.createdAt,
+          expiresAt: redeemed.expiresAt,
+          peerId: redeemed.peerId,
+          daemonDeviceId: redeemed.daemonDeviceId,
+          daemonPublicKey: redeemed.daemonPublicKey,
+          relayPairingPeerId: redeemed.relayPairingPeerId,
+          serverSignature: redeemed.serverSignature,
+        },
+      });
+      this.pairingChannelKeys.delete(frame.offerId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      reply({
+        type: 'relay_pairing_redeem_response',
+        requestId,
+        ok: false,
+        errorCode: 'PAIRING_REDEEM_FAILED',
+        error: message,
+      });
+    }
+  }
+
+  private prunePairingChannelKeys(
+    now = Date.now(),
+    maxAgeMs = this.pairingChannelTtlMs,
+    maxEntries = this.pairingChannelMaxEntries,
+  ): void {
+    for (const [offerId, channel] of this.pairingChannelKeys.entries()) {
+      if (now - channel.createdAt > maxAgeMs) {
+        this.pairingChannelKeys.delete(offerId);
+      }
+    }
+    const overflow = this.pairingChannelKeys.size - maxEntries;
+    if (overflow <= 0) {
+      return;
+    }
+    const oldest = Array.from(this.pairingChannelKeys.entries())
+      .sort((a, b) => a[1].createdAt - b[1].createdAt)
+      .slice(0, overflow);
+    for (const [offerId] of oldest) {
+      this.pairingChannelKeys.delete(offerId);
     }
   }
 
@@ -728,10 +1136,22 @@ export class DaemonRelayBridge {
     if (this.pendingOutboundBytes < 0) this.pendingOutboundBytes = 0;
   }
 
+  private async resolvePolicyCPairingSecret(
+    peerId: string | undefined,
+  ): Promise<Buffer | undefined> {
+    if (!peerId || peerId.trim().length === 0) {
+      return undefined;
+    }
+    const resolved = await resolveRelayPairingSecret(peerId);
+    if (!resolved || resolved.length !== 32) {
+      return undefined;
+    }
+    return resolved;
+  }
+
   private async issueRelayToken(): Promise<{
     relayToken: string;
     profile: RelayHandshakeProfile;
-    pairingSecret?: Buffer;
   }> {
     const url = `${this.options.relayServerUrl.replace(/\/+$/, '')}/api/poc/relay-token`;
     const controller = new AbortController();
@@ -797,26 +1217,9 @@ export class DaemonRelayBridge {
       throw new BridgeError('TOKEN_RESPONSE_INVALID', 'missing/invalid e2eeProfile claim');
     }
 
-    let pairingSecret: Buffer | undefined;
-    try {
-      pairingSecret = decodePairingSecret(tokenClaims.pairingSecret);
-    } catch (error) {
-      throw new BridgeError(
-        'TOKEN_RESPONSE_INVALID',
-        error instanceof Error ? error.message : String(error),
-      );
-    }
-    if (profile === 'noise-ikpsk2' && !pairingSecret) {
-      throw new BridgeError(
-        'TOKEN_RESPONSE_INVALID',
-        'noise-ikpsk2 requires pairingSecret in token claims',
-      );
-    }
-
     return {
       relayToken: parsed.relayToken,
       profile,
-      pairingSecret,
     };
   }
 
@@ -857,6 +1260,12 @@ export class DaemonRelayBridge {
     const parsed = (await res.json().catch(() => null)) as JwksResponse | null;
     if (!parsed || !Array.isArray(parsed.keys)) {
       throw new BridgeError('TOKEN_RESPONSE_INVALID', 'JWKS response missing keys array');
+    }
+    if (parsed.keys.length > MAX_JWKS_KEYS) {
+      throw new BridgeError(
+        'TOKEN_RESPONSE_INVALID',
+        `JWKS response contains too many keys (${parsed.keys.length} > ${MAX_JWKS_KEYS})`,
+      );
     }
 
     const keys: Record<string, string> = {};

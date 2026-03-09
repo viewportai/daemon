@@ -35,10 +35,9 @@ describe('ClaudeHookInstaller', () => {
   it('installs hooks into new settings file', async () => {
     const changed = await installer.install(defaultConfig);
     expect(changed).toBe(true);
+    const settingsPath = path.join(tempHome, '.claude', 'settings.json');
 
-    const settings = JSON.parse(
-      await fs.readFile(path.join(tempHome, '.claude', 'settings.json'), 'utf-8'),
-    );
+    const settings = JSON.parse(await fs.readFile(settingsPath, 'utf-8'));
 
     expect(settings.hooks).toBeDefined();
     expect(settings.hooks.SessionStart).toBeDefined();
@@ -57,6 +56,9 @@ describe('ClaudeHookInstaller', () => {
 
     // Other hooks have short timeout
     expect(sessionStartHook.timeout).toBe(5);
+
+    const stat = await fs.stat(settingsPath);
+    expect(stat.mode & 0o777).toBe(0o600);
   });
 
   it('preserves existing user hooks', async () => {

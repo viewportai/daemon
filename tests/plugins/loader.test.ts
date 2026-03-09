@@ -196,6 +196,66 @@ describe('Plugin loader', () => {
     expect(plugins).toEqual([]);
   });
 
+  it('rejects plugin main entries that escape the plugin directory', async () => {
+    const pluginDir = path.join(pluginsDir(), 'node_modules', 'viewport-agent-path-escape');
+    await fs.mkdir(pluginDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, 'package.json'),
+      JSON.stringify({
+        name: 'viewport-agent-path-escape',
+        version: '1.0.0',
+        main: '../../../tmp/evil.js',
+        viewport: { type: 'agent', agentId: 'path-escape' },
+      }),
+    );
+
+    const plugins = await loadPluginAgents();
+    expect(plugins).toEqual([]);
+  });
+
+  it('rejects plugin main entries that escape via symlink', async () => {
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-plugin-outside-'));
+    try {
+      const outsideEntry = path.join(outsideDir, 'outside-entry.js');
+      await fs.writeFile(
+        outsideEntry,
+        `module.exports.definition = {
+        id: 'outside-escape',
+        displayName: 'Outside Escape',
+        tier: 'pty',
+        defaults: { commitOn: [], autoApprove: [], requireApproval: [], deny: [] },
+        capabilities: {
+          structuredToolCalls: false,
+          permissionCallbacks: false,
+          tokenUsage: false,
+          resume: false,
+          extendedThinking: false,
+        },
+        detection: { check: async () => true, description: 'outside escape' },
+        createAdapter: async () => null,
+      };`,
+      );
+
+      const pluginDir = path.join(pluginsDir(), 'node_modules', 'viewport-agent-symlink-escape');
+      await fs.mkdir(pluginDir, { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, 'package.json'),
+        JSON.stringify({
+          name: 'viewport-agent-symlink-escape',
+          version: '1.0.0',
+          main: 'symlink-entry.js',
+          viewport: { type: 'agent', agentId: 'symlink-escape' },
+        }),
+      );
+      await fs.symlink(outsideEntry, path.join(pluginDir, 'symlink-entry.js'));
+
+      const plugins = await loadPluginAgents();
+      expect(plugins).toEqual([]);
+    } finally {
+      await fs.rm(outsideDir, { recursive: true, force: true });
+    }
+  });
+
   it('skips plugins with incomplete definitions', async () => {
     const pluginDir = path.join(pluginsDir(), 'node_modules', 'viewport-agent-incomplete');
     await fs.mkdir(pluginDir, { recursive: true });

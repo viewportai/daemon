@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   createNoiseV3Init,
   deriveNoiseV3SessionFromInit,
@@ -65,6 +65,7 @@ describe('Noise v3 handshake', () => {
       nextEpoch: 1,
     });
 
+    const timingSpy = vi.spyOn(crypto, 'timingSafeEqual');
     expect(() =>
       finalizeNoiseV3Response({
         state: init.state,
@@ -74,5 +75,7 @@ describe('Noise v3 handshake', () => {
         },
       }),
     ).toThrow('noise handshake proof mismatch');
+    expect(timingSpy).toHaveBeenCalled();
+    timingSpy.mockRestore();
   });
 });
