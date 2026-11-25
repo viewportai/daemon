@@ -2,7 +2,7 @@ import { openSync, closeSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { configDir } from '../core/config.js';
+import { configDir, resolveResourceOverrideConfig } from '../core/config.js';
 import {
   readProcessInfo,
   writeDaemonRuntimeState,
@@ -10,6 +10,7 @@ import {
   signalProcessGroupSafely,
   signalProcessSafely,
 } from './daemon-lifecycle.js';
+import { resolveDaemonRuntimeIdentity } from '../core/runtime-identity.js';
 import {
   SUPERVISOR_CONFIG_ENV,
   WORKER_CONFIG_ENV,
@@ -17,9 +18,11 @@ import {
   WORKER_EXIT_SHUTDOWN,
   type RuntimeLaunchConfig,
 } from './supervisor-protocol.js';
+import { decodeRuntimeConfig, encodeRuntimeConfig } from './supervisor-runtime-config.js';
+import { resolveDaemonSettingsFromSources } from './daemon-settings.js';
+import { resolveLocalTlsState } from './local-tls.js';
 
 const SUPERVISOR_STARTUP_GRACE_MS = 1_500;
-
 function resolveCliEntry(): string {
   const entry = process.argv[1];
   if (!entry) {
@@ -28,101 +31,20 @@ function resolveCliEntry(): string {
   return path.resolve(entry);
 }
 
-function encodeRuntimeConfig(config: RuntimeLaunchConfig): string {
-  return Buffer.from(JSON.stringify(config), 'utf-8').toString('base64url');
-}
-
-function decodeRuntimeConfig(raw: string | undefined): RuntimeLaunchConfig {
-  if (!raw) {
-    throw new Error('Missing runtime launch config');
-  }
-  const decoded = Buffer.from(raw, 'base64url').toString('utf-8');
-  const parsed = JSON.parse(decoded) as Partial<RuntimeLaunchConfig>;
-  if (
-    typeof parsed.host !== 'string' ||
-    typeof parsed.port !== 'number' ||
-    typeof parsed.version !== 'string' ||
-    (parsed.profile !== 'local' && parsed.profile !== 'lan' && parsed.profile !== 'relay') ||
-    typeof parsed.authEnabled !== 'boolean' ||
-    typeof parsed.detached !== 'boolean'
-  ) {
-    throw new Error('Invalid runtime launch config');
-  }
-  const listen =
-    typeof parsed.listen === 'string'
-      ? parsed.listen
-      : typeof parsed.socketPath === 'string'
-        ? `unix://${parsed.socketPath}`
-        : `${parsed.host}:${parsed.port}`;
-  return {
-    listen,
-    host: parsed.host,
-    port: parsed.port,
-    socketPath: typeof parsed.socketPath === 'string' ? parsed.socketPath : undefined,
-    version: parsed.version,
-    profile: parsed.profile,
-    allowedHostsRaw:
-      typeof parsed.allowedHostsRaw === 'string' ? parsed.allowedHostsRaw : undefined,
-    allowedOriginsRaw:
-      typeof parsed.allowedOriginsRaw === 'string' ? parsed.allowedOriginsRaw : undefined,
-    authEnabled: parsed.authEnabled,
-    detached: parsed.detached,
-    logPath: typeof parsed.logPath === 'string' ? parsed.logPath : undefined,
-    relayEnabled: typeof parsed.relayEnabled === 'boolean' ? parsed.relayEnabled : undefined,
-    relayEndpoint: typeof parsed.relayEndpoint === 'string' ? parsed.relayEndpoint : undefined,
-    relayServerUrl: typeof parsed.relayServerUrl === 'string' ? parsed.relayServerUrl : undefined,
-    relayWorkspaceId:
-      typeof parsed.relayWorkspaceId === 'string' ? parsed.relayWorkspaceId : undefined,
-    relayEnrollToken:
-      typeof parsed.relayEnrollToken === 'string' ? parsed.relayEnrollToken : undefined,
-    relayIssueToken:
-      typeof parsed.relayIssueToken === 'string' ? parsed.relayIssueToken : undefined,
-    relayTlsVerify:
-      parsed.relayTlsVerify === 'auto' ||
-      parsed.relayTlsVerify === '0' ||
-      parsed.relayTlsVerify === '1'
-        ? parsed.relayTlsVerify
-        : undefined,
-    relayCaCertPath:
-      typeof parsed.relayCaCertPath === 'string' ? parsed.relayCaCertPath : undefined,
-    relayTlsPins:
-      Array.isArray(parsed.relayTlsPins) &&
-      parsed.relayTlsPins.every((entry) => typeof entry === 'string')
-        ? parsed.relayTlsPins
-        : undefined,
-    relayTokenIssuer:
-      typeof parsed.relayTokenIssuer === 'string' ? parsed.relayTokenIssuer : undefined,
-    relayTokenAudience:
-      typeof parsed.relayTokenAudience === 'string' ? parsed.relayTokenAudience : undefined,
-    relayTokenJwksUrl:
-      typeof parsed.relayTokenJwksUrl === 'string' ? parsed.relayTokenJwksUrl : undefined,
-    relayTokenSigningKeys:
-      parsed.relayTokenSigningKeys &&
-      typeof parsed.relayTokenSigningKeys === 'object' &&
-      !Array.isArray(parsed.relayTokenSigningKeys)
-        ? (parsed.relayTokenSigningKeys as Record<string, string>)
-        : undefined,
-    relayTokenClockSkewSec:
-      typeof parsed.relayTokenClockSkewSec === 'number' &&
-      Number.isInteger(parsed.relayTokenClockSkewSec) &&
-      parsed.relayTokenClockSkewSec >= 0
-        ? parsed.relayTokenClockSkewSec
-        : undefined,
-  };
-}
-
 function buildWorkerEnv(config: RuntimeLaunchConfig): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    [WORKER_CONFIG_ENV]: encodeRuntimeConfig(config),
-  };
+  const env = { ...process.env };
+  delete env[SUPERVISOR_CONFIG_ENV];
+  delete env[WORKER_CONFIG_ENV];
+  env[WORKER_CONFIG_ENV] = encodeRuntimeConfig(config);
+  return env;
 }
 
 function buildSupervisorEnv(config: RuntimeLaunchConfig): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    [SUPERVISOR_CONFIG_ENV]: encodeRuntimeConfig(config),
-  };
+  const env = { ...process.env };
+  delete env[SUPERVISOR_CONFIG_ENV];
+  delete env[WORKER_CONFIG_ENV];
+  env[SUPERVISOR_CONFIG_ENV] = encodeRuntimeConfig(config);
+  return env;
 }
 
 function toWorkerArgs(): string[] {
@@ -205,7 +127,30 @@ export async function runSupervisorForeground(config: RuntimeLaunchConfig): Prom
 
 async function writeState(config: RuntimeLaunchConfig, workerPid?: number): Promise<void> {
   const ownerInfo = readProcessInfo(process.pid);
+  const tls = resolveLocalTlsState();
+  const identity = resolveDaemonRuntimeIdentity({
+    daemonConfig: {
+      profile: config.profile,
+      server: {
+        url: config.serverUrl,
+        tlsVerify: config.serverTlsVerify,
+        caCertPath: config.serverCaCertPath,
+        tlsPins: config.serverTlsPins,
+      },
+      relay: {
+        enabled: config.relayEnabled,
+        endpoint: config.relayEndpoint,
+        serverUrl: config.relayServerUrl,
+        workspaceId: config.relayWorkspaceId,
+        runtimeTargetId: config.relayRuntimeTargetId,
+        machineId: config.relayMachineId,
+      },
+    },
+    daemonVersion: config.version,
+  });
+  const projectConfig = resolveResourceOverrideConfig(process.env);
   await writeDaemonRuntimeState({
+    pid: workerPid ?? process.pid,
     ownerPid: process.pid,
     workerPid,
     port: config.port,
@@ -228,7 +173,20 @@ async function writeState(config: RuntimeLaunchConfig, workerPid?: number): Prom
     relayEndpoint: config.relayEndpoint,
     relayServerUrl: config.relayServerUrl,
     relayWorkspaceId: config.relayWorkspaceId,
+    relayRuntimeTargetId: config.relayRuntimeTargetId,
+    relayMachineId: config.relayMachineId,
     relayTlsVerify: config.relayTlsVerify,
+    tlsEnabled: tls.enabled,
+    tlsHost: tls.host,
+    tlsCertDir: tls.certDir,
+    tlsCertPath: tls.certPath,
+    tlsKeyPath: tls.keyPath,
+    runtimeKind: identity.runtimeKind,
+    daemonHome: identity.daemonHome,
+    daemonHomeScope: identity.daemonHomeScope,
+    serverUrl: identity.serverUrl,
+    resourceOverrideConfigDir: projectConfig.dir ?? undefined,
+    resourceOverrideConfigSource: projectConfig.source ?? undefined,
   });
 }
 
@@ -240,10 +198,36 @@ function launchWorker(config: RuntimeLaunchConfig): ChildProcess {
 }
 
 export async function runSupervisorFromEnv(): Promise<number> {
-  const config = decodeRuntimeConfig(process.env[SUPERVISOR_CONFIG_ENV]);
+  let config = decodeRuntimeConfig(process.env[SUPERVISOR_CONFIG_ENV]);
   let stopping = false;
   let restarting = false;
   let worker: ChildProcess | null = null;
+
+  const reloadConfig = async (): Promise<void> => {
+    try {
+      const resolved = await resolveDaemonSettingsFromSources();
+      config = {
+        ...config,
+        ...resolved.launch,
+        listen: config.listen,
+        host: config.host,
+        port: config.port,
+        socketPath: config.socketPath,
+        profile: config.profile,
+        authEnabled: config.authEnabled,
+        allowedHostsRaw: config.allowedHostsRaw,
+        allowedOriginsRaw: config.allowedOriginsRaw,
+        detached: config.detached,
+        logPath: config.logPath ?? resolved.launch.logPath,
+      };
+    } catch (error) {
+      console.warn(
+        `[supervisor] failed to reload daemon config after restart request: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  };
 
   const requestWorkerStop = (signal: NodeJS.Signals): void => {
     stopping = true;
@@ -281,10 +265,15 @@ export async function runSupervisorFromEnv(): Promise<number> {
       }
 
       const delay = restarting ? 250 : 1_000;
-      restarting = false;
       setTimeout(() => {
         if (stopping) return;
-        spawnWorker();
+        void (async () => {
+          if (restarting) {
+            await reloadConfig();
+          }
+          restarting = false;
+          spawnWorker();
+        })();
       }, delay);
     });
   };

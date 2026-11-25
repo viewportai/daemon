@@ -7,7 +7,12 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import type { AgentAdapter, Session, SessionOptions } from '../core/interfaces.js';
+import type {
+  AgentAdapter,
+  AgentAdapterDescriptor,
+  Session,
+  SessionOptions,
+} from '../core/interfaces.js';
 import type { SessionMessage, SessionState } from '../core/types.js';
 import { logger } from '../core/logger.js';
 import { metrics } from '../core/metrics.js';
@@ -112,6 +117,31 @@ export class GeminiCliAdapter implements AgentAdapter {
   readonly agentId = 'gemini';
   constructor(private readonly runCommand: GeminiCommandRunner = runGeminiCommand) {}
 
+  describe(): AgentAdapterDescriptor {
+    return {
+      schema: 'viewport.agent_adapter/v2',
+      agentId: this.agentId,
+      displayName: 'Gemini CLI',
+      adapterVersion: 'gemini-cli',
+      capabilities: {
+        executionModes: {
+          plan: 'prompt_only',
+          read_only: 'unsupported',
+          review: 'prompt_only',
+          implement: 'prompt_only',
+        },
+        toolAllowlist: 'unsupported',
+        structuredOutput: 'prompt_only',
+        permissionHooks: 'unsupported',
+        usageReporting: 'unavailable',
+        costReporting: 'unavailable',
+        maxTurns: 'unsupported',
+        maxBudget: 'unsupported',
+        hardTimeout: 'hard',
+      },
+    };
+  }
+
   async startSession(cwd: string, options?: SessionOptions): Promise<Session> {
     metrics.increment('sessions.gemini.started');
     const id = randomUUID();
@@ -121,7 +151,7 @@ export class GeminiCliAdapter implements AgentAdapter {
       model: options?.model,
       runCommand: this.runCommand,
     });
-    await session.start(options?.initialPrompt ?? '');
+    await session.start(options?.deferInitialPrompt ? '' : (options?.initialPrompt ?? ''));
     return session;
   }
 
@@ -134,7 +164,7 @@ export class GeminiCliAdapter implements AgentAdapter {
       resumeSessionId: sessionId,
       runCommand: this.runCommand,
     });
-    await session.start(options?.initialPrompt ?? 'Continue.');
+    await session.start(options?.deferInitialPrompt ? '' : (options?.initialPrompt ?? 'Continue.'));
     return session;
   }
 }

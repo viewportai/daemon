@@ -9,11 +9,21 @@ import {
   BranchRetrySchema,
   SquashMergeSchema,
   ListSessionsSchema,
+  ReadSessionMessagesSchema,
+  ContextCandidatePreviewSchema,
+  ContextProposeSchema,
+  ContextResolveSchema,
   ResumeSchema,
   WatchDiscoveredSessionSchema,
   UnwatchDiscoveredSessionSchema,
+  WorkflowRunSchema,
+  WorkflowListRunsSchema,
+  WorkflowShowRunSchema,
+  WorkflowApproveRunSchema,
+  WorkflowCancelRunSchema,
   SuperviseSchema,
   RespondHookPermissionSchema,
+  TrustedEdgeTeamEpochPublishSchema,
   IncomingMessageSchema,
 } from '../../src/server/ws-protocol.js';
 
@@ -27,12 +37,22 @@ describe('LaunchSchema', () => {
     const result = LaunchSchema.safeParse({
       type: 'launch',
       directoryId: 'dir-1',
+      resourceId: 'resource-1',
       prompt: 'Fix the bug',
       model: 'claude-sonnet-4-20250514',
       configOverrides: { agent: 'claude', costCapUsd: 5.0, trust: 'operator' },
       requestId: 'req-1',
     });
     expect(result.success).toBe(true);
+  });
+
+  it('rejects legacy project scope fields', () => {
+    const result = LaunchSchema.safeParse({
+      type: 'launch',
+      directoryId: 'dir-1',
+      projectId: 'project-1',
+    });
+    expect(result.success).toBe(false);
   });
 
   it('rejects missing directoryId', () => {
@@ -94,6 +114,119 @@ describe('PromptSchema', () => {
       sessionId: 's1',
       text: 'hello',
       images: Array.from({ length: 5 }, () => ({ data: 'abc', mediaType: 'image/png' })),
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('ContextCandidatePreviewSchema', () => {
+  it('accepts candidate preview by event id', () => {
+    const result = ContextCandidatePreviewSchema.safeParse({
+      type: 'context-candidate-preview',
+      contextResourceId: 'ctx-1',
+      workspaceId: 'workspace-1',
+      actorName: 'bob-vps',
+      candidateEventId: 'event-1',
+      requestId: 'req-1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts candidate preview by payload digest', () => {
+    const result = ContextCandidatePreviewSchema.safeParse({
+      type: 'context-candidate-preview',
+      contextResourceId: 'ctx-1',
+      actorName: 'bob-vps',
+      payloadDigest: 'digest-1',
+      requestId: 'req-1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects missing context resource id', () => {
+    const result = ContextCandidatePreviewSchema.safeParse({
+      type: 'context-candidate-preview',
+      actorName: 'bob-vps',
+      candidateEventId: 'event-1',
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('TrustedEdgeTeamEpochPublishSchema', () => {
+  it('accepts a trusted-edge team epoch publish command', () => {
+    const result = TrustedEdgeTeamEpochPublishSchema.safeParse({
+      type: 'trusted-edge-team-epoch-publish',
+      workspaceId: 'workspace-1',
+      teamId: 'team-public-1',
+      capabilityToken: 'capability-token',
+      requestId: 'req-1',
+    });
+
+    expect(result.success).toBe(true);
+    expect(
+      IncomingMessageSchema.safeParse({
+        type: 'trusted-edge-team-epoch-publish',
+        workspaceId: 'workspace-1',
+        teamId: 'team-public-1',
+        capabilityToken: 'capability-token',
+        requestId: 'req-1',
+      }).success,
+    ).toBe(true);
+  });
+});
+
+describe('ContextResolveSchema', () => {
+  it('accepts scoped context resolve commands', () => {
+    const result = ContextResolveSchema.safeParse({
+      type: 'context-resolve',
+      contextResourceId: 'ctx-1',
+      workspaceId: 'workspace-1',
+      actorName: 'bob-vps',
+      query: 'roses',
+      maxItems: 25,
+      includePrivate: false,
+      capabilityToken: 'capability-token',
+      requestId: 'req-1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('requires workspace id for trusted-edge resolve', () => {
+    const result = ContextResolveSchema.safeParse({
+      type: 'context-resolve',
+      contextResourceId: 'ctx-1',
+      actorName: 'bob-vps',
+      query: 'roses',
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('ContextProposeSchema', () => {
+  it('accepts scoped context proposal commands', () => {
+    const result = ContextProposeSchema.safeParse({
+      type: 'context-propose',
+      contextResourceId: 'ctx-1',
+      workspaceId: 'workspace-1',
+      actorName: 'bob-vps',
+      title: 'Roses incident note',
+      body: 'Keep the rose context scoped to the workspace.',
+      source: 'web://vault-detail',
+      sourceKind: 'integration',
+      capabilityToken: 'capability-token',
+      requestId: 'req-1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('requires workspace id for trusted-edge proposals', () => {
+    const result = ContextProposeSchema.safeParse({
+      type: 'context-propose',
+      contextResourceId: 'ctx-1',
+      actorName: 'bob-vps',
+      title: 'Roses incident note',
+      body: 'Keep the rose context scoped to the workspace.',
     });
     expect(result.success).toBe(false);
   });
@@ -230,6 +363,98 @@ describe('BranchRetrySchema', () => {
   });
 });
 
+describe('Workflow schemas', () => {
+  it('accepts a workflow run command', () => {
+    const result = WorkflowRunSchema.safeParse({
+      type: 'workflow-run',
+      workflowYaml:
+        'schema: viewport.workflow/v1\nname: proof\nnodes:\n  one:\n    type: shell\n    command: echo ok\n',
+      workflowSourceRef: 'viewport://templates/proof',
+      directoryId: 'dir-1',
+      inputs: {
+        pr: '123',
+        integration_event: {
+          provider: 'github',
+          payload: { number: 42, labels: ['needs-review'] },
+        },
+      },
+      resourceId: 'context-main',
+      runtimeTargetId: 'runtime-target-1',
+      platformRunId: 'platform-run-1',
+      rerunOfWorkflowRunId: 'source-run-1',
+      executionPolicy: { mode: 'named_branch', branch: 'main' },
+      requestId: 'req-1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects legacy project workflow target fields', () => {
+    const result = WorkflowRunSchema.safeParse({
+      type: 'workflow-run',
+      workflowYaml:
+        'schema: viewport.workflow/v1\nname: proof\nnodes:\n  one:\n    type: shell\n    command: echo ok\n',
+      directoryId: 'dir-1',
+      resourceId: 'context-main',
+      runtimeTargetId: 'runtime-target-1',
+      projectId: 'project-1',
+      projectMachineBindingId: 'binding-1',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts a workflow list command', () => {
+    const result = WorkflowListRunsSchema.safeParse({
+      type: 'workflow-list-runs',
+      limit: 25,
+      requestId: 'req-1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts a workflow show command', () => {
+    const result = WorkflowShowRunSchema.safeParse({
+      type: 'workflow-show-run',
+      runId: 'run-1',
+      requestId: 'req-1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts a workflow approval command', () => {
+    const result = WorkflowApproveRunSchema.safeParse({
+      type: 'workflow-approve',
+      runId: 'run-1',
+      nodeId: 'gate',
+      approved: true,
+      message: 'ship it',
+      actor: {
+        id: '42',
+        name: 'Test User',
+        email: 'test@example.test',
+        source: 'viewport-web',
+      },
+      requestId: 'req-1',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts a workflow cancel command', () => {
+    const result = WorkflowCancelRunSchema.safeParse({
+      type: 'workflow-cancel',
+      runId: 'run-1',
+      message: 'Stop this run',
+      actor: {
+        id: '42',
+        name: 'Test User',
+        email: 'test@example.test',
+        source: 'viewport-web',
+      },
+      requestId: 'req-1',
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
 describe('SquashMergeSchema', () => {
   it('accepts valid message', () => {
     const result = SquashMergeSchema.safeParse({
@@ -255,7 +480,7 @@ describe('ListSessionsSchema', () => {
     const result = ListSessionsSchema.safeParse({
       type: 'list-sessions',
       directoryId: 'dir-1',
-      limit: 10,
+      limit: 50,
       offset: 20,
     });
     expect(result.success).toBe(true);
@@ -265,7 +490,30 @@ describe('ListSessionsSchema', () => {
     const result = ListSessionsSchema.safeParse({
       type: 'list-sessions',
       directoryId: 'dir-1',
-      limit: 500,
+      limit: 51,
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('ReadSessionMessagesSchema', () => {
+  it('accepts a bounded transcript read request', () => {
+    const result = ReadSessionMessagesSchema.safeParse({
+      type: 'read-session-messages',
+      directoryId: 'dir-1',
+      sessionId: 's1',
+      limit: 100,
+      delivery: 'event-stream',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects unbounded transcript reads above the guardrail', () => {
+    const result = ReadSessionMessagesSchema.safeParse({
+      type: 'read-session-messages',
+      directoryId: 'dir-1',
+      sessionId: 's1',
+      limit: 201,
     });
     expect(result.success).toBe(false);
   });
@@ -286,9 +534,20 @@ describe('ResumeSchema', () => {
       type: 'resume',
       sessionId: 's1',
       directoryId: 'dir-1',
+      resourceId: 'resource-1',
       prompt: 'Continue from where you left off',
     });
     expect(result.success).toBe(true);
+  });
+
+  it('rejects legacy project scope fields', () => {
+    const result = ResumeSchema.safeParse({
+      type: 'resume',
+      sessionId: 's1',
+      directoryId: 'dir-1',
+      projectId: 'project-1',
+    });
+    expect(result.success).toBe(false);
   });
 });
 

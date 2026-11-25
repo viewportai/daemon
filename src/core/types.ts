@@ -19,6 +19,7 @@ export type SessionState =
 
 export type SessionTrust = 'operator' | 'automated' | 'external';
 export type SessionAgentMode = 'detect' | 'bypass';
+export type SessionExecutionMode = 'plan' | 'read_only' | 'implement' | 'review';
 
 // ---------------------------------------------------------------------------
 // Attention state — centralizes "this session needs your attention"
@@ -260,9 +261,23 @@ export interface ToolCallUpdate {
 export interface TokenUsage {
   type: 'token_usage';
   inputTokens: number;
+  inputTokenScope?: 'billable' | 'raw_provider';
   outputTokens: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  billableInputTokens?: number;
+  budgetedTotalTokens?: number;
   totalCostUsd?: number;
-  modelUsage?: Record<string, { inputTokens: number; outputTokens: number; costUsd: number }>;
+  modelUsage?: Record<
+    string,
+    {
+      inputTokens: number;
+      outputTokens: number;
+      costUsd: number;
+      cacheReadInputTokens?: number;
+      cacheCreationInputTokens?: number;
+    }
+  >;
   durationMs?: number;
   numTurns?: number;
   timestamp: number;
@@ -321,6 +336,31 @@ export type PermissionDecision =
 export interface SessionConfig {
   agent: string;
   model?: string;
+  effort?: 'low' | 'medium' | 'high' | 'xhigh';
+  /** Provider sandbox posture for agents that support it, such as Codex. */
+  sandboxMode?: string;
+  /** Provider approval posture for agents that support it, such as Codex. */
+  approvalPolicy?: string;
+  /**
+   * Provider-neutral execution intent. Adapters translate this to their own
+   * safe modes; e.g. Claude plan nodes use permissionMode=plan instead of
+   * inheriting implementation tool permissions.
+   */
+  executionMode?: SessionExecutionMode;
+  /** Exact provider tool allowlist for the session, when supported. */
+  allowedTools?: string[];
+  /** Maximum provider turns for adapters that support a hard/provider cap. */
+  maxTurns?: number;
+  /** Maximum provider spend for adapters that support a hard/provider cap. */
+  maxBudgetUsd?: number;
+  /** Explicit resource context selected by the launcher/operator. */
+  resourceId?: string;
+  /**
+   * Session prompt context injection mode. Workflow runs set this to
+   * `disabled` after compiling an explicit node context envelope so broad
+   * repo ambient context cannot leak into nodes by default.
+   */
+  contextInjection?: 'auto' | 'disabled';
   gitTracker: GitTrackerConfig;
   permissions: PermissionsConfig;
   costCapUsd?: number;

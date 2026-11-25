@@ -1,7 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { createWsCommandHandlers } from '../../src/server/ws-command-handlers.js';
+import {
+  fitMessagesForAck,
+  SESSION_MESSAGES_ACK_PLAINTEXT_LIMIT_BYTES,
+} from '../../src/server/ws-session-command-handlers.js';
 import type { ConnectedClient } from '../../src/server/hello-builder.js';
 import { discoveredWatchKey } from '../../src/server/discovered-watch-key.js';
+import { ViewportError } from '../../src/core/errors.js';
 
 function createClient(): { client: ConnectedClient; sent: Array<Record<string, unknown>> } {
   const sent: Array<Record<string, unknown>> = [];
@@ -31,6 +39,10 @@ describe('ws-command-handlers', () => {
   it('list-sessions includes agentId in payload', async () => {
     const { client, sent } = createClient();
     const daemon = {
+      directoryManager: { get: vi.fn().mockReturnValue({ id: 'dir-1', path: '/tmp/project' }) },
+      configManager: {
+        getConfig: vi.fn().mockReturnValue({}),
+      },
       getDiscoveredSessions: vi.fn().mockReturnValue(
         new Map([
           [
@@ -64,9 +76,61 @@ describe('ws-command-handlers', () => {
 
     const sessionList = sent.find((m) => m['type'] === 'session-list');
     expect(sessionList).toBeTruthy();
+    expect(sessionList).toMatchObject({
+      offset: 0,
+      limit: 25,
+      hasMore: false,
+    });
     const sessions = sessionList?.['sessions'] as Array<Record<string, unknown>>;
     expect(sessions[0]?.['agentId']).toBe('codex');
+    expect(sessions[0]).toMatchObject({
+      directoryId: 'dir-1',
+      workingDirectory: '/tmp/project',
+    });
+    expect(sessions[0]).not.toHaveProperty('projectId');
+    expect(sessions[0]).not.toHaveProperty('projectBindingSource');
     expect(sendAck).toHaveBeenCalledWith(client, 'req-1', 'ok');
+  });
+
+  it('caps list-sessions pages to keep relay frames bounded', async () => {
+    const { client, sent } = createClient();
+    const sessions = Array.from({ length: 80 }, (_, i) => ({
+      agentId: 'codex',
+      sessionId: `s${i}`,
+      summary: `Session ${i}`,
+      lastModified: 100 + i,
+      resumable: true,
+      messageCount: 4,
+    }));
+    const daemon = {
+      directoryManager: { get: vi.fn().mockReturnValue({ id: 'dir-1', path: '/tmp/project' }) },
+      configManager: {
+        getConfig: vi.fn().mockReturnValue({}),
+      },
+      getDiscoveredSessions: vi.fn().mockReturnValue(new Map([['dir-1', sessions]])),
+    };
+    const sendAck = vi.fn();
+    const handlers = createWsCommandHandlers({
+      daemon: daemon as any,
+      sendAck,
+      getOrCreateBuffer: getOrCreateBuffer as any,
+    });
+
+    await handlers['list-sessions'](client, {
+      type: 'list-sessions',
+      directoryId: 'dir-1',
+      limit: 200,
+      requestId: 'req-1',
+    } as any);
+
+    const sessionList = sent.find((m) => m['type'] === 'session-list');
+    expect(sessionList).toMatchObject({
+      offset: 0,
+      limit: 50,
+      total: 80,
+      hasMore: true,
+    });
+    expect((sessionList?.['sessions'] as unknown[]).length).toBe(50);
   });
 
   it('resume rejects missing discovered session', async () => {
@@ -96,6 +160,449 @@ describe('ws-command-handlers', () => {
       expect.stringContaining('Discovered session not found'),
       { errorCode: 'DISCOVERED_SESSION_NOT_FOUND' },
     );
+  });
+
+  it('resume rejects discovered sessions that the agent cannot resume', async () => {
+    const { client } = createClient();
+    const daemon = {
+      directoryManager: { get: vi.fn().mockReturnValue({ id: 'dir-1', path: '/tmp/project' }) },
+      getDiscoveredSessions: vi.fn().mockReturnValue(
+        new Map([
+          [
+            'dir-1',
+            [
+              {
+                agentId: 'aider',
+                sessionId: 'not-resumable',
+                summary: 'Cannot resume me',
+                lastModified: 123,
+                resumable: false,
+              },
+            ],
+          ],
+        ]),
+      ),
+      resumeSession: vi.fn(),
+    };
+    const sendAck = vi.fn();
+    const handlers = createWsCommandHandlers({
+      daemon: daemon as any,
+      sendAck,
+      getOrCreateBuffer: getOrCreateBuffer as any,
+    });
+
+    await handlers['resume'](client, {
+      type: 'resume',
+      directoryId: 'dir-1',
+      sessionId: 'not-resumable',
+      requestId: 'req-not-resumable',
+    });
+
+    expect(daemon.resumeSession).not.toHaveBeenCalled();
+    expect(sendAck).toHaveBeenCalledWith(
+      client,
+      'req-not-resumable',
+      'error',
+      expect.stringContaining('Session is not resumable'),
+      { errorCode: 'SESSION_NOT_RESUMABLE' },
+    );
+  });
+
+  it('read-session-messages distinguishes missing directory and missing discovered session', async () => {
+    const { client } = createClient();
+    const daemon = {
+      directoryManager: {
+        get: vi.fn((id: string) => (id === 'dir-1' ? { id, path: '/tmp/project' } : undefined)),
+      },
+      getDiscoveredSessions: vi.fn().mockReturnValue(new Map([['dir-1', []]])),
+    };
+    const sendAck = vi.fn();
+    const handlers = createWsCommandHandlers({
+      daemon: daemon as any,
+      sendAck,
+      getOrCreateBuffer: getOrCreateBuffer as any,
+    });
+
+    await handlers['read-session-messages'](client, {
+      type: 'read-session-messages',
+      directoryId: 'missing-dir',
+      sessionId: 'session-1',
+      requestId: 'req-missing-dir',
+    });
+    await handlers['read-session-messages'](client, {
+      type: 'read-session-messages',
+      directoryId: 'dir-1',
+      sessionId: 'missing-session',
+      requestId: 'req-missing-session',
+    });
+
+    expect(sendAck).toHaveBeenNthCalledWith(
+      1,
+      client,
+      'req-missing-dir',
+      'error',
+      expect.stringContaining('Directory not found'),
+      { errorCode: 'DIRECTORY_NOT_FOUND' },
+    );
+    expect(sendAck).toHaveBeenNthCalledWith(
+      2,
+      client,
+      'req-missing-session',
+      'error',
+      expect.stringContaining('Discovered session not found'),
+      { errorCode: 'DISCOVERED_SESSION_NOT_FOUND' },
+    );
+  });
+
+  it('read-session-messages falls back to discovered transcript when stale replay metadata is empty', async () => {
+    const previousViewportHome = process.env['VIEWPORT_HOME'];
+    const previousCodexHome = process.env['CODEX_HOME'];
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-stale-replay-'));
+    try {
+      process.env['VIEWPORT_HOME'] = path.join(temp, 'viewport-home');
+      process.env['CODEX_HOME'] = path.join(temp, 'codex-home');
+      const sessionId = 'codex-stale-replay-session';
+      const replayDir = path.join(process.env['VIEWPORT_HOME'], 'replay');
+      const codexDir = path.join(process.env['CODEX_HOME'], 'sessions', '2026', '05', '09');
+      await fs.mkdir(replayDir, { recursive: true });
+      await fs.mkdir(codexDir, { recursive: true });
+      await fs.writeFile(
+        path.join(replayDir, `${encodeURIComponent(sessionId)}.meta.json`),
+        JSON.stringify({ sessionId, directoryId: 'dir-1', latestSeq: 1 }) + '\n',
+        'utf-8',
+      );
+      const sourcePath = path.join(codexDir, `rollout-2026-05-09T00-00-00-${sessionId}.jsonl`);
+      await fs.writeFile(
+        sourcePath,
+        [
+          JSON.stringify({
+            timestamp: '2026-05-09T00:00:00.000Z',
+            type: 'response_item',
+            payload: {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'history from discovered transcript' }],
+            },
+          }),
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const { client } = createClient();
+      const daemon = {
+        directoryManager: {
+          get: vi.fn((id: string) => (id === 'dir-1' ? { id, path: '/tmp/project' } : undefined)),
+        },
+        getDiscoveredSessions: vi.fn().mockReturnValue(
+          new Map([
+            [
+              'dir-1',
+              [
+                {
+                  agentId: 'codex',
+                  sessionId,
+                  summary: 'Codex history',
+                  lastModified: Date.now(),
+                  resumable: true,
+                  messageCount: 1,
+                  sourcePath,
+                },
+              ],
+            ],
+          ]),
+        ),
+      };
+      const sendAck = vi.fn();
+      const handlers = createWsCommandHandlers({
+        daemon: daemon as any,
+        sendAck,
+        getOrCreateBuffer: getOrCreateBuffer as any,
+      });
+
+      await handlers['read-session-messages'](client, {
+        type: 'read-session-messages',
+        directoryId: 'dir-1',
+        sessionId,
+        requestId: 'req-history',
+        limit: 100,
+      });
+
+      expect(sendAck).toHaveBeenCalledWith(
+        client,
+        'req-history',
+        'ok',
+        undefined,
+        expect.objectContaining({
+          nextOffset: 1,
+          hasMoreBefore: false,
+          messages: [
+            expect.objectContaining({
+              kind: 'text',
+              text: 'history from discovered transcript',
+            }),
+          ],
+        }),
+      );
+    } finally {
+      if (previousViewportHome === undefined) {
+        delete process.env['VIEWPORT_HOME'];
+      } else {
+        process.env['VIEWPORT_HOME'] = previousViewportHome;
+      }
+      if (previousCodexHome === undefined) {
+        delete process.env['CODEX_HOME'];
+      } else {
+        process.env['CODEX_HOME'] = previousCodexHome;
+      }
+      await fs.rm(temp, { recursive: true, force: true });
+    }
+  });
+
+  it('read-session-messages prefers discovered transcript history over live replay when both exist', async () => {
+    const previousViewportHome = process.env['VIEWPORT_HOME'];
+    const previousCodexHome = process.env['CODEX_HOME'];
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-replay-shadow-'));
+    try {
+      process.env['VIEWPORT_HOME'] = path.join(temp, 'viewport-home');
+      process.env['CODEX_HOME'] = path.join(temp, 'codex-home');
+      const sessionId = 'codex-replay-shadow-session';
+      const replayDir = path.join(process.env['VIEWPORT_HOME'], 'replay');
+      const codexDir = path.join(process.env['CODEX_HOME'], 'sessions', '2026', '05', '09');
+      await fs.mkdir(replayDir, { recursive: true });
+      await fs.mkdir(codexDir, { recursive: true });
+      await fs.writeFile(
+        path.join(replayDir, `${encodeURIComponent(sessionId)}.meta.json`),
+        JSON.stringify({ sessionId, directoryId: 'dir-1', latestSeq: 1 }) + '\n',
+        'utf-8',
+      );
+      await fs.writeFile(
+        path.join(replayDir, `${encodeURIComponent(sessionId)}.jsonl`),
+        JSON.stringify({
+          seq: 1,
+          sessionId,
+          update: {
+            updateType: 'user-message',
+            messageId: 'live-tail-only',
+            text: 'live replay tail should not hide file history',
+            timestamp: Date.parse('2026-05-09T00:01:00.000Z'),
+          },
+        }) + '\n',
+        'utf-8',
+      );
+      const sourcePath = path.join(codexDir, `rollout-2026-05-09T00-00-00-${sessionId}.jsonl`);
+      await fs.writeFile(
+        sourcePath,
+        [
+          JSON.stringify({
+            timestamp: '2026-05-09T00:00:00.000Z',
+            type: 'response_item',
+            payload: {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'canonical discovered transcript history' }],
+            },
+          }),
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const { client } = createClient();
+      const daemon = {
+        directoryManager: {
+          get: vi.fn((id: string) => (id === 'dir-1' ? { id, path: '/tmp/project' } : undefined)),
+        },
+        getDiscoveredSessions: vi.fn().mockReturnValue(
+          new Map([
+            [
+              'dir-1',
+              [
+                {
+                  agentId: 'codex',
+                  sessionId,
+                  summary: 'Codex history',
+                  lastModified: Date.now(),
+                  resumable: true,
+                  messageCount: 2,
+                  sourcePath,
+                },
+              ],
+            ],
+          ]),
+        ),
+      };
+      const sendAck = vi.fn();
+      const handlers = createWsCommandHandlers({
+        daemon: daemon as any,
+        sendAck,
+        getOrCreateBuffer: getOrCreateBuffer as any,
+      });
+
+      await handlers['read-session-messages'](client, {
+        type: 'read-session-messages',
+        directoryId: 'dir-1',
+        sessionId,
+        requestId: 'req-history',
+        limit: 100,
+      });
+
+      expect(sendAck).toHaveBeenCalledWith(
+        client,
+        'req-history',
+        'ok',
+        undefined,
+        expect.objectContaining({
+          messages: [
+            expect.objectContaining({
+              kind: 'text',
+              text: 'canonical discovered transcript history',
+            }),
+          ],
+        }),
+      );
+    } finally {
+      if (previousViewportHome === undefined) {
+        delete process.env['VIEWPORT_HOME'];
+      } else {
+        process.env['VIEWPORT_HOME'] = previousViewportHome;
+      }
+      if (previousCodexHome === undefined) {
+        delete process.env['CODEX_HOME'];
+      } else {
+        process.env['CODEX_HOME'] = previousCodexHome;
+      }
+      await fs.rm(temp, { recursive: true, force: true });
+    }
+  });
+
+  it('read-session-messages can stream the transcript page before acknowledging', async () => {
+    const previousViewportHome = process.env['VIEWPORT_HOME'];
+    const previousCodexHome = process.env['CODEX_HOME'];
+    const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-streamed-history-'));
+    try {
+      process.env['VIEWPORT_HOME'] = path.join(temp, 'viewport-home');
+      process.env['CODEX_HOME'] = path.join(temp, 'codex-home');
+      const sessionId = 'codex-streamed-session';
+      const codexDir = path.join(process.env['CODEX_HOME'], 'sessions', '2026', '05', '09');
+      await fs.mkdir(codexDir, { recursive: true });
+      const sourcePath = path.join(codexDir, `rollout-2026-05-09T00-00-00-${sessionId}.jsonl`);
+      await fs.writeFile(
+        sourcePath,
+        [
+          JSON.stringify({
+            timestamp: '2026-05-09T00:00:00.000Z',
+            type: 'response_item',
+            payload: {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'history sent as page event' }],
+            },
+          }),
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const { client, sent } = createClient();
+      const daemon = {
+        directoryManager: {
+          get: vi.fn((id: string) => (id === 'dir-1' ? { id, path: '/tmp/project' } : undefined)),
+        },
+        getDiscoveredSessions: vi.fn().mockReturnValue(
+          new Map([
+            [
+              'dir-1',
+              [
+                {
+                  agentId: 'codex',
+                  sessionId,
+                  summary: 'Codex history',
+                  lastModified: Date.now(),
+                  resumable: true,
+                  messageCount: 1,
+                  sourcePath,
+                },
+              ],
+            ],
+          ]),
+        ),
+      };
+      const sendAck = vi.fn();
+      const handlers = createWsCommandHandlers({
+        daemon: daemon as any,
+        sendAck,
+        getOrCreateBuffer: getOrCreateBuffer as any,
+      });
+
+      await handlers['read-session-messages'](client, {
+        type: 'read-session-messages',
+        directoryId: 'dir-1',
+        sessionId,
+        requestId: 'req-stream-history',
+        limit: 100,
+        delivery: 'event-stream',
+      });
+
+      expect(sent).toContainEqual(
+        expect.objectContaining({
+          type: 'session-messages-page',
+          requestId: 'req-stream-history',
+          directoryId: 'dir-1',
+          sessionId,
+          final: true,
+          messages: [
+            expect.objectContaining({
+              kind: 'text',
+              text: 'history sent as page event',
+            }),
+          ],
+        }),
+      );
+      expect(sendAck).toHaveBeenCalledWith(
+        client,
+        'req-stream-history',
+        'ok',
+        undefined,
+        expect.objectContaining({
+          streamed: true,
+          accepted: true,
+        }),
+      );
+      expect(sendAck.mock.calls[0]?.[4]).not.toHaveProperty('messages');
+    } finally {
+      if (previousViewportHome === undefined) {
+        delete process.env['VIEWPORT_HOME'];
+      } else {
+        process.env['VIEWPORT_HOME'] = previousViewportHome;
+      }
+      if (previousCodexHome === undefined) {
+        delete process.env['CODEX_HOME'];
+      } else {
+        process.env['CODEX_HOME'] = previousCodexHome;
+      }
+      await fs.rm(temp, { recursive: true, force: true });
+    }
+  });
+
+  it('truncates large transcript ack payloads below the relay-safe plaintext limit', () => {
+    const messages = Array.from({ length: 12 }, (_, index) => ({
+      kind: 'tool_result' as const,
+      messageId: `large-${index}`,
+      timestamp: Date.now() + index,
+      toolName: 'shell',
+      output: 'x'.repeat(180_000),
+    }));
+
+    const fit = fitMessagesForAck(messages as any);
+    const bytes = Buffer.byteLength(
+      JSON.stringify({
+        type: 'ack',
+        requestId: 'size-check',
+        status: 'ok',
+        ...fit,
+      }),
+    );
+
+    expect(bytes).toBeLessThanOrEqual(SESSION_MESSAGES_ACK_PLAINTEXT_LIMIT_BYTES);
+    expect(fit.truncated).toBe(true);
   });
 
   it('resume uses discovered agent when resuming', async () => {
@@ -136,12 +643,65 @@ describe('ws-command-handlers', () => {
       requestId: 'req-3',
     });
 
-    expect(resumeSession).toHaveBeenCalledWith('s1', 'dir-1', undefined, {
+    expect(resumeSession).toHaveBeenCalledWith('s1', 'dir-1', '', {
       agent: 'gemini',
       model: 'gemini-pro',
     });
     const started = sent.find((m) => m['type'] === 'session-started');
     expect(started?.['agent']).toBe('gemini');
+  });
+
+  it('resume returns structured ack errors from the resume path', async () => {
+    const { client } = createClient();
+    const resumeSession = vi
+      .fn()
+      .mockRejectedValue(
+        new ViewportError(
+          'ADAPTER_NOT_AVAILABLE',
+          'No adapter registered for agent: missing-agent',
+        ),
+      );
+    const daemon = {
+      directoryManager: { get: vi.fn().mockReturnValue({ id: 'dir-1', path: '/tmp/project' }) },
+      getDiscoveredSessions: vi.fn().mockReturnValue(
+        new Map([
+          [
+            'dir-1',
+            [
+              {
+                agentId: 'missing-agent',
+                sessionId: 's1',
+                summary: 'Resume me',
+                lastModified: 123,
+                resumable: true,
+              },
+            ],
+          ],
+        ]),
+      ),
+      resumeSession,
+    };
+    const sendAck = vi.fn();
+    const handlers = createWsCommandHandlers({
+      daemon: daemon as any,
+      sendAck,
+      getOrCreateBuffer: getOrCreateBuffer as any,
+    });
+
+    await handlers['resume'](client, {
+      type: 'resume',
+      directoryId: 'dir-1',
+      sessionId: 's1',
+      requestId: 'req-adapter-missing',
+    });
+
+    expect(sendAck).toHaveBeenCalledWith(
+      client,
+      'req-adapter-missing',
+      'error',
+      expect.stringContaining('No adapter registered'),
+      { errorCode: 'ADAPTER_NOT_AVAILABLE' },
+    );
   });
 
   it('launch starts session then sends prompt and replays buffered updates', async () => {
@@ -178,15 +738,62 @@ describe('ws-command-handlers', () => {
     await handlers['launch'](client, {
       type: 'launch',
       directoryId: 'dir-1',
+      resourceId: 'resource-1',
       prompt: 'continue',
       requestId: 'req-launch',
     });
 
-    expect(launchSession).toHaveBeenCalledWith('dir-1', '', undefined);
-    expect(sendPrompt).toHaveBeenCalledWith('s-new', 'continue');
-    expect(sent.find((m) => m['type'] === 'session-started')).toBeTruthy();
+    expect(launchSession).toHaveBeenCalledWith('dir-1', 'continue', {
+      resourceId: 'resource-1',
+    });
+    expect(sendPrompt).not.toHaveBeenCalled();
+    expect(sent.find((m) => m['type'] === 'session-started')).toMatchObject({
+      resourceId: 'resource-1',
+    });
+    expect(sent.find((m) => m['type'] === 'session-started')).not.toHaveProperty('projectId');
     expect(sent.find((m) => m['type'] === 'session-update')).toBeTruthy();
     expect(sendAck).toHaveBeenCalledWith(client, 'req-launch', 'ok');
+  });
+
+  it('launch accepts resourceId as the resource-first scope', async () => {
+    const { client, sent } = createClient();
+    const launchSession = vi.fn().mockResolvedValue('s-resource');
+    const daemon = {
+      directoryManager: {
+        get: vi.fn().mockReturnValue({ id: 'dir-1', path: '/tmp/resource-repo' }),
+      },
+      launchSession,
+      sendPrompt: vi.fn(),
+    };
+    const sendAck = vi.fn();
+    const handlers = createWsCommandHandlers({
+      daemon: daemon as any,
+      sendAck,
+      getOrCreateBuffer: vi.fn(() => ({
+        getAll: () => [],
+        getReplayWindow: () => ({
+          entries: [],
+          droppedWindow: false,
+          requestedLastSeq: 0,
+          earliestAvailableSeq: 0,
+          latestAvailableSeq: 0,
+        }),
+      })) as any,
+    });
+
+    await handlers['launch'](client, {
+      type: 'launch',
+      directoryId: 'dir-1',
+      resourceId: 'resource-1',
+      requestId: 'req-resource-launch',
+    });
+
+    expect(launchSession).toHaveBeenCalledWith('dir-1', '', { resourceId: 'resource-1' });
+    expect(sent.find((m) => m['type'] === 'session-started')).toMatchObject({
+      resourceId: 'resource-1',
+    });
+    expect(sent.find((m) => m['type'] === 'session-started')).not.toHaveProperty('projectId');
+    expect(sendAck).toHaveBeenCalledWith(client, 'req-resource-launch', 'ok');
   });
 
   it('resume replays buffered updates and sends prompt after attach', async () => {
@@ -240,13 +847,20 @@ describe('ws-command-handlers', () => {
       type: 'resume',
       directoryId: 'dir-1',
       sessionId: 's1',
+      resourceId: 'resource-1',
       prompt: 'keep going',
       requestId: 'req-resume',
     });
 
-    expect(resumeSession).toHaveBeenCalledWith('s1', 'dir-1', undefined, { agent: 'claude' });
-    expect(sendPrompt).toHaveBeenCalledWith('s1', 'keep going');
-    expect(sent.find((m) => m['type'] === 'session-started')).toBeTruthy();
+    expect(resumeSession).toHaveBeenCalledWith('s1', 'dir-1', 'keep going', {
+      agent: 'claude',
+      resourceId: 'resource-1',
+    });
+    expect(sendPrompt).not.toHaveBeenCalled();
+    expect(sent.find((m) => m['type'] === 'session-started')).toMatchObject({
+      resourceId: 'resource-1',
+    });
+    expect(sent.find((m) => m['type'] === 'session-started')).not.toHaveProperty('projectId');
     expect(sent.find((m) => m['type'] === 'session-update')).toBeTruthy();
     expect(sendAck).toHaveBeenCalledWith(client, 'req-resume', 'ok');
   });
@@ -358,5 +972,54 @@ describe('ws-command-handlers', () => {
     expect(client.watchedDiscoveredSessions.has(discoveredWatchKey('disc-2099', 'dir-1'))).toBe(
       true,
     );
+  });
+
+  it('sync-request sends a fresh sync snapshot before ack', async () => {
+    const { client, sent } = createClient();
+    const daemon = {
+      directoryManager: { list: vi.fn().mockReturnValue([]) },
+      getActiveSessions: vi.fn().mockReturnValue([]),
+      getDiscoveredSessions: vi.fn().mockReturnValue(new Map()),
+      getAvailableAgents: vi.fn().mockReturnValue([]),
+      configManager: {
+        getMachineId: vi.fn().mockReturnValue('machine-1'),
+        getConfig: vi.fn().mockReturnValue({}),
+        getDaemonConfig: vi.fn().mockReturnValue({
+          profile: 'relay',
+          relay: {
+            serverUrl: 'https://getviewport.com',
+            endpoint: 'wss://relay.getviewport.com/ws',
+            workspaceId: 'workspace-1',
+          },
+          server: {
+            url: 'https://getviewport.com',
+          },
+        }),
+      },
+    };
+    const sendAck = vi.fn();
+    const handlers = createWsCommandHandlers({
+      daemon: daemon as any,
+      sendAck,
+      getOrCreateBuffer: getOrCreateBuffer as any,
+    });
+
+    await handlers['sync-request'](client, {
+      type: 'sync-request',
+      requestId: 'req-sync',
+    });
+
+    expect(sent[0]).toMatchObject({
+      type: 'sync-snapshot',
+      machine: {
+        id: 'machine-1',
+        runtimeKind: 'managed',
+        daemonVersion: expect.any(String),
+      },
+      directories: [],
+      activeSessions: [],
+      discoveredSessions: [],
+    });
+    expect(sendAck).toHaveBeenCalledWith(client, 'req-sync', 'ok');
   });
 });

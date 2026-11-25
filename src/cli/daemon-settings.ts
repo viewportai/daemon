@@ -1,8 +1,10 @@
 import { getFlag, hasFlag } from './args.js';
 import { loadConfig } from '../core/config.js';
+import { resolveDisplayVersion } from '../core/package-meta.js';
 import { buildSecurityProfile } from '../server/security.js';
 import type { DeploymentProfile } from '../server/security.js';
 import { parseListenTarget, type DaemonListenTarget } from './listen-target.js';
+import { resolveRelayLaunchBindings } from './relay-launch-bindings.js';
 import type { RuntimeLaunchConfig } from './supervisor-protocol.js';
 
 export interface DaemonResolvedSettings {
@@ -141,7 +143,7 @@ function resolveListenInput(configListen: string | undefined): string {
 function resolveProfile(configProfile: DeploymentProfile | undefined): DeploymentProfile {
   const cliProfile = parseProfile(getFlag('profile'));
   if (cliProfile) return cliProfile;
-  const envProfile = parseProfile(envValue('VPD_PROFILE', 'VIEWPORT_PROFILE'));
+  const envProfile = parseProfile(envValue('VPD_RUNTIME_PROFILE', 'VIEWPORT_RUNTIME_PROFILE'));
   if (envProfile) return envProfile;
   return configProfile ?? 'local';
 }
@@ -217,10 +219,14 @@ export async function resolveDaemonSettingsFromSources(): Promise<DaemonResolved
     getFlag('relay-workspace') ??
     envValue('VPD_RELAY_WORKSPACE', 'VIEWPORT_RELAY_WORKSPACE') ??
     daemonConfig?.relay?.workspaceId;
-  const relayEnrollToken =
-    getFlag('relay-enroll-token') ??
-    envValue('VPD_RELAY_ENROLL_TOKEN', 'VIEWPORT_RELAY_ENROLL_TOKEN') ??
-    daemonConfig?.relay?.enrollToken;
+  const relayRuntimeTargetId =
+    getFlag('relay-runtime-target') ??
+    envValue('VPD_RELAY_RUNTIME_TARGET', 'VIEWPORT_RELAY_RUNTIME_TARGET') ??
+    daemonConfig?.relay?.runtimeTargetId;
+  const relayMachineId =
+    getFlag('relay-machine') ??
+    envValue('VPD_RELAY_MACHINE', 'VIEWPORT_RELAY_MACHINE') ??
+    daemonConfig?.relay?.machineId;
   const relayIssueToken =
     getFlag('relay-issue-token') ??
     envValue('VPD_RELAY_ISSUE_TOKEN', 'VIEWPORT_RELAY_ISSUE_TOKEN') ??
@@ -266,23 +272,63 @@ export async function resolveDaemonSettingsFromSources(): Promise<DaemonResolved
     ) ??
     daemonConfig?.relay?.tokenClockSkewSec;
 
+  const relayBindings = resolveRelayLaunchBindings({
+    configured: daemonConfig?.relay?.bindings,
+    computed: {
+      enabled: true,
+      endpoint: relayEndpoint,
+      serverUrl: relayServerUrl,
+      workspaceId: relayWorkspaceId,
+      runtimeTargetId: relayRuntimeTargetId,
+      machineId: relayMachineId,
+      issueToken: relayIssueToken,
+      tlsVerify: relayTlsVerify,
+      caCertPath: relayCaCertPath,
+      tlsPins: relayTlsPins,
+      tokenIssuer: relayTokenIssuer,
+      tokenAudience: relayTokenAudience,
+      tokenJwksUrl: relayTokenJwksUrl,
+      tokenSigningKeys: relayTokenSigningKeys,
+      tokenClockSkewSec: relayTokenClockSkewSec,
+    },
+  });
+
   const launch: RuntimeLaunchConfig = {
     listen: listenTarget.listen,
     host: listenTarget.type === 'tcp' ? listenTarget.host : '127.0.0.1',
     port: listenTarget.type === 'tcp' ? listenTarget.port : 0,
     socketPath: listenTarget.type === 'socket' ? listenTarget.path : undefined,
-    version: '0.3.0',
+    version: resolveDisplayVersion(),
     profile: securityProfile.profile,
     allowedHostsRaw,
     allowedOriginsRaw,
     authEnabled: securityProfile.requireAuth,
     detached: resolveDetachedDefault(undefined),
     logPath,
+    serverUrl:
+      getFlag('server-url') ??
+      envValue('VPD_SERVER_URL', 'VIEWPORT_SERVER_URL') ??
+      daemonConfig?.server?.url ??
+      relayServerUrl,
+    serverTlsVerify:
+      parseRelayTlsVerify(getFlag('server-tls-verify')) ??
+      parseRelayTlsVerify(envValue('VPD_SERVER_TLS_VERIFY', 'VIEWPORT_SERVER_TLS_VERIFY')) ??
+      daemonConfig?.server?.tlsVerify ??
+      'auto',
+    serverCaCertPath:
+      getFlag('server-ca-cert') ??
+      envValue('VPD_SERVER_CA_CERT', 'VIEWPORT_SERVER_CA_CERT') ??
+      daemonConfig?.server?.caCertPath,
+    serverTlsPins:
+      parseCsvList(getFlag('server-tls-pins')) ??
+      parseCsvList(envValue('VPD_SERVER_TLS_PINS', 'VIEWPORT_SERVER_TLS_PINS')) ??
+      daemonConfig?.server?.tlsPins,
     relayEnabled,
     relayEndpoint,
     relayServerUrl,
     relayWorkspaceId,
-    relayEnrollToken,
+    relayRuntimeTargetId,
+    relayMachineId,
     relayIssueToken,
     relayTlsVerify,
     relayCaCertPath,
@@ -292,6 +338,7 @@ export async function resolveDaemonSettingsFromSources(): Promise<DaemonResolved
     relayTokenJwksUrl,
     relayTokenSigningKeys,
     relayTokenClockSkewSec,
+    relayBindings,
   };
 
   return {

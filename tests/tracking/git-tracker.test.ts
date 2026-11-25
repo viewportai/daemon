@@ -20,6 +20,13 @@ const DEFAULT_CONFIG: GitTrackerConfig = {
   worktreeRoot: '.viewport/worktrees',
 };
 
+// These tests spawn many real `git` subprocesses (init, worktree, commit, push)
+// per case. Under the parallel fork pool on slower/loaded CI runners the git
+// subprocess contention pushes individual cases past the default 15s ceiling,
+// causing intermittent timeout flakes. 30s matches the established budget for
+// the other git-subprocess-heavy suite (github-repo-provider.test.ts).
+const GIT_TRACKER_TEST_TIMEOUT_MS = 30_000;
+
 function toolCallUpdate(
   toolName: string,
   status: 'completed' | 'error' = 'completed',
@@ -34,7 +41,7 @@ function toolCallUpdate(
   };
 }
 
-describe('GitTracker', () => {
+describe('GitTracker', { timeout: GIT_TRACKER_TEST_TIMEOUT_MS }, () => {
   let projectDir: string;
   let baseBranch: string;
 

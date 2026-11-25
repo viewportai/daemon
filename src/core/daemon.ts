@@ -11,10 +11,12 @@
 
 import type {
   AgentAdapter,
+  AgentAdapterDescriptor,
   DiscoveredSession,
   RunTrackerFactory,
   SessionDiscovery,
 } from './interfaces.js';
+import type { ModelInfo } from './agent-registry.js';
 import type {
   PendingPermissionRequest,
   SessionAgentMode,
@@ -30,7 +32,13 @@ import { DirectoryManager } from '../directories/manager.js';
 import { SessionManager } from './session-manager.js';
 import { PermissionCoordinator } from './permission-coordinator.js';
 import { logger } from './logger.js';
-import { dedupeDiscoveredSessions } from './discovered-sessions.js';
+import { discoverDirectorySessions } from './session-discovery-runner.js';
+import { WorkflowRunner } from '../workflows/runner.js';
+import { WorkflowSessionLinkStore } from '../workflows/session-links.js';
+import {
+  EphemeralPlanDraftStore,
+  type EphemeralPlanDraft,
+} from '../hooks/ephemeral-plan-drafts.js';
 
 const log = logger.child({ module: 'daemon' });
 
@@ -41,13 +49,19 @@ const log = logger.child({ module: 'daemon' });
 export class Daemon extends TypedEventEmitter<DaemonEvents> {
   readonly configManager: ConfigManager;
   readonly directoryManager: DirectoryManager;
+  readonly workflowRunner: WorkflowRunner;
 
   private adapters = new Map<string, AgentAdapter>();
   private discoveries = new Map<string, SessionDiscovery>();
   private trackerFactory: RunTrackerFactory | null = null;
+  private modelProvider: (() => ModelInfo[] | Promise<ModelInfo[]>) | null = null;
 
   private readonly permissionCoordinator: PermissionCoordinator;
   private readonly sessionManager: SessionManager;
+  private readonly workflowSessionLinks = new WorkflowSessionLinkStore();
+  private readonly ephemeralPlanDrafts = new EphemeralPlanDraftStore();
+  private discoveryRunPromise: Promise<void> | null = null;
+  private discoveryRerunRequested = false;
 
   /**
    * Discovered sessions from JSONL files, keyed by directoryId.
@@ -68,6 +82,7 @@ export class Daemon extends TypedEventEmitter<DaemonEvents> {
       this.adapters,
       () => this.trackerFactory,
     );
+    this.workflowRunner = new WorkflowRunner(this);
   }
 
   /** Register an agent adapter (e.g. ClaudeAdapter). */
@@ -85,9 +100,28 @@ export class Daemon extends TypedEventEmitter<DaemonEvents> {
     this.trackerFactory = factory;
   }
 
+  /** Set the provider used to resolve runtime model availability. */
+  setModelProvider(provider: () => ModelInfo[] | Promise<ModelInfo[]>): void {
+    this.modelProvider = provider;
+  }
+
   /** Initialize the daemon — loads config from disk. */
   async initialize(): Promise<void> {
     await this.configManager.load();
+    // Load workflow plugins from `~/.viewport/plugins.json` before resuming
+    // pending runs so any custom node types in those runs have an executor
+    // registered when the runner picks them back up.
+    const { loadPlugins } = await import('../workflows/plugin-loader.js');
+    await loadPlugins();
+  }
+
+  /**
+   * Resume workflow runs after startup has registered agent adapters and model
+   * providers. Running this before adapters are loaded makes valid resumed runs
+   * fail preflight as "agent unavailable".
+   */
+  resumePendingWorkflowRuns(): void {
+    void this.workflowRunner.resumePendingRuns().catch(() => undefined);
   }
 
   /**
@@ -95,30 +129,57 @@ export class Daemon extends TypedEventEmitter<DaemonEvents> {
    * Finds existing sessions from agent-specific sources (e.g. ~/.claude/projects/).
    */
   async runDiscovery(): Promise<void> {
-    const directories = this.directoryManager.list();
-    const nextDiscovered = new Map<string, DiscoveredSession[]>();
-
-    for (const dir of directories) {
-      const allSessions: DiscoveredSession[] = [];
-
-      for (const [agentId, discovery] of this.discoveries) {
-        try {
-          const sessions = await discovery.discoverSessions(dir.path);
-          allSessions.push(...sessions);
-        } catch (err) {
-          log.warn({ err, agentId, directory: dir.path }, 'Discovery failed for directory');
-        }
-      }
-
-      const dedupedSessions = dedupeDiscoveredSessions(allSessions);
-      if (dedupedSessions.length > 0) {
-        // Sort by most recent first
-        nextDiscovered.set(dir.id, dedupedSessions);
-      }
+    if (this.discoveryRunPromise) {
+      this.discoveryRerunRequested = true;
+      return this.discoveryRunPromise;
     }
+
+    this.discoveryRunPromise = this.runDiscoveryLoop();
+    try {
+      await this.discoveryRunPromise;
+    } finally {
+      this.discoveryRunPromise = null;
+    }
+  }
+
+  private async runDiscoveryLoop(): Promise<void> {
+    do {
+      this.discoveryRerunRequested = false;
+      await this.runDiscoveryOnce();
+    } while (this.discoveryRerunRequested);
+  }
+
+  private async runDiscoveryOnce(): Promise<void> {
+    const directories = this.directoryManager.list();
+
+    log.debug(
+      {
+        directories: directories.length,
+        discoveries: this.discoveries.size,
+        agents: [...this.discoveries.keys()],
+      },
+      'Starting discovery run',
+    );
+
+    const nextDiscovered = await discoverDirectorySessions({
+      directories,
+      discoveries: this.discoveries,
+      links: this.workflowSessionLinks,
+      log,
+    });
 
     // Replace atomically so stale entries are removed when sessions disappear.
     this.discoveredSessions = nextDiscovered;
+    log.debug(
+      {
+        directoriesWithSessions: nextDiscovered.size,
+        totalSessions: [...nextDiscovered.values()].reduce(
+          (sum, sessions) => sum + sessions.length,
+          0,
+        ),
+      },
+      'Discovery run complete',
+    );
   }
 
   /** Get discovered sessions for a directory. */
@@ -135,6 +196,22 @@ export class Daemon extends TypedEventEmitter<DaemonEvents> {
   /** Get available agent IDs from registered adapters. */
   getAvailableAgents(): string[] {
     return [...this.adapters.keys()];
+  }
+
+  /** Get workflow-relevant capability descriptors for registered adapters. */
+  getAgentAdapterDescriptions(): AgentAdapterDescriptor[] {
+    return [...this.adapters.values()].map((adapter) => adapter.describe());
+  }
+
+  /** Get a single adapter capability descriptor. */
+  getAgentAdapterDescription(agentId: string): AgentAdapterDescriptor | undefined {
+    return this.adapters.get(agentId)?.describe();
+  }
+
+  /** Get available model IDs from the registered agent registry, when known. */
+  async getAvailableModels(): Promise<ModelInfo[]> {
+    if (!this.modelProvider) return [];
+    return this.modelProvider();
   }
 
   // ---------------------------------------------------------------------------
@@ -194,6 +271,7 @@ export class Daemon extends TypedEventEmitter<DaemonEvents> {
   getSessionInfo(sessionId: string): {
     state: SessionState;
     directoryId: string;
+    resourceId?: string;
     agent: string;
     mode: SessionAgentMode;
     steps: ReadonlyArray<Step>;
@@ -201,9 +279,26 @@ export class Daemon extends TypedEventEmitter<DaemonEvents> {
     return this.sessionManager.getSessionInfo(sessionId);
   }
 
+  hasSession(sessionId: string): boolean {
+    return this.sessionManager.hasSession(sessionId);
+  }
+
+  getSessionWorktreePath(sessionId: string): string {
+    return this.sessionManager.getSessionWorktreePath(sessionId);
+  }
+
+  getSessionNativeId(sessionId: string): string {
+    return this.sessionManager.getSessionNativeId(sessionId);
+  }
+
+  getSessionEndReason(sessionId: string): string | undefined {
+    return this.sessionManager.getSessionEndReason(sessionId);
+  }
+
   listActiveSessions(): Array<{
     sessionId: string;
     directoryId: string;
+    resourceId?: string;
     agent: string;
     state: SessionState;
     mode: SessionAgentMode;
@@ -282,6 +377,21 @@ export class Daemon extends TypedEventEmitter<DaemonEvents> {
 
   getSessionMode(sessionId: string): SessionAgentMode {
     return this.sessionManager.getSessionMode(sessionId);
+  }
+
+  createEphemeralPlanDraft(
+    workspaceId: string,
+    event: DaemonEvents['hook:plan-proposed'],
+  ): EphemeralPlanDraft {
+    return this.ephemeralPlanDrafts.create(workspaceId, event);
+  }
+
+  getEphemeralPlanDraft(draftId: string): EphemeralPlanDraft | null {
+    return this.ephemeralPlanDrafts.get(draftId);
+  }
+
+  deleteEphemeralPlanDraft(draftId: string): void {
+    this.ephemeralPlanDrafts.delete(draftId);
   }
 
   // ---------------------------------------------------------------------------

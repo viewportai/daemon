@@ -3,10 +3,11 @@
  *
  * Implements the Viewport wire protocol (plan/03_protocol.md):
  * launch, kill, prompt, respond-permission, subscribe/unsubscribe,
- * rollback, branch-retry, squash-merge, list-sessions, resume.
+ * rollback, branch-retry, squash-merge, list-sessions, resume, sync-request.
  */
 
 import { z } from 'zod';
+import type { WorkflowInputValue } from '../workflows/types.js';
 
 const MAX_PROMPT_CHARS = 100_000;
 const MAX_MODEL_CHARS = 200;
@@ -14,7 +15,19 @@ const MAX_THINKING_MODE_CHARS = 32;
 const MAX_REQUEST_ID_CHARS = 128;
 const MAX_IMAGE_BYTES_BASE64_CHARS = 2_000_000;
 const MAX_IMAGE_COUNT = 4;
-const MAX_LIST_SESSIONS_LIMIT = 200;
+
+const WorkflowInputValueSchema: z.ZodType<WorkflowInputValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(WorkflowInputValueSchema),
+    z.record(z.string(), WorkflowInputValueSchema),
+  ]),
+);
+export const MAX_LIST_SESSIONS_LIMIT = 50;
+export const MAX_READ_SESSION_MESSAGES_LIMIT = 200;
 
 const ImageSchema = z.object({
   data: z.string().max(MAX_IMAGE_BYTES_BASE64_CHARS),
@@ -25,23 +38,26 @@ const ImageSchema = z.object({
 // Individual message schemas
 // ---------------------------------------------------------------------------
 
-export const LaunchSchema = z.object({
-  type: z.literal('launch'),
-  directoryId: z.string().min(1).max(512),
-  prompt: z.string().max(MAX_PROMPT_CHARS).optional(),
-  model: z.string().max(MAX_MODEL_CHARS).optional(),
-  thinkingMode: z.string().max(MAX_THINKING_MODE_CHARS).optional(),
-  images: z.array(ImageSchema).max(MAX_IMAGE_COUNT).optional(),
-  configOverrides: z
-    .object({
-      agent: z.string().max(64).optional(),
-      model: z.string().max(MAX_MODEL_CHARS).optional(),
-      costCapUsd: z.number().optional(),
-      trust: z.enum(['operator', 'automated', 'external']).optional(),
-    })
-    .optional(),
-  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
-});
+export const LaunchSchema = z
+  .object({
+    type: z.literal('launch'),
+    directoryId: z.string().min(1).max(512),
+    resourceId: z.string().min(1).max(256).optional(),
+    prompt: z.string().max(MAX_PROMPT_CHARS).optional(),
+    model: z.string().max(MAX_MODEL_CHARS).optional(),
+    thinkingMode: z.string().max(MAX_THINKING_MODE_CHARS).optional(),
+    images: z.array(ImageSchema).max(MAX_IMAGE_COUNT).optional(),
+    configOverrides: z
+      .object({
+        agent: z.string().max(64).optional(),
+        model: z.string().max(MAX_MODEL_CHARS).optional(),
+        costCapUsd: z.number().optional(),
+        trust: z.enum(['operator', 'automated', 'external']).optional(),
+      })
+      .optional(),
+    requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+  })
+  .strict();
 
 export const KillSchema = z.object({
   type: z.literal('kill'),
@@ -111,14 +127,77 @@ export const ListSessionsSchema = z.object({
   requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
 });
 
-export const ResumeSchema = z.object({
-  type: z.literal('resume'),
-  sessionId: z.string().min(1).max(256),
+export const ReadSessionMessagesSchema = z.object({
+  type: z.literal('read-session-messages'),
   directoryId: z.string().min(1).max(512),
-  prompt: z.string().max(MAX_PROMPT_CHARS).optional(),
-  model: z.string().max(MAX_MODEL_CHARS).optional(),
+  sessionId: z.string().min(1).max(256),
+  limit: z.number().int().positive().max(MAX_READ_SESSION_MESSAGES_LIMIT).optional(),
+  offset: z.number().int().nonnegative().optional(),
+  delivery: z.enum(['ack', 'event-stream']).optional(),
   requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
 });
+
+export const ContextCandidatePreviewSchema = z.object({
+  type: z.literal('context-candidate-preview'),
+  contextResourceId: z.string().min(1).max(256),
+  workspaceId: z.string().min(1).max(256).optional(),
+  actorName: z.string().min(1).max(256),
+  candidateEventId: z.string().min(1).max(256).optional(),
+  payloadDigest: z.string().min(1).max(256).optional(),
+  passphrase: z.string().max(4096).optional(),
+  recoveryCode: z.string().max(4096).optional(),
+  capabilityToken: z.string().min(1).max(4096).optional(),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const ContextResolveSchema = z.object({
+  type: z.literal('context-resolve'),
+  contextResourceId: z.string().min(1).max(256),
+  workspaceId: z.string().min(1).max(256),
+  actorName: z.string().min(1).max(256),
+  query: z.string().max(10_000).default(''),
+  maxItems: z.number().int().min(1).max(500).optional(),
+  includePrivate: z.boolean().optional(),
+  profile: z.string().min(1).max(256).optional(),
+  profilePin: z
+    .object({
+      path: z.string().min(1).max(4096).optional(),
+      digest: z.string().min(1).max(256).optional(),
+    })
+    .optional(),
+  passphrase: z.string().max(4096).optional(),
+  recoveryCode: z.string().max(4096).optional(),
+  capabilityToken: z.string().min(1).max(4096).optional(),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const ContextProposeSchema = z.object({
+  type: z.literal('context-propose'),
+  contextResourceId: z.string().min(1).max(256),
+  workspaceId: z.string().min(1).max(256),
+  actorName: z.string().min(1).max(256),
+  title: z.string().min(1).max(500),
+  body: z.string().min(1).max(100_000),
+  source: z.string().max(512).optional(),
+  sourceKind: z.enum(['workflow', 'plan', 'integration']).optional(),
+  sync: z.boolean().optional(),
+  passphrase: z.string().max(4096).optional(),
+  recoveryCode: z.string().max(4096).optional(),
+  capabilityToken: z.string().min(1).max(4096).optional(),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const ResumeSchema = z
+  .object({
+    type: z.literal('resume'),
+    sessionId: z.string().min(1).max(256),
+    directoryId: z.string().min(1).max(512),
+    resourceId: z.string().min(1).max(256).optional(),
+    prompt: z.string().max(MAX_PROMPT_CHARS).optional(),
+    model: z.string().max(MAX_MODEL_CHARS).optional(),
+    requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+  })
+  .strict();
 
 export const WatchDiscoveredSessionSchema = z.object({
   type: z.literal('watch-discovered-session'),
@@ -131,6 +210,90 @@ export const UnwatchDiscoveredSessionSchema = z.object({
   type: z.literal('unwatch-discovered-session'),
   sessionId: z.string().min(1).max(256),
   directoryId: z.string().min(1).max(512).optional(),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const SyncRequestSchema = z.object({
+  type: z.literal('sync-request'),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const WorkflowRunSchema = z
+  .object({
+    type: z.literal('workflow-run'),
+    workflowPath: z.string().min(1).max(4096).optional(),
+    workflowYaml: z.string().min(1).max(256_000).optional(),
+    workflowSourceRef: z.string().min(1).max(4096).optional(),
+    directoryId: z.string().min(1).max(512),
+    inputs: z.record(z.string(), WorkflowInputValueSchema).optional(),
+    resourceId: z.string().min(1).max(256).optional(),
+    runtimeTargetId: z.string().min(1).max(256).optional(),
+    platformRunId: z.string().min(1).max(256).optional(),
+    rerunOfWorkflowRunId: z.string().min(1).max(256).optional(),
+    executionPolicy: z
+      .object({
+        mode: z.enum(['current_tree', 'isolated_worktree', 'named_branch']),
+        branch: z.string().min(1).max(255).optional(),
+      })
+      .strict()
+      .optional(),
+    dataCapturePolicy: z
+      .object({
+        transcripts: z.enum(['none', 'excerpt']),
+        logs: z.enum(['metadata', 'content']),
+        artifacts: z.enum(['metadata', 'local_reference']),
+      })
+      .strict()
+      .optional(),
+    requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+  })
+  .strict()
+  .refine((value) => Boolean(value.workflowPath || value.workflowYaml), {
+    message: 'workflowPath or workflowYaml is required',
+    path: ['workflowPath'],
+  });
+
+export const WorkflowListRunsSchema = z.object({
+  type: z.literal('workflow-list-runs'),
+  limit: z.number().int().positive().max(200).optional(),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const WorkflowShowRunSchema = z.object({
+  type: z.literal('workflow-show-run'),
+  runId: z.string().min(1).max(256),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const WorkflowApproveRunSchema = z.object({
+  type: z.literal('workflow-approve'),
+  runId: z.string().min(1).max(256),
+  nodeId: z.string().min(1).max(256),
+  approved: z.boolean(),
+  message: z.string().max(2_000).optional(),
+  actor: z
+    .object({
+      id: z.string().max(255).optional(),
+      name: z.string().max(255).optional(),
+      email: z.string().email().max(255).optional(),
+      source: z.string().max(255).optional(),
+    })
+    .optional(),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const WorkflowCancelRunSchema = z.object({
+  type: z.literal('workflow-cancel'),
+  runId: z.string().min(1).max(256),
+  message: z.string().max(2_000).optional(),
+  actor: z
+    .object({
+      id: z.string().max(255).optional(),
+      name: z.string().max(255).optional(),
+      email: z.string().email().max(255).optional(),
+      source: z.string().max(255).optional(),
+    })
+    .optional(),
   requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
 });
 
@@ -155,6 +318,110 @@ export const RespondHookPermissionSchema = z.object({
   requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
 });
 
+const TrustedEdgePlanBodyKeyGrantSchema = z.object({
+  schema: z.literal('viewport.plan_body_key_grant/v2'),
+  algorithm: z.literal('x25519-hkdf-sha256-aes-256-gcm'),
+  recipient_type: z.union([z.literal('user_epoch'), z.literal('team_epoch')]),
+  recipient_epoch_id: z.string().min(1).max(256),
+  recipient_fingerprint: z.string().min(1).max(256),
+  key_ref: z.string().min(1).max(256),
+  aad: z.record(z.string(), z.unknown()),
+  encrypted_payload: z.object({
+    schema: z.literal('viewport.wrapped_key_envelope/v1'),
+    alg: z.literal('x25519-hkdf-sha256-aes-256-gcm'),
+    ephemeralPublicKeyJwk: z.record(z.string(), z.unknown()),
+    iv: z.string().min(1),
+    ciphertext: z.string().min(1),
+    tag: z.string().min(1),
+    aadDigest: z.string().min(1),
+    createdAt: z.string().min(1),
+  }),
+});
+
+export const TrustedEdgePlanDecryptSchema = z.object({
+  type: z.literal('trusted-edge-plan-decrypt'),
+  workspaceId: z.string().min(1).max(256),
+  planId: z.string().min(1).max(256).optional(),
+  sourceRef: z.string().min(1).max(512).optional(),
+  bodyEncryption: z.object({
+    schema: z.literal('viewport.plan_body_encrypted/v1'),
+    algorithm: z.literal('AES-GCM-256'),
+    key_ref: z.string().min(1).max(256),
+    ciphertext: z.string().min(1),
+    iv: z.string().min(1),
+    tag: z.string().min(1),
+    digest: z.string().min(1).max(256),
+    aad: z.record(z.string(), z.unknown()).optional(),
+  }),
+  bodyKeyGrants: z.array(TrustedEdgePlanBodyKeyGrantSchema).max(500).optional(),
+  capabilityToken: z.string().min(1).max(4096).optional(),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const TrustedEdgePlanEncryptFieldSchema = z.object({
+  type: z.literal('trusted-edge-plan-encrypt-field'),
+  workspaceId: z.string().min(1).max(256),
+  planId: z.string().min(1).max(256).optional(),
+  sourceRef: z.string().min(1).max(512).optional(),
+  bodyEncryption: TrustedEdgePlanDecryptSchema.shape.bodyEncryption,
+  bodyKeyGrants: TrustedEdgePlanDecryptSchema.shape.bodyKeyGrants,
+  text: z.string().min(1).max(20000),
+  aad: z.record(z.string(), z.unknown()).optional(),
+  capabilityToken: TrustedEdgePlanDecryptSchema.shape.capabilityToken,
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const TrustedEdgePlanDecryptFieldSchema = z.object({
+  type: z.literal('trusted-edge-plan-decrypt-field'),
+  workspaceId: z.string().min(1).max(256),
+  planId: z.string().min(1).max(256).optional(),
+  sourceRef: z.string().min(1).max(512).optional(),
+  bodyEncryption: TrustedEdgePlanDecryptSchema.shape.bodyEncryption,
+  bodyKeyGrants: TrustedEdgePlanDecryptSchema.shape.bodyKeyGrants,
+  fieldEncryption: z.object({
+    schema: z.literal('viewport.plan_feedback_field_encrypted/v1'),
+    algorithm: z.literal('AES-GCM-256'),
+    key_ref: z.string().min(1).max(256),
+    ciphertext: z.string().min(1),
+    iv: z.string().min(1),
+    tag: z.string().min(1),
+    digest: z.string().min(1).max(256),
+    aad: z.record(z.string(), z.unknown()).optional(),
+  }),
+  capabilityToken: TrustedEdgePlanDecryptSchema.shape.capabilityToken,
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const TrustedEdgePlanWrapKeySchema = z.object({
+  type: z.literal('trusted-edge-plan-wrap-key'),
+  workspaceId: z.string().min(1).max(256),
+  planId: z.string().min(1).max(256).optional(),
+  sourceRef: z.string().min(1).max(512).optional(),
+  bodyEncryption: TrustedEdgePlanDecryptSchema.shape.bodyEncryption,
+  bodyKeyGrants: TrustedEdgePlanDecryptSchema.shape.bodyKeyGrants,
+  recipients: z
+    .array(
+      z.object({
+        recipient_type: z.union([z.literal('user_epoch'), z.literal('team_epoch')]),
+        recipient_epoch_id: z.string().min(1).max(256),
+        recipient_fingerprint: z.string().min(1).max(256),
+        encryption_public_key_jwk: z.record(z.string(), z.unknown()),
+      }),
+    )
+    .min(1)
+    .max(500),
+  capabilityToken: TrustedEdgePlanDecryptSchema.shape.capabilityToken,
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
+export const TrustedEdgeTeamEpochPublishSchema = z.object({
+  type: z.literal('trusted-edge-team-epoch-publish'),
+  workspaceId: z.string().min(1).max(256),
+  teamId: z.string().min(1).max(256),
+  capabilityToken: z.string().min(1).max(4096).optional(),
+  requestId: z.string().max(MAX_REQUEST_ID_CHARS).optional(),
+});
+
 // ---------------------------------------------------------------------------
 // Discriminated union of all incoming messages
 // ---------------------------------------------------------------------------
@@ -170,11 +437,26 @@ export const IncomingMessageSchema = z.discriminatedUnion('type', [
   BranchRetrySchema,
   SquashMergeSchema,
   ListSessionsSchema,
+  ReadSessionMessagesSchema,
+  ContextCandidatePreviewSchema,
+  ContextResolveSchema,
+  ContextProposeSchema,
   ResumeSchema,
   WatchDiscoveredSessionSchema,
   UnwatchDiscoveredSessionSchema,
+  SyncRequestSchema,
+  WorkflowRunSchema,
+  WorkflowListRunsSchema,
+  WorkflowShowRunSchema,
+  WorkflowApproveRunSchema,
+  WorkflowCancelRunSchema,
   SuperviseSchema,
   RespondHookPermissionSchema,
+  TrustedEdgePlanDecryptSchema,
+  TrustedEdgePlanDecryptFieldSchema,
+  TrustedEdgePlanEncryptFieldSchema,
+  TrustedEdgePlanWrapKeySchema,
+  TrustedEdgeTeamEpochPublishSchema,
 ]);
 
 export type IncomingMessage = z.infer<typeof IncomingMessageSchema>;

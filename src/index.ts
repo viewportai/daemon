@@ -13,15 +13,29 @@
  *   vpd stop                  Stop the daemon
  *   vpd restart               Restart the daemon
  *   vpd worktree ...          Worktree operator commands
+ *   vpd validate              Validate repo-local Viewport contracts
+ *   vpd contract ...          Resolve repo-local Viewport contracts
+ *   vpd guard ...             Check repo-local approval/risk gates
+ *   vpd config ...            Resolve repo-local Viewport resources
+ *   vpd context ...           Local trusted-edge context commands
+ *   vpd signal ...            Local trusted-edge signal feature extraction commands
+ *   vpd unlock <id>           Activate a short-lived hosted-web trusted-edge session
+ *   vpd skills ...            Install agent skills that call vpd
+ *   vpd watch ...             Personal/local monitor commands
+ *   vpd worker ...            Workflow worker commands
+ *   vpd check [path]          Validate .viewport/ directory (no account required)
+ *   vpd diagnostic            Print a sanitized support diagnostic snapshot
  */
 
 import { getCommand, getArgs } from './cli/args.js';
+import { resolveGlobalFlag } from './cli/global-flags.js';
 import {
   install,
   addDirectory,
   removeDirectory,
   list,
   status,
+  doctor,
   stop,
   restart,
   run,
@@ -31,18 +45,54 @@ import {
   attach,
   pair,
   update,
+  showDaemonHelp,
   showHelp,
   ls,
+  showSessionHelp,
   stopSession,
+  sessionManifest,
   permit,
   agent,
   worktree,
+  workflow,
+  config,
+  contract,
+  validate,
+  teamResource,
+  guard,
+  context,
+  skills,
   service,
   setup,
   remote,
+  profile,
+  use,
+  uninstall,
+  bind,
+  unlock,
+  worker,
+  watch,
+  check,
+  diagnostic,
+  signal,
 } from './cli/commands.js';
-import { hookNotify } from './cli/hook-command.js';
+import { resolveDisplayVersion } from './core/package-meta.js';
+import { hookCapabilities, hookNotify, showHookHelp } from './cli/hook-command.js';
 import { start, runSupervisorCommand, runWorkerCommand } from './startup.js';
+import { SUPERVISOR_CONFIG_ENV, WORKER_CONFIG_ENV } from './cli/supervisor-protocol.js';
+
+const rawArgs = getArgs();
+const globalFlag = resolveGlobalFlag(rawArgs);
+
+if (globalFlag === 'help') {
+  showHelp();
+  process.exit(0);
+}
+
+if (globalFlag === 'version') {
+  console.log(resolveDisplayVersion());
+  process.exit(0);
+}
 
 const commands: Record<string, () => Promise<void>> = {
   start,
@@ -51,6 +101,7 @@ const commands: Record<string, () => Promise<void>> = {
   remove: removeDirectory,
   list,
   status,
+  doctor,
   stop,
   restart,
   run,
@@ -60,25 +111,58 @@ const commands: Record<string, () => Promise<void>> = {
   attach,
   pair,
   update,
+  upgrade: update,
   ls,
   permit,
   agent,
   worktree,
+  workflow,
+  config,
+  contract,
+  validate,
+  'team-resource': teamResource,
+  guard,
+  context,
+  skills,
   service,
   setup,
   remote,
+  profile,
+  use,
+  uninstall,
+  bind,
+  unlock,
+  worker,
+  watch,
+  check,
+  diagnostic,
+  signal,
 };
 
 const command = getCommand();
 
+if (command !== '__supervisor' && command !== '__worker') {
+  delete process.env[SUPERVISOR_CONFIG_ENV];
+  delete process.env[WORKER_CONFIG_ENV];
+}
+
 // Sub-command: vpd hook notify --event <EventName>
 if (command === 'hook') {
   const subcommand = getArgs()[1];
-  if (subcommand === 'notify') {
+  if (!subcommand) {
+    showHookHelp();
+    process.exit(0);
+  } else if (subcommand === 'notify') {
     hookNotify().catch(() => process.exit(1));
+  } else if (subcommand === 'plan' || subcommand === 'plan-proposed') {
+    hookNotify('PlanProposed').catch(() => process.exit(1));
+  } else if (subcommand === 'capabilities') {
+    hookCapabilities().catch(() => process.exit(1));
   } else {
     console.error(`Unknown hook subcommand: ${subcommand}`);
     console.error('Usage: vpd hook notify --event <EventName>');
+    console.error('       vpd hook plan < hook-payload.json');
+    console.error('       vpd hook capabilities [--adapter <name>] [--json]');
     process.exit(1);
   }
 } else {
@@ -95,8 +179,13 @@ if (command === 'hook') {
   } else {
     let handler = commands[command];
     if (command === 'daemon') {
-      const subcommand = getArgs()[1] ?? 'status';
+      const subcommand = getArgs()[1];
+      if (!subcommand) {
+        showDaemonHelp();
+        process.exit(0);
+      }
       if (subcommand === 'start') handler = start;
+      if (subcommand === 'doctor') handler = doctor;
       if (subcommand === 'status') handler = status;
       if (subcommand === 'stop') handler = stop;
       if (subcommand === 'restart') handler = restart;
@@ -106,15 +195,40 @@ if (command === 'hook') {
       if (subcommand === 'setup') handler = setup;
     } else if (command === 'session') {
       const subcommand = getArgs()[1];
+      if (!subcommand) {
+        showSessionHelp();
+        process.exit(0);
+      }
       if (subcommand === 'stop') handler = stopSession;
+      if (subcommand === 'manifest') handler = sessionManifest;
     } else if (command === 'permit') {
       handler = permit;
     } else if (command === 'agent') {
       handler = agent;
     } else if (command === 'worktree') {
       handler = worktree;
+    } else if (command === 'workflow') {
+      handler = workflow;
+    } else if (command === 'config') {
+      handler = config;
+    } else if (command === 'contract') {
+      handler = contract;
+    } else if (command === 'guard') {
+      handler = guard;
+    } else if (command === 'context') {
+      handler = context;
+    } else if (command === 'skills') {
+      handler = skills;
     } else if (command === 'remote') {
       handler = remote;
+    } else if (command === 'bind') {
+      handler = bind;
+    } else if (command === 'worker') {
+      handler = worker;
+    } else if (command === 'watch') {
+      handler = watch;
+    } else if (command === 'signal') {
+      handler = signal;
     }
     if (!handler) {
       if (command !== 'help') {

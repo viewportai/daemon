@@ -1,8 +1,4 @@
-import { spawn } from 'node:child_process';
-import { configDir } from '../core/config.js';
-import { getArgs, getFlag, hasFlag } from './args.js';
-import { resolveDaemonEndpoint } from './daemon-client.js';
-import type { DaemonEndpoint } from './daemon-client.js';
+import { getFlag, hasFlag } from './args.js';
 import {
   clearDaemonRuntimeState,
   readDaemonRuntimeState,
@@ -12,158 +8,26 @@ import {
   readProcessInfo,
   isOwnershipMatch,
   isPidRunning,
+  type DaemonRuntimeState,
 } from './daemon-lifecycle.js';
-import {
-  compareSemver,
-  fetchLatestVersion,
-  formatNpmInvocation,
-  resolveNpmInvocationFromNode,
-  resolvePreferredNodePath,
-  type NpmInvocation,
-} from './runtime-toolchain.js';
-import { start } from '../startup.js';
+import { startWithLaunchConfig } from '../startup.js';
 import {
   isJsonMode,
   parseTimeoutMs,
   printJson,
-  readDaemonHealth,
   requestLifecycle,
-  resolvePackageName,
-  resolvePackageVersion,
-  shortError,
+  waitForDaemonReady,
 } from './command-shared.js';
-import {
-  createPairingClientIdentity,
-  createPairingRedeemProof,
-  getOrCreateTrustAnchor,
-  issuePairingOffer,
-  listPairingOffers,
-  revokePairingOffer,
-  rotateAuthToken,
-} from '../server/pairing-offers.js';
+import { resolveDaemonSettingsFromSources } from './daemon-settings.js';
+import { runPairCommand } from './lifecycle-pair-command.js';
+import { resolveDefaultPairingName } from './pairing-name-resolver.js';
+export { doctor } from './lifecycle-doctor-command.js';
+export { resolveDefaultPairingName };
+export { status } from './lifecycle-status-command.js';
+export { update } from './lifecycle-update-command.js';
 
-function endpointHealthUrl(endpoint: DaemonEndpoint): string {
-  if (endpoint.type === 'socket') {
-    return `unix://${endpoint.socketPath}:/health`;
-  }
-  return `${endpoint.baseUrl}/health`;
-}
-
-function endpointListenLabel(endpoint: DaemonEndpoint): string {
-  if (endpoint.type === 'socket') {
-    return `unix://${endpoint.socketPath}`;
-  }
-  return `${endpoint.host}:${endpoint.port}`;
-}
-
-export async function status(): Promise<void> {
-  const asJson = isJsonMode();
-  const endpoint = await resolveDaemonEndpoint();
-  const url = endpointHealthUrl(endpoint);
-  const state = await readDaemonRuntimeState();
-  const runningByState = !!(state && isPidRunning(state.ownerPid));
-  const health = await readDaemonHealth();
-
-  const statusValue: 'running' | 'stopped' | 'unresponsive' = health
-    ? 'running'
-    : runningByState
-      ? 'unresponsive'
-      : 'stopped';
-
-  const owner =
-    state?.ownerUid !== undefined
-      ? `${state.ownerUid}@${state.ownerHostname ?? 'unknown-host'}`
-      : null;
-  const resolvedNode = resolvePreferredNodePath({
-    daemonPid: state?.ownerPid ?? null,
-    fallbackNodePath: process.execPath,
-  });
-
-  let runtimeNpm = 'unknown';
-  let npmInvocation: NpmInvocation | null = null;
-  try {
-    npmInvocation = resolveNpmInvocationFromNode(resolvedNode.nodePath);
-    runtimeNpm = formatNpmInvocation(npmInvocation);
-  } catch (err) {
-    runtimeNpm = `unresolved (${shortError(err)})`;
-  }
-
-  const cliVersion = resolvePackageVersion();
-  let latestCliVersion = 'unknown';
-  let updateStatus = 'unknown';
-  let note: string | undefined;
-  if (npmInvocation) {
-    const latest = fetchLatestVersion({ npm: npmInvocation, packageName: resolvePackageName() });
-    if (latest.version) {
-      latestCliVersion = latest.version;
-      const comparison = compareSemver(cliVersion, latest.version);
-      if (comparison === null) {
-        updateStatus = 'unknown (version format not comparable)';
-      } else if (comparison < 0) {
-        updateStatus = `update available (${cliVersion} -> ${latest.version})`;
-      } else {
-        updateStatus = 'up to date';
-      }
-    } else {
-      note = latest.note;
-      updateStatus = latest.note ?? 'unknown';
-    }
-  }
-
-  const payload = {
-    status: statusValue,
-    endpoint: url,
-    home: configDir(),
-    ownerPid: state?.ownerPid ?? null,
-    workerPid: state?.workerPid ?? health?.pid ?? null,
-    owner,
-    listen: state?.listen ?? health?.listen ?? endpointListenLabel(endpoint),
-    socketPath:
-      state?.socketPath ??
-      health?.socketPath ??
-      (endpoint.type === 'socket' ? endpoint.socketPath : null),
-    startedAt: state?.startedAt ?? health?.startedAt ?? null,
-    profile: state?.profile ?? null,
-    runtimeNode: `${resolvedNode.nodePath} (${resolvedNode.source})`,
-    runtimeNpm,
-    cliVersion,
-    latestCliVersion,
-    updateStatus,
-    health,
-    note,
-  };
-
-  if (asJson) {
-    printJson(payload);
-    return;
-  }
-
-  console.log(`Status:      ${payload.status}`);
-  console.log(`Home:        ${payload.home}`);
-  console.log(`Listen:      ${payload.listen}`);
-  if (payload.socketPath) {
-    console.log(`Socket:      ${payload.socketPath}`);
-  }
-  console.log(`Owner PID:   ${payload.ownerPid ?? '-'}`);
-  console.log(`Worker PID:  ${payload.workerPid ?? '-'}`);
-  console.log(`Owner:       ${payload.owner ?? '-'}`);
-  console.log(
-    `Started:     ${payload.startedAt ? new Date(payload.startedAt).toISOString() : '-'}`,
-  );
-  console.log(`Profile:     ${payload.profile ?? '-'}`);
-  console.log(`Node:        ${payload.runtimeNode}`);
-  console.log(`npm:         ${payload.runtimeNpm}`);
-  console.log(`CLI:         ${payload.cliVersion}`);
-  console.log(`Latest CLI:  ${payload.latestCliVersion}`);
-  console.log(`Update:      ${payload.updateStatus}`);
-  if (payload.health) {
-    console.log(`Sessions:    ${payload.health.sessions}`);
-    console.log(`Directories: ${payload.health.directories}`);
-    console.log(`Agents:      ${payload.health.agents}`);
-  }
-  if (payload.note) {
-    console.log(`Note:        ${payload.note}`);
-  }
+export function showDaemonHelp(): void {
+  console.log('Usage: vpd daemon <start|doctor|status|stop|restart|pair|update|service|setup> ...');
 }
 
 export async function stop(options?: {
@@ -294,270 +158,155 @@ export async function stop(options?: {
 
 export async function restart(): Promise<void> {
   const asJson = isJsonMode();
+  await restartDaemon();
   if (asJson) {
-    await stop({ exitOnNotRunning: false, silent: true });
-    await start({ silent: true });
     printJson({ command: 'restart', ok: true });
     return;
   }
+  console.log('Daemon restarted.');
+}
 
-  await stop({ exitOnNotRunning: false });
-  await start();
+function applyRuntimeOverrides(
+  launch: Awaited<ReturnType<typeof resolveDaemonSettingsFromSources>>['launch'],
+  runtimeState: Awaited<ReturnType<typeof readDaemonRuntimeState>>,
+): Awaited<ReturnType<typeof resolveDaemonSettingsFromSources>>['launch'] {
+  if (!runtimeState) {
+    return launch;
+  }
+
+  return {
+    ...launch,
+    listen:
+      runtimeState.listen ??
+      (runtimeState.socketPath
+        ? `unix://${runtimeState.socketPath}`
+        : `${runtimeState.host}:${runtimeState.port}`),
+    host: runtimeState.host,
+    port: runtimeState.socketPath ? 0 : runtimeState.port,
+    socketPath: runtimeState.socketPath,
+    profile: runtimeState.profile ?? launch.profile,
+    allowedHostsRaw: runtimeState.allowedHostsRaw ?? launch.allowedHostsRaw,
+    allowedOriginsRaw: runtimeState.allowedOriginsRaw ?? launch.allowedOriginsRaw,
+    authEnabled: runtimeState.authEnabled ?? launch.authEnabled,
+    logPath: runtimeState.logPath ?? launch.logPath,
+    relayEnabled: launch.relayEnabled,
+    relayEndpoint: launch.relayEndpoint ?? runtimeState.relayEndpoint,
+    relayServerUrl: launch.relayServerUrl ?? runtimeState.relayServerUrl,
+    relayWorkspaceId: launch.relayWorkspaceId ?? runtimeState.relayWorkspaceId,
+    relayRuntimeTargetId: launch.relayRuntimeTargetId ?? runtimeState.relayRuntimeTargetId,
+    relayMachineId: launch.relayMachineId ?? runtimeState.relayMachineId,
+    relayTlsVerify: launch.relayTlsVerify ?? runtimeState.relayTlsVerify,
+  };
+}
+
+function applyRuntimeTlsEnvironment(
+  runtimeState: Awaited<ReturnType<typeof readDaemonRuntimeState>>,
+): () => void {
+  const keys = [
+    'VIEWPORT_TLS',
+    'VIEWPORT_TLS_HOST',
+    'VIEWPORT_TLS_CERT_DIR',
+    'VIEWPORT_TLS_CERT',
+    'VIEWPORT_TLS_KEY',
+  ];
+  const previous = new Map<string, string | undefined>();
+  for (const key of keys) {
+    previous.set(key, process.env[key]);
+  }
+
+  const setEnv = (key: string, value: string | undefined) => {
+    if (value === undefined || value === '') {
+      delete process.env[key];
+      return;
+    }
+    process.env[key] = value;
+  };
+
+  if (runtimeState?.tlsEnabled) {
+    setEnv('VIEWPORT_TLS', '1');
+    setEnv('VIEWPORT_TLS_HOST', runtimeState.tlsHost?.trim() || 'localhost');
+    const certDir = runtimeState.tlsCertDir?.trim() || undefined;
+    setEnv('VIEWPORT_TLS_CERT_DIR', certDir);
+    if (certDir) {
+      setEnv('VIEWPORT_TLS_CERT', undefined);
+      setEnv('VIEWPORT_TLS_KEY', undefined);
+    } else {
+      setEnv('VIEWPORT_TLS_CERT', runtimeState.tlsCertPath?.trim() || undefined);
+      setEnv('VIEWPORT_TLS_KEY', runtimeState.tlsKeyPath?.trim() || undefined);
+    }
+  } else if (runtimeState?.tlsEnabled === false) {
+    setEnv('VIEWPORT_TLS', '0');
+    setEnv('VIEWPORT_TLS_HOST', undefined);
+    setEnv('VIEWPORT_TLS_CERT_DIR', undefined);
+    setEnv('VIEWPORT_TLS_CERT', undefined);
+    setEnv('VIEWPORT_TLS_KEY', undefined);
+  }
+  return () => {
+    for (const [key, value] of previous.entries()) {
+      setEnv(key, value);
+    }
+  };
+}
+
+function applyRuntimeResourceOverrideEnvironment(
+  runtimeState: Awaited<ReturnType<typeof readDaemonRuntimeState>>,
+): () => void {
+  const keys = ['VIEWPORT_RESOURCE_OVERRIDE_DIR', 'VPD_RESOURCE_OVERRIDE_DIR'];
+  const previous = new Map<string, string | undefined>();
+  for (const key of keys) {
+    previous.set(key, process.env[key]);
+  }
+
+  const setEnv = (key: string, value: string | undefined) => {
+    if (value === undefined || value === '') {
+      delete process.env[key];
+      return;
+    }
+    process.env[key] = value;
+  };
+
+  if (runtimeState?.resourceOverrideConfigDir) {
+    setEnv('VIEWPORT_RESOURCE_OVERRIDE_DIR', runtimeState.resourceOverrideConfigDir);
+    setEnv('VPD_RESOURCE_OVERRIDE_DIR', undefined);
+  }
+
+  return () => {
+    for (const [key, value] of previous.entries()) {
+      setEnv(key, value);
+    }
+  };
+}
+
+async function hardRestartFromRuntimeState(runtimeState: DaemonRuntimeState | null): Promise<void> {
+  if (runtimeState?.ownerPid) {
+    await stopPid(runtimeState.ownerPid, {
+      timeoutMs: 1_500,
+      force: true,
+      useProcessGroup: true,
+    });
+    await clearDaemonRuntimeState();
+  }
+
+  const resolved = await resolveDaemonSettingsFromSources();
+  const launch = applyRuntimeOverrides(resolved.launch, runtimeState);
+  const restoreEnv = applyRuntimeTlsEnvironment(runtimeState);
+  const restoreResourceOverrideEnv = applyRuntimeResourceOverrideEnvironment(runtimeState);
+  try {
+    await startWithLaunchConfig(launch, { silent: true });
+    await waitForDaemonReady({ requireRelayConnected: false, timeoutMs: 45_000 });
+  } finally {
+    restoreResourceOverrideEnv();
+    restoreEnv();
+  }
+}
+
+export async function restartDaemon(): Promise<void> {
+  const runtimeState = await readDaemonRuntimeState();
+  await hardRestartFromRuntimeState(runtimeState);
 }
 
 export async function pair(): Promise<void> {
-  const asJson = isJsonMode();
-  const args = getArgs();
-  const pairCommandIndex = args[0] === 'daemon' && args[1] === 'pair' ? 1 : 0;
-  const pairSubcommand = args[pairCommandIndex + 1];
-
-  if (pairSubcommand === 'list') {
-    const offers = await listPairingOffers();
-    if (asJson) {
-      printJson({ command: 'pair list', ok: true, offers });
-      return;
-    }
-    if (offers.length === 0) {
-      console.log('No pairing offers found.');
-      return;
-    }
-    console.log('Pairing offers\\n');
-    for (const offer of offers) {
-      const status = offer.active ? 'active' : offer.expired ? 'expired' : 'inactive';
-      console.log(`${offer.offerId} (${status})`);
-      console.log(`  listen:     ${offer.listen}`);
-      console.log(`  profile:    ${offer.profile}`);
-      console.log(`  trust:      ${offer.trustAnchor}`);
-      console.log(`  daemon:     ${offer.daemonDeviceId}`);
-      console.log(`  created:    ${new Date(offer.createdAt).toISOString()}`);
-      console.log(`  expires:    ${new Date(offer.expiresAt).toISOString()}`);
-      console.log('');
-    }
-    return;
-  }
-
-  if (pairSubcommand === 'revoke') {
-    const offerId = args[pairCommandIndex + 2];
-    if (!offerId || offerId.startsWith('--')) {
-      throw new Error('Usage: vpd pair revoke <offer-id> [--json]');
-    }
-    const revoked = await revokePairingOffer(offerId);
-    if (asJson) {
-      printJson({ command: 'pair revoke', ok: revoked, offerId });
-      return;
-    }
-    if (!revoked) {
-      throw new Error(`Pair offer not found: ${offerId}`);
-    }
-    console.log(`Revoked pair offer ${offerId}`);
-    return;
-  }
-
-  if (pairSubcommand === 'rotate-token') {
-    const result = await rotateAuthToken();
-    if (asJson) {
-      printJson({
-        command: 'pair rotate-token',
-        ok: true,
-        previousTokenExisted: result.previousTokenExisted,
-        restarted: false,
-      });
-      return;
-    }
-    console.log('Rotated daemon auth token on disk.');
-    console.log('Restart the daemon for the new token to take effect.');
-    return;
-  }
-
-  if (pairSubcommand === 'anchor') {
-    const anchor = await getOrCreateTrustAnchor();
-    if (asJson) {
-      printJson({
-        command: 'pair anchor',
-        ok: true,
-        trustAnchor: anchor.fingerprint,
-        trustAnchorId: anchor.id,
-        createdAt: anchor.createdAt,
-      });
-      return;
-    }
-    console.log(`Trust anchor: ${anchor.fingerprint}`);
-    console.log(`Anchor ID:    ${anchor.id}`);
-    console.log(`Created:      ${new Date(anchor.createdAt).toISOString()}`);
-    return;
-  }
-
-  const state = await readDaemonRuntimeState();
-  const health = await readDaemonHealth();
-  const endpoint = await resolveDaemonEndpoint();
-
-  if (!state && !health) {
-    if (asJson) {
-      printJson({ command: 'pair', ok: false, error: 'Daemon is not running' });
-      return;
-    }
-    console.error('Daemon is not running. Start it first with `vpd start`.');
-    process.exit(1);
-  }
-
-  const defaultHost = endpoint.type === 'tcp' ? endpoint.host : '127.0.0.1';
-  const defaultPort = endpoint.type === 'tcp' ? endpoint.port : 0;
-  const ttlRaw = getFlag('ttl');
-  const ttlSeconds = ttlRaw ? Number(ttlRaw) : 600;
-  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
-    throw new Error(`Invalid --ttl value: ${ttlRaw}`);
-  }
-  const issued = await issuePairingOffer({
-    ttlSeconds,
-    connection: {
-      host: state?.host ?? health?.host ?? defaultHost,
-      port: state?.port ?? health?.port ?? defaultPort,
-      listen: state?.listen ?? health?.listen ?? endpointListenLabel(endpoint),
-      socketPath:
-        state?.socketPath ??
-        health?.socketPath ??
-        (endpoint.type === 'socket' ? endpoint.socketPath : undefined),
-      profile: state?.profile ?? 'local',
-    },
-  });
-  const offer = {
-    offerId: issued.offerId,
-    redeemSecret: issued.redeemSecret,
-    trustAnchor: issued.trustAnchor,
-    daemonDeviceId: issued.daemonDeviceId,
-    daemonPublicKey: issued.daemonPublicKey,
-    host: state?.host ?? health?.host ?? defaultHost,
-    port: state?.port ?? health?.port ?? defaultPort,
-    listen: state?.listen ?? health?.listen ?? endpointListenLabel(endpoint),
-    socketPath:
-      state?.socketPath ??
-      health?.socketPath ??
-      (endpoint.type === 'socket' ? endpoint.socketPath : undefined),
-    profile: state?.profile ?? 'local',
-    createdAt: issued.createdAt,
-    expiresAt: issued.expiresAt,
-  };
-
-  const encoded = Buffer.from(
-    JSON.stringify({
-      offerId: offer.offerId,
-      proof: offer.redeemSecret,
-      trustAnchor: offer.trustAnchor,
-      daemonDeviceId: offer.daemonDeviceId,
-      daemonPublicKey: offer.daemonPublicKey,
-      host: offer.host,
-      port: offer.port,
-      listen: offer.listen,
-      socketPath: offer.socketPath,
-      profile: offer.profile,
-      createdAt: offer.createdAt,
-      expiresAt: offer.expiresAt,
-    }),
-    'utf-8',
-  ).toString('base64url');
-  const url = `viewport://pair#offer=${encoded}`;
-
-  if (asJson) {
-    printJson({ command: 'pair', ok: true, offer, url });
-    return;
-  }
-
-  // Print a redeem payload example with client proof generation for operators.
-  const clientIdentity = createPairingClientIdentity();
-  const proof = createPairingRedeemProof({
-    offerId: offer.offerId,
-    redeemSecret: offer.redeemSecret,
-    trustAnchor: offer.trustAnchor,
-    clientIdentity,
-  });
-
-  console.log('\nPairing offer:\n');
-  console.log(url);
-  console.log('\nRedeem payload preview (example):\n');
-  console.log(
-    JSON.stringify(
-      {
-        offerId: offer.offerId,
-        proof: offer.redeemSecret,
-        trustAnchor: offer.trustAnchor,
-        clientPublicKey: proof.clientPublicKey,
-        clientProof: proof.clientProof,
-      },
-      null,
-      2,
-    ),
-  );
-}
-
-function runCommand(command: string, args: string[]): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      stdio: 'inherit',
-      env: process.env,
-    });
-
-    child.once('error', reject);
-    child.once('exit', (code, signal) => {
-      if (signal) {
-        reject(new Error(`Command exited via signal ${signal}`));
-        return;
-      }
-      resolve(code ?? 1);
-    });
-  });
-}
-
-export async function update(): Promise<void> {
-  const asJson = isJsonMode();
-  const packageName = resolvePackageName();
-  const state = await readDaemonRuntimeState();
-  const resolvedNode = resolvePreferredNodePath({
-    daemonPid: state?.ownerPid ?? null,
-    fallbackNodePath: process.execPath,
-  });
-  const npm = resolveNpmInvocationFromNode(resolvedNode.nodePath);
-
-  const exitCode = await runCommand(npm.command, [
-    ...npm.argsPrefix,
-    'install',
-    '-g',
-    `${packageName}@latest`,
-  ]);
-  if (exitCode !== 0) {
-    if (asJson) {
-      printJson({
-        command: 'update',
-        ok: false,
-        error: `Update command failed with exit code ${exitCode}`,
-      });
-      return;
-    }
-    throw new Error(`Update command failed with exit code ${exitCode}`);
-  }
-
-  const shouldRestart = hasFlag('yes') || hasFlag('restart');
-  if (shouldRestart) {
-    await stop({ exitOnNotRunning: false });
-    await start();
-  }
-
-  if (asJson) {
-    printJson({
-      command: 'update',
-      ok: true,
-      package: packageName,
-      restarted: shouldRestart,
-      runtimeNode: resolvedNode.nodePath,
-      runtimeNpm: formatNpmInvocation(npm),
-    });
-    return;
-  }
-
-  if (!shouldRestart) {
-    console.log('Update complete. Restart skipped. Run `vpd restart` when ready.');
-    return;
-  }
-  console.log('Update complete. Daemon restart requested.');
+  await runPairCommand({ restartDaemon });
 }
 
 export function showHelp(): void {
@@ -570,14 +319,36 @@ export function showHelp(): void {
   );
   console.log('                               Start the daemon (detached by default)');
   console.log(
-    '  daemon <subcommand>          Lifecycle ops (start, status, stop, restart, pair, update, service, setup)',
+    '  daemon <subcommand>          Lifecycle ops (start, doctor, status, stop, restart, pair, update, service, setup)',
   );
-  console.log('  setup [--yes|--choose]       First-run guided setup (recommended or custom)');
-  console.log('  install [--json]             Detect available agents and install hooks');
+  console.log(
+    '  setup [--yes|--choose]       First-run setup; safe default writes profile/config only',
+  );
+  console.log('  profile <cmd>                Manage local/prod daemon profiles');
+  console.log('  use <profile>                Set the machine-default daemon profile');
+  console.log('  upgrade [--restart|--yes]    Upgrade the global vpd package');
+  console.log('  uninstall [--yes] [--purge-home] [--no-package]');
+  console.log('                               Stop daemons, remove service, and uninstall vpd');
+  console.log(
+    '  install [--hooks] [--json]   Install vpd config and detect agents; hooks are opt-in',
+  );
+  console.log('  bind [path] [--org <organization-id>] [--yes] [--json]');
+  console.log(
+    '                               Authorize a local directory tree to stream to a paired organization',
+  );
+  console.log('  unlock <id> [--workspace <id>] [--json]');
+  console.log(
+    '                               Activate a short-lived hosted-web trusted-edge session',
+  );
   console.log('  add <path> [--json]          Register a directory');
   console.log('  remove <path> [--json]       Unregister a directory');
   console.log('  list [--json]                List directories + active sessions');
-  console.log('  status [--json]              Daemon health and runtime status');
+  console.log(
+    '  doctor [--json]              Show daemon identity, runtime mode, and active targets',
+  );
+  console.log('  diagnostic [--json]          Print a sanitized support diagnostic snapshot');
+  console.log('  status [--json] [--check-updates]');
+  console.log('                               Daemon health and runtime status');
   console.log('  stop [--json] [--timeout <seconds>] [--force]');
   console.log('                               Stop daemon gracefully (with optional forced kill)');
   console.log('  restart                       Stop then start daemon');
@@ -587,6 +358,10 @@ export function showHelp(): void {
   );
   console.log('                               List active/discovered sessions');
   console.log('  session stop <sid> [--json|--format <fmt>]  Stop an active session');
+  console.log('  session manifest --session <sid> [--json|--format <fmt>]');
+  console.log(
+    '                               Print provider/workflow/approval manifest for a session',
+  );
   console.log('  send <sid> --prompt <text>   Send a prompt to an active session');
   console.log('  logs <sid> [--follow]        Replay or follow session updates');
   console.log('  wait <sid> [--timeout <s>]   Block until a session ends');
@@ -608,18 +383,100 @@ export function showHelp(): void {
     '  worktree squash <sid> [--target <branch>] [--message <text>] [--json|--format <fmt>]',
   );
   console.log('                               Worktree and git-step operator controls');
-  console.log('  pair [--ttl <seconds>] [--json]');
-  console.log('                               Create a short-lived pairing offer URL');
-  console.log('  pair list [--json]           List pairing offers');
-  console.log('  pair revoke <offer-id> [--json]');
-  console.log('                               Revoke a pairing offer');
+  console.log('  workflow validate <file> [--json]');
+  console.log(
+    '  workflow run <workflow-id|file> [--path <repo>] [--input k=v] [--input-json k=json] [--json]',
+  );
+  console.log('  workflow runs [--json]');
+  console.log('  workflow show <run-id> [--json]');
+  console.log('  workflow rerun <run-id> [--detach] [--json]');
+  console.log('  workflow approve <run-id> <node-id> [--deny] [--message <text>] [--json]');
+  console.log('  workflow cancel <run-id> [--message <text>] [--json]');
+  console.log(
+    '                               Validate, run, inspect, approve, and cancel local workflows',
+  );
+  console.log('  config resolve [--cwd <path>] [--json]');
+  console.log('                               Resolve repo-local .viewport/config resources');
+  console.log('  validate [--path <path>] [--json]');
+  console.log('                               Validate repo-local .viewport/config.yaml contract');
+  console.log('  contract resolve [--path <path>] [--json]');
+  console.log('                               Resolve repo-local contract manifest');
+  console.log('  guard check --path <file> [--action edit] [--cwd <repo>] [--json]');
+  console.log('                               Check repo-local approval/risk gates');
+  console.log('  skills install [claude-code|cursor|all] [--target <path>] [--force] [--json]');
+  console.log('                               Install agent instructions for calling vpd');
+  console.log(
+    '  context init --context <id> --user <name> --device <name> --passphrase <text> --recovery-code <text> [--key-store file|macos-keychain] [--json]',
+  );
+  console.log(
+    '                               Defaults to file; use macos-keychain explicitly on Darwin',
+  );
+  console.log(
+    '  context user-init --user <name> --device <name> --passphrase <text> --recovery-code <text> [--key-store file|macos-keychain] [--json]',
+  );
+  console.log(
+    '  context join --context <id> --user <name> --device <name> --passphrase <text> --recovery-code <text> [--key-store file|macos-keychain] [--json]',
+  );
+  console.log('  context status [--context <id>] [--json]');
+  console.log(
+    '  context add (--context <id>|--provider <id> --path <repo>) --device <name> --title <text> --body <text> --passphrase <text> --recovery-code <text> [--json]',
+  );
+  console.log(
+    '  context use-github --repo <owner/repo|url> [--provider <id>] [--path <repo>] [--json]',
+  );
+  console.log(
+    '  context propose --context <id> --device <name> --title <text> --body <text> --passphrase <text> --recovery-code <text> [--json]',
+  );
+  console.log(
+    '  context resolve --context <id> --query <text> --passphrase <text> --recovery-code <text> [--json]',
+  );
+  console.log(
+    '                               Resolve encrypted local context on this trusted edge',
+  );
+  console.log(
+    '  context sync-push [--context <id>] [--server-url <url>] [--credential <token>] [--json]',
+  );
+  console.log(
+    '                               Push signed encrypted context events to Viewport; defaults to vpd remote login config',
+  );
+  console.log(
+    '  context sync-pull [--context <id>] [--server-url <url>] [--credential <token>] --passphrase <text> --recovery-code <text> [--json]',
+  );
+  console.log(
+    '                               Pull signed encrypted context events from Viewport; defaults to vpd remote login config',
+  );
+  console.log(
+    '  context grants-process --context <id> --actor <device> --passphrase <text> --recovery-code <text> [--json]',
+  );
+  console.log(
+    '                               Emit encrypted repo-key grant events for pending workspace shares',
+  );
+  console.log(
+    '  context revokes-process --context <id> --actor <device> --passphrase <text> --recovery-code <text> [--json]',
+  );
+  console.log(
+    '                               Emit revocation and key-rotation events for removed workspace shares',
+  );
+  console.log('  hook notify --event <EventName>');
+  console.log('  hook plan                    Send a plan proposal hook from stdin');
+  console.log('  hook capabilities [--adapter <name>] [--json]');
+  console.log(
+    '  pair [<code>] [--worker] [--transport polling|relay|inbound] [--workdir <path>] [--server <url>] [--app-url <url>] [--json]',
+  );
+  console.log('                               Pair with Viewport via pairing code');
   console.log('  pair anchor [--json]         Show daemon trust anchor fingerprint');
   console.log('  pair rotate-token [--json]   Rotate auth token on disk (restart required)');
-  console.log('  update [--json] [--yes]      Update daemon package, optionally restart');
+  console.log('  update [--json] [--yes] [--dry-run]');
+  console.log('                               Update daemon package, optionally restart');
   console.log('  service <install|uninstall|status> [--json]');
   console.log('                               Manage OS user service (launchd/systemd)');
+  console.log('  watch <start|doctor|status>  Personal/local monitor commands');
+  console.log('  worker <start|run-once|doctor>');
   console.log(
-    '  remote <login|status|enable|disable|logout> [--server <url>] [--workspace <id>] [--token <enroll-token>] [--user <id>]',
+    '                               Workflow worker commands; pair with `vpd pair --worker`',
+  );
+  console.log(
+    '  remote <login|status|enable|disable|logout> [--server <url>] [--workspace <id>] [--token <issue-token>]',
   );
   console.log('                               Configure daemon-native relay transport');
   console.log('  help                         Show this help message');

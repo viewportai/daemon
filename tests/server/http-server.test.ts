@@ -5,6 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { recordRedeemAttempt, registerHttpRoutes } from '../../src/server/http-server.js';
 import { Daemon } from '../../src/core/daemon.js';
+import type { SecurityProfile } from '../../src/server/security.js';
 import type { DiscoveredSession, SessionDiscovery } from '../../src/core/interfaces.js';
 import { RingBuffer } from '../../src/server/ring-buffer.js';
 import {
@@ -20,6 +21,12 @@ describe('HTTP Server', () => {
   let testDir: string;
   let daemon: Daemon;
   let app: ReturnType<typeof Fastify>;
+  const localLoopbackProfile: SecurityProfile = {
+    profile: 'local',
+    host: '127.0.0.1',
+    allowedHosts: [],
+    requireAuth: false,
+  };
 
   beforeEach(async () => {
     tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-http-test-'));
@@ -33,7 +40,7 @@ describe('HTTP Server', () => {
     await daemon.initialize();
 
     app = Fastify();
-    registerHttpRoutes(app, daemon);
+    registerHttpRoutes(app, daemon, undefined, { securityProfile: localLoopbackProfile });
     await app.ready();
   });
 
@@ -60,6 +67,42 @@ describe('HTTP Server', () => {
     expect(body.pid).toBe(process.pid);
     expect(body.process?.node).toBeTypeOf('string');
     expect(body.process?.memoryRss).toBeGreaterThan(0);
+  });
+
+  it('GET /health reports all relay binding statuses', async () => {
+    await app.close();
+    app = Fastify();
+    registerHttpRoutes(app, daemon, undefined, {
+      getRelayStatus: () => ({
+        workspaceId: 'org-a',
+        relayEndpoint: 'wss://relay-a.test/ws',
+        state: 'connected',
+        reconnectAttempt: 0,
+      }),
+      getRelayStatuses: () => [
+        {
+          workspaceId: 'org-a',
+          relayEndpoint: 'wss://relay-a.test/ws',
+          state: 'connected',
+          reconnectAttempt: 0,
+        },
+        {
+          workspaceId: 'org-b',
+          relayEndpoint: 'wss://relay-b.test/ws',
+          state: 'waiting_retry',
+          reconnectAttempt: 2,
+        },
+      ],
+    });
+    await app.ready();
+
+    const res = await app.inject({ method: 'GET', url: '/health' });
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.payload).relay.bindings).toMatchObject([
+      { workspaceId: 'org-a', state: 'connected' },
+      { workspaceId: 'org-b', state: 'waiting_retry', reconnectAttempt: 2 },
+    ]);
   });
 
   // ---------------------------------------------------------------------------
@@ -107,9 +150,13 @@ describe('HTTP Server', () => {
 
     const res = await app.inject({ method: 'GET', url: '/api/sessions?scope=all' });
     expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.payload) as { sessions: Array<{ source: string }> };
+    const body = JSON.parse(res.payload) as {
+      sessions: Array<{ source: string; projectId?: string | null; projectBindingSource?: string }>;
+    };
     expect(body.sessions.some((session) => session.source === 'active')).toBe(true);
     expect(body.sessions.some((session) => session.source === 'discovered')).toBe(true);
+    expect(body.sessions.every((session) => !('projectId' in session))).toBe(true);
+    expect(body.sessions.every((session) => !('projectBindingSource' in session))).toBe(true);
   });
 
   it('POST /api/directories registers a directory', async () => {
@@ -206,6 +253,77 @@ describe('HTTP Server', () => {
       'offline prompt',
       'offline reply',
     ]);
+  });
+
+  it('GET /api/directories/:directoryId/sessions/:sessionId/messages pages active history by default', async () => {
+    const directory = await daemon.directoryManager.register(testDir);
+    const buffer = new RingBuffer({ sessionId: 'long-active-history-session' });
+    buffer.setDirectoryId(directory.id);
+    for (let i = 0; i < 125; i++) {
+      buffer.push('long-active-history-session', {
+        updateType: 'agent-message',
+        messageId: `active-agent-${i}`,
+        text: `reply ${i}`,
+        timestamp: Date.now() + i,
+      });
+    }
+    await buffer.flushPersistence();
+
+    const full = await app.inject({
+      method: 'GET',
+      url: `/api/directories/${directory.id}/sessions/long-active-history-session/messages`,
+    });
+    const limited = await app.inject({
+      method: 'GET',
+      url: `/api/directories/${directory.id}/sessions/long-active-history-session/messages?limit=10`,
+    });
+    const older = await app.inject({
+      method: 'GET',
+      url: `/api/directories/${directory.id}/sessions/long-active-history-session/messages?limit=10&offset=10`,
+    });
+
+    expect(full.statusCode).toBe(200);
+    expect(limited.statusCode).toBe(200);
+    expect(older.statusCode).toBe(200);
+    expect(JSON.parse(full.payload)).toMatchObject({
+      nextOffset: 100,
+      hasMoreBefore: true,
+    });
+    expect((JSON.parse(full.payload) as { messages: unknown[] }).messages).toHaveLength(100);
+    expect(JSON.parse(limited.payload)).toMatchObject({
+      nextOffset: 10,
+      hasMoreBefore: true,
+    });
+    expect(
+      (JSON.parse(limited.payload) as { messages: Array<{ text?: string }> }).messages,
+    ).toHaveLength(10);
+    expect(
+      (JSON.parse(limited.payload) as { messages: Array<{ text?: string }> }).messages[0]?.text,
+    ).toBe('reply 115');
+    expect(
+      (JSON.parse(older.payload) as { messages: Array<{ text?: string }> }).messages[0]?.text,
+    ).toBe('reply 105');
+  });
+
+  it('GET /api/directories/:directoryId/sessions/:sessionId/messages distinguishes missing directory and session errors', async () => {
+    const missingDirectory = await app.inject({
+      method: 'GET',
+      url: '/api/directories/missing-dir/sessions/session-1/messages',
+    });
+    expect(missingDirectory.statusCode).toBe(404);
+    expect(JSON.parse(missingDirectory.payload)).toMatchObject({
+      errorCode: 'DIRECTORY_NOT_FOUND',
+    });
+
+    const directory = await daemon.directoryManager.register(testDir);
+    const missingSession = await app.inject({
+      method: 'GET',
+      url: `/api/directories/${directory.id}/sessions/missing-session/messages`,
+    });
+    expect(missingSession.statusCode).toBe(404);
+    expect(JSON.parse(missingSession.payload)).toMatchObject({
+      errorCode: 'DISCOVERED_SESSION_NOT_FOUND',
+    });
   });
 
   it('POST /api/sessions/:id/stop stops active session', async () => {
@@ -327,7 +445,10 @@ describe('HTTP Server', () => {
     const hookRouter = {
       handleEvent: vi.fn().mockResolvedValue({ allowFallback: false }),
     };
-    registerHttpRoutes(localApp, daemon, undefined, { hookRouter: hookRouter as never });
+    registerHttpRoutes(localApp, daemon, undefined, {
+      hookRouter: hookRouter as never,
+      securityProfile: localLoopbackProfile,
+    });
     await localApp.ready();
 
     try {
@@ -572,17 +693,57 @@ describe('HTTP Server', () => {
 
     const res = await app.inject({
       method: 'GET',
-      url: `/api/directories/${dir.id}/sessions/codex-session-1/messages`,
+      url: `/api/directories/${dir.id}/sessions/codex-session-1/messages?limit=1&offset=0`,
     });
     expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.payload) as { messages: Array<{ kind: string; text?: string }> };
-    expect(body.messages.length).toBeGreaterThan(0);
-    expect(body.messages.some((msg) => msg.kind === 'text' && msg.text === 'hello codex')).toBe(
-      true,
-    );
-    expect(body.messages.some((msg) => msg.kind === 'text' && msg.text === 'hello user')).toBe(
-      true,
-    );
+    const body = JSON.parse(res.payload) as {
+      messages: Array<{ kind: string; text?: string }>;
+      nextOffset?: number;
+      hasMoreBefore?: boolean;
+    };
+    expect(body).toMatchObject({
+      nextOffset: 1,
+      hasMoreBefore: true,
+    });
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0]).toMatchObject({ kind: 'text', text: 'hello user' });
+
+    const older = await app.inject({
+      method: 'GET',
+      url: `/api/directories/${dir.id}/sessions/codex-session-1/messages?limit=1&offset=1`,
+    });
+    expect(older.statusCode).toBe(200);
+    const olderBody = JSON.parse(older.payload) as {
+      messages: Array<{ kind: string; text?: string }>;
+      nextOffset?: number;
+      hasMoreBefore?: boolean;
+    };
+    expect(olderBody).toMatchObject({
+      nextOffset: 2,
+      hasMoreBefore: true,
+    });
+    expect(olderBody.messages).toHaveLength(1);
+    expect(olderBody.messages[0]).toMatchObject({ kind: 'text', text: 'hello codex' });
+
+    const oldest = await app.inject({
+      method: 'GET',
+      url: `/api/directories/${dir.id}/sessions/codex-session-1/messages?limit=1&offset=2`,
+    });
+    expect(oldest.statusCode).toBe(200);
+    const oldestBody = JSON.parse(oldest.payload) as {
+      messages: Array<{ kind: string; title?: string }>;
+      nextOffset?: number;
+      hasMoreBefore?: boolean;
+    };
+    expect(oldestBody).toMatchObject({
+      nextOffset: 3,
+      hasMoreBefore: false,
+    });
+    expect(oldestBody.messages).toHaveLength(1);
+    expect(oldestBody.messages[0]).toMatchObject({
+      kind: 'event',
+      title: 'Provider event: session_meta',
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -645,5 +806,96 @@ describe('HTTP Server', () => {
       url: `/api/files/${id}/../../../etc/passwd`,
     });
     expect(res.statusCode).toBe(404);
+  });
+
+  it('POST /api/workflows/runs preserves Product20 agent session ids', async () => {
+    const createRes = await app.inject({
+      method: 'POST',
+      url: '/api/directories',
+      payload: { path: testDir },
+    });
+    const { id } = JSON.parse(createRes.payload);
+
+    // Deterministic: this test verifies the HTTP layer PRESERVES the Product20 ids end-to-end
+    // (request body → runner args → response). We mock startRun so it asserts id pass-through, not
+    // real async workflow execution — executing the shell node for real made this test flaky
+    // (the run record raced). Real execution is covered by the e2e suites.
+    const startRun = vi.spyOn(daemon.workflowRunner, 'startRun').mockImplementation(
+      async (req) =>
+        ({
+          id: 'workflow-run-1',
+          agentSessionId: req.agentSessionId,
+          platformRunId: req.platformRunId,
+          runtimeTargetId: req.runtimeTargetId,
+        }) as unknown as Awaited<ReturnType<typeof daemon.workflowRunner.startRun>>,
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/workflows/runs',
+      payload: {
+        workflowYaml: `
+schema: viewport.workflow/v1
+name: agent-session-http-proof
+nodes:
+  inspect:
+    type: shell
+    command: "true"
+`,
+        workflowSourceRef: 'viewport://tests/agent-session-http-proof',
+        directoryId: id,
+        resourceId: 'workspace_1',
+        runtimeTargetId: 'runtime-target-1',
+        platformRunId: 'workflow-run-1',
+        agentSessionId: 'agent-session-1',
+      },
+    });
+
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.payload);
+    expect(body.run.agentSessionId).toBe('agent-session-1');
+    expect(body.run.platformRunId).toBe('workflow-run-1');
+    expect(body.run.runtimeTargetId).toBe('runtime-target-1');
+    expect(startRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentSessionId: 'agent-session-1',
+        platformRunId: 'workflow-run-1',
+        runtimeTargetId: 'runtime-target-1',
+      }),
+    );
+  });
+
+  it('POST /api/workflows/runs/:id/approvals/:nodeId accepts approval feedback', async () => {
+    const decideApproval = vi.spyOn(daemon.workflowRunner, 'decideApproval').mockResolvedValue({
+      id: 'run-approval-feedback',
+      status: 'running',
+      workflowName: 'proof',
+      nodes: {},
+      events: [],
+    } as never);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/workflows/runs/run-approval-feedback/approvals/create_plan',
+      payload: {
+        approved: true,
+        message: 'Approved revised plan.',
+        feedback: {
+          plan_body: '## Revised Plan\nShip the approved implementation path.',
+        },
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(decideApproval).toHaveBeenCalledWith(
+      'run-approval-feedback',
+      'create_plan',
+      expect.objectContaining({
+        approved: true,
+        feedback: {
+          plan_body: '## Revised Plan\nShip the approved implementation path.',
+        },
+      }),
+    );
   });
 });

@@ -53,6 +53,21 @@ describe('HTTP security and lifecycle routes', () => {
     requireAuth: true,
   };
 
+  it('fails closed for protected API requests when no security profile is supplied', async () => {
+    await setup();
+
+    const res = await app!.inject({
+      method: 'GET',
+      url: '/api/directories',
+      headers: {
+        host: '127.0.0.1',
+      },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(JSON.parse(res.payload).error).toContain('auth is required');
+  });
+
   it('rejects protected API requests without auth when profile requires it', async () => {
     await setup({
       securityProfile: lanProfile,
@@ -112,6 +127,49 @@ describe('HTTP security and lifecycle routes', () => {
       },
     });
     expect(res.statusCode).toBe(403);
+  });
+
+  it('reports relay bridge status in health payload when relay is enabled', async () => {
+    await setup({
+      runtime: {
+        pid: process.pid,
+        host: '127.0.0.1',
+        port: 7070,
+        startedAt: Date.now(),
+        version: '0.3.0',
+        relayEnabled: true,
+      },
+      getRelayStatus: () => ({
+        state: 'waiting_retry',
+        reconnectAttempt: 2,
+        lastErrorCode: 'WEBSOCKET_ERROR',
+        lastErrorMessage: 'relay disconnected',
+        lastErrorAt: Date.now(),
+      }),
+    });
+
+    const res = await app!.inject({
+      method: 'GET',
+      url: '/health',
+      headers: {
+        host: '127.0.0.1',
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.payload) as {
+      relay?: {
+        enabled: boolean;
+        state: string;
+        reconnectAttempt: number;
+        lastErrorCode: string;
+      };
+    };
+    expect(body.relay).toMatchObject({
+      enabled: true,
+      state: 'waiting_retry',
+      reconnectAttempt: 2,
+      lastErrorCode: 'WEBSOCKET_ERROR',
+    });
   });
 
   it('allows hook auth bypass in local loopback profile only', async () => {
@@ -322,6 +380,34 @@ describe('HTTP security and lifecycle routes', () => {
 
     await new Promise((resolve) => setImmediate(resolve));
     expect(shutdownCalled).toBe(1);
+    expect(restartCalled).toBe(1);
+  });
+
+  it('allows lifecycle endpoints without auth when the daemon is running in local no-auth mode', async () => {
+    let restartCalled = 0;
+    await setup({
+      auth: undefined,
+      securityProfile: {
+        profile: 'local',
+        host: '127.0.0.1',
+        allowedHosts: ['127.0.0.1'],
+        allowedOrigins: [],
+        requireAuth: false,
+      },
+      onLifecycleRestart: async () => {
+        restartCalled += 1;
+      },
+    });
+
+    const restartRes = await app!.inject({
+      method: 'POST',
+      url: '/api/lifecycle/restart',
+    });
+
+    expect(restartRes.statusCode).toBe(200);
+    expect(JSON.parse(restartRes.payload).status).toBe('restart_requested');
+
+    await new Promise((resolve) => setImmediate(resolve));
     expect(restartCalled).toBe(1);
   });
 });

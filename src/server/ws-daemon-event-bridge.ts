@@ -9,6 +9,12 @@ import { sendHello } from './hello-builder.js';
 import { messageToUpdate, permissionToUpdate, stepToUpdate } from './message-normalizers.js';
 import type { RingBuffer } from './ring-buffer.js';
 import { resolveMatchedDiscoveredWatch } from './discovered-watch-key.js';
+import { createGitMetadataResolver } from '../session-enrichment/git.js';
+import {
+  resolveSessionResourceManifestSync,
+  type SessionResourceManifest,
+} from '../config-resolution/index.js';
+import { isRecentlyDiscoveredSession } from './discovered-session-window.js';
 
 const log = logger.child({ module: 'ws-daemon-event-bridge' });
 
@@ -86,6 +92,14 @@ export function registerWsDaemonEventBridge(
     });
     for (const client of clients) {
       client.send(msg);
+    }
+  };
+  const sendToSessionSubscribers = (sessionId: string, payload: Record<string, unknown>): void => {
+    const msg = JSON.stringify(payload);
+    for (const client of clients) {
+      if (client.subscriptions.has(sessionId)) {
+        client.send(msg);
+      }
     }
   };
 
@@ -246,27 +260,67 @@ export function registerWsDaemonEventBridge(
   });
 
   daemon.on('discovery:updated', () => {
+    const gitMetadataFor = createGitMetadataResolver();
     const sessions: Array<{
       id: string;
       agentId: string;
       directoryId: string;
       summary: string;
+      nativeTitle?: string;
+      generatedTitle?: string;
+      displayTitle?: string;
+      titleSource?: 'native' | 'generated' | 'first_prompt' | 'fallback';
+      firstPrompt?: string;
+      lastPrompt?: string;
+      latestModel?: string;
+      approvalPolicy?: string;
+      sandboxMode?: string;
+      reasoningEffort?: string;
       lastActivity: number;
       messageCount: number;
       resumable: boolean;
+      workingDirectory: string | null;
+      repoRoot: string | null;
+      repoRemoteUrl: string | null;
+      repoBranch: string | null;
+      repoSha: string | null;
+      resourceManifest: SessionResourceManifest;
     }> = [];
 
+    const now = Date.now();
     for (const [directoryId, discovered] of daemon.getDiscoveredSessions()) {
       for (const s of discovered) {
         if (sessions.length >= MAX_DISCOVERED_BROADCAST) break;
+        if (!isRecentlyDiscoveredSession(s, now)) continue;
+        const directoryPath = daemon.directoryManager.get(directoryId)?.path;
+        const workingDirectory = s.cwd ?? s.worktreePath ?? directoryPath ?? null;
+        const git = gitMetadataFor(workingDirectory);
         sessions.push({
           id: s.sessionId,
           agentId: s.agentId,
           directoryId,
           summary: s.summary,
+          nativeTitle: s.nativeTitle,
+          generatedTitle: s.generatedTitle,
+          displayTitle: s.displayTitle,
+          titleSource: s.titleSource,
+          firstPrompt: s.firstPrompt,
+          lastPrompt: s.lastPrompt,
+          latestModel: s.latestModel,
+          approvalPolicy: s.approvalPolicy,
+          sandboxMode: s.sandboxMode,
+          reasoningEffort: s.reasoningEffort,
           lastActivity: s.lastModified,
           messageCount: s.messageCount ?? 0,
           resumable: s.resumable,
+          workingDirectory,
+          repoRoot: git.repoRoot,
+          repoRemoteUrl: git.repoRemoteUrl,
+          repoBranch: git.repoBranch,
+          repoSha: git.repoSha,
+          resourceManifest: resolveSessionResourceManifestSync({
+            workingDirectory: workingDirectory ?? process.cwd(),
+          }),
         });
       }
       if (sessions.length >= MAX_DISCOVERED_BROADCAST) break;
@@ -293,6 +347,13 @@ export function registerWsDaemonEventBridge(
   daemon.on('directory:unregistered', () => {
     for (const client of clients) {
       sendHello(client, daemon, registry);
+    }
+  });
+
+  daemon.on('workflow:run-updated', ({ run }) => {
+    const msg = JSON.stringify({ type: 'workflow-run-updated', run });
+    for (const client of clients) {
+      client.send(msg);
     }
   });
 
@@ -375,8 +436,12 @@ export function registerWsDaemonEventBridge(
   });
 
   daemon.on('hook:stop', (data) => {
-    const msg = JSON.stringify({ type: 'hook-stop', ...data, timestamp: Date.now() });
-    for (const client of clients) client.send(msg);
+    sendToSessionSubscribers(data.sessionId, {
+      type: 'hook-stop',
+      sessionId: data.sessionId,
+      adapter: data.adapter,
+      timestamp: Date.now(),
+    });
   });
 
   daemon.on('hook:subagent-start', (data) => {
@@ -387,6 +452,21 @@ export function registerWsDaemonEventBridge(
   daemon.on('hook:subagent-stop', (data) => {
     const msg = JSON.stringify({ type: 'hook-subagent-stop', ...data, timestamp: Date.now() });
     for (const client of clients) client.send(msg);
+  });
+
+  daemon.on('hook:plan-proposed', (data) => {
+    sendToSessionSubscribers(data.sessionId, {
+      type: 'hook-plan-proposed',
+      sessionId: data.sessionId,
+      adapter: data.adapter,
+      title: data.title,
+      summary: data.summary,
+      body: data.body,
+      source: data.source,
+      sourceRef: data.sourceRef,
+      metadata: data.metadata,
+      timestamp: Date.now(),
+    });
   });
 
   const bufferCleanupInterval = setInterval(() => {

@@ -21,10 +21,13 @@ import {
   deriveSessionFromKeyExchange,
   parseRelayKeyExchangeInitFrame,
 } from '../../src/relay/bridge-key-exchange.js';
+import { acceptInboundRelaySeq } from '../../src/relay/bridge-relay-sessions.js';
 import { DaemonRelayBridge } from '../../src/relay/daemon-relay-bridge.js';
 import {
   createPairingClientIdentity,
   createPairingRedeemProof,
+  issuePairingOffer,
+  redeemPairingOffer,
 } from '../../src/server/pairing-offers.js';
 
 function deriveClientSessionKey(params: {
@@ -235,7 +238,6 @@ describe('daemon relay bridge helpers', () => {
         relayEndpoint: 'ws://127.0.0.1:7781/ws',
         relayServerUrl: 'http://127.0.0.1:7780',
         workspaceId: 'workspace_demo',
-        enrollToken: 'enroll-token',
         daemonWsUrl: 'ws://127.0.0.1:7070/ws',
       });
 
@@ -383,7 +385,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
     });
 
@@ -412,7 +413,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       issueToken: 'daemon-issue-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
     });
@@ -438,10 +438,11 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
     });
     (bridge as any).daemonIdentity = {
+      deviceId: 'device-1',
+      createdAt: Date.now(),
       algorithm: 'p256',
       publicKey: toBase64Url(daemonPublic),
       privateKey: toBase64Url(daemonPrivate),
@@ -468,11 +469,12 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       issueToken: 'daemon-issue-existing',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
     });
     (bridge as any).daemonIdentity = {
+      deviceId: 'device-1',
+      createdAt: Date.now(),
       algorithm: 'p256',
       publicKey: toBase64Url(daemonPublic),
       privateKey: toBase64Url(daemonPrivate),
@@ -489,13 +491,52 @@ describe('daemon relay bridge helpers', () => {
     expect((bridge as any).daemonIssueToken).toBe('daemon-issue-existing');
   });
 
+  it('registerDaemonPublicKey prefers daemon issue token over enroll token once paired', async () => {
+    const daemon = crypto.createECDH('prime256v1');
+    const daemonPublic = daemon.generateKeys();
+    const daemonPrivate = daemon.getPrivateKey();
+
+    const bridge = new DaemonRelayBridge({
+      relayEndpoint: 'ws://127.0.0.1:7781/ws',
+      relayServerUrl: 'http://127.0.0.1:7780',
+      workspaceId: 'workspace_demo',
+      issueToken: 'daemon-issue-token',
+      daemonWsUrl: 'ws://127.0.0.1:7070/ws',
+    });
+    (bridge as any).daemonIdentity = {
+      deviceId: 'device-1',
+      createdAt: Date.now(),
+      algorithm: 'p256',
+      publicKey: toBase64Url(daemonPublic),
+      privateKey: toBase64Url(daemonPrivate),
+    };
+
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    global.fetch = fetchMock;
+
+    await expect((bridge as any).registerDaemonPublicKey()).resolves.toBeUndefined();
+
+    const [requestUrl, requestInit] = fetchMock.mock.calls[0] ?? [];
+    expect(requestUrl).toBe(
+      'http://127.0.0.1:7780/api/runtime/workspaces/workspace_demo/daemon-key',
+    );
+    const parsedBody = JSON.parse(String(requestInit?.body)) as {
+      credential?: string;
+    };
+    expect(parsedBody.credential).toBe('daemon-issue-token');
+  });
+
   it('issueRelayToken uses daemon issue token credential (not enroll token)', async () => {
     const signingKey = 'test-relay-signing-key-0123456789';
     const bridge = new DaemonRelayBridge({
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token-not-for-issue',
       issueToken: 'daemon-issue-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
       relayTokenSigningKeys: {
@@ -512,7 +553,7 @@ describe('daemon relay bridge helpers', () => {
               role: 'workspace-daemon',
               workspaceId: 'workspace_demo',
               e2eeProfile: 'noise-ik',
-              iss: 'viewport-server-poc',
+              iss: 'viewport-server',
               aud: 'viewport-relay',
               exp: Math.floor(Date.now() / 1000) + 120,
               iat: Math.floor(Date.now() / 1000) - 5,
@@ -532,8 +573,10 @@ describe('daemon relay bridge helpers', () => {
     await (bridge as any).issueRelayToken();
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? '{}')) as {
       credential?: string;
+      workspaceId?: string;
     };
     expect(body.credential).toBe('daemon-issue-token');
+    expect(body.workspaceId).toBe('workspace_demo');
   });
 
   it('issueRelayToken derives profile from relay token payload, not response claims object', async () => {
@@ -542,7 +585,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token-not-for-issue',
       issueToken: 'daemon-issue-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
       relayTokenSigningKeys: {
@@ -555,7 +597,7 @@ describe('daemon relay bridge helpers', () => {
         role: 'workspace-daemon',
         workspaceId: 'workspace_demo',
         e2eeProfile: 'noise-ikpsk2',
-        iss: 'viewport-server-poc',
+        iss: 'viewport-server',
         aud: 'viewport-relay',
         exp: Math.floor(Date.now() / 1000) + 120,
         iat: Math.floor(Date.now() / 1000) - 5,
@@ -588,13 +630,12 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token-not-for-issue',
       issueToken: 'daemon-issue-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
       relayTokenSigningKeys: {
         v1: 'expected-signing-key',
       },
-      relayTokenIssuer: 'viewport-server-poc',
+      relayTokenIssuer: 'viewport-server',
       relayTokenAudience: 'viewport-relay',
     });
 
@@ -602,7 +643,7 @@ describe('daemon relay bridge helpers', () => {
       role: 'workspace-daemon',
       workspaceId: 'workspace_demo',
       e2eeProfile: 'noise-ik',
-      iss: 'viewport-server-poc',
+      iss: 'viewport-server',
       aud: 'viewport-relay',
       exp: Math.floor(Date.now() / 1000) + 120,
       iat: Math.floor(Date.now() / 1000) - 5,
@@ -632,13 +673,12 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token-not-for-issue',
       issueToken: 'daemon-issue-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
       relayTokenSigningKeys: {
         v1: 'expected-signing-key',
       },
-      relayTokenIssuer: 'viewport-server-poc',
+      relayTokenIssuer: 'viewport-server',
       relayTokenAudience: 'viewport-relay',
     });
 
@@ -678,12 +718,11 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token-not-for-issue',
       issueToken: 'daemon-issue-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
-      relayTokenIssuer: 'viewport-server-poc',
+      relayTokenIssuer: 'viewport-server',
       relayTokenAudience: 'viewport-relay',
-      relayTokenJwksUrl: 'https://server.test/api/.well-known/jwks.json',
+      relayTokenJwksUrl: 'https://jwks.getviewport.example/api/.well-known/jwks.json',
     });
 
     const relayToken = makeRelayJwtRs256(
@@ -691,7 +730,7 @@ describe('daemon relay bridge helpers', () => {
         role: 'workspace-daemon',
         workspaceId: 'workspace_demo',
         e2eeProfile: 'noise-ik',
-        iss: 'viewport-server-poc',
+        iss: 'viewport-server',
         aud: 'viewport-relay',
         exp: Math.floor(Date.now() / 1000) + 120,
         iat: Math.floor(Date.now() / 1000) - 5,
@@ -742,12 +781,11 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token-not-for-issue',
       issueToken: 'daemon-issue-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
-      relayTokenIssuer: 'viewport-server-poc',
+      relayTokenIssuer: 'viewport-server',
       relayTokenAudience: 'viewport-relay',
-      relayTokenJwksUrl: 'https://server.test/api/.well-known/jwks.json',
+      relayTokenJwksUrl: 'https://jwks.getviewport.example/api/.well-known/jwks.json',
     });
 
     const relayToken = makeRelayJwtRs256(
@@ -755,7 +793,7 @@ describe('daemon relay bridge helpers', () => {
         role: 'workspace-daemon',
         workspaceId: 'workspace_demo',
         e2eeProfile: 'noise-ik',
-        iss: 'viewport-server-poc',
+        iss: 'viewport-server',
         aud: 'viewport-relay',
         exp: Math.floor(Date.now() / 1000) + 120,
         iat: Math.floor(Date.now() / 1000) - 5,
@@ -899,7 +937,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'bad-token',
       issueToken: 'daemon-issue-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
     });
@@ -929,7 +966,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
     });
 
@@ -964,9 +1000,9 @@ describe('daemon relay bridge helpers', () => {
     });
     expect(session.keyRotationRequested).toBe(true);
 
-    expect((bridge as any).acceptInboundSeq(session, 1)).toBe(true);
-    expect((bridge as any).acceptInboundSeq(session, 1)).toBe(false);
-    expect((bridge as any).acceptInboundSeq(session, RELAY_REPLAY_WINDOW + 10)).toBe(false);
+    expect(acceptInboundRelaySeq(session, 1)).toBe(true);
+    expect(acceptInboundRelaySeq(session, 1)).toBe(false);
+    expect(acceptInboundRelaySeq(session, RELAY_REPLAY_WINDOW + 10)).toBe(false);
   });
 
   it('supports overriding key rotation threshold for test harnesses', () => {
@@ -974,7 +1010,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
       keyRotateAfterMessages: 2,
     });
@@ -1014,7 +1049,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
     });
     const daemon = crypto.createECDH('prime256v1');
@@ -1068,7 +1102,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
     });
     const daemon = crypto.createECDH('prime256v1');
@@ -1120,12 +1153,121 @@ describe('daemon relay bridge helpers', () => {
     expect(relayWs.send).toHaveBeenCalledTimes(1);
   });
 
+  it('resolves policy C pairing secret after pairing redemption persists local peer binding', async () => {
+    const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-policyc-relay-test-'));
+    const previousHome = process.env['VIEWPORT_HOME'];
+    process.env['VIEWPORT_HOME'] = tempHome;
+
+    try {
+      const bridge = new DaemonRelayBridge({
+        relayEndpoint: 'ws://127.0.0.1:7781/ws',
+        relayServerUrl: 'http://127.0.0.1:7780',
+        workspaceId: 'workspace_demo',
+        daemonWsUrl: 'ws://127.0.0.1:7070/ws',
+      });
+
+      const offer = await issuePairingOffer({
+        connection: {
+          host: '127.0.0.1',
+          port: 7070,
+          listen: '127.0.0.1:7070',
+          profile: 'relay',
+        },
+        ttlSeconds: 300,
+      });
+      const clientIdentity = createPairingClientIdentity();
+      const redeemProof = createPairingRedeemProof({
+        offerId: offer.offerId,
+        redeemSecret: offer.redeemSecret,
+        trustAnchor: offer.trustAnchor,
+        clientIdentity,
+      });
+      const redeemed = await redeemPairingOffer(
+        offer.offerId,
+        offer.redeemSecret,
+        offer.trustAnchor,
+        redeemProof.clientPublicKey,
+        redeemProof.clientProof,
+      );
+      expect(redeemed?.relayPairingPeerId).toBe(clientIdentity.peerId);
+
+      const resolvedPairingSecret = await (bridge as any).resolvePolicyCPairingSecret(
+        clientIdentity.peerId,
+      );
+      expect(resolvedPairingSecret).not.toBeUndefined();
+      expect(resolvedPairingSecret?.length).toBe(32);
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env['VIEWPORT_HOME'];
+      } else {
+        process.env['VIEWPORT_HOME'] = previousHome;
+      }
+      await fs.rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('does not replay cached daemon state after key exchange', async () => {
+    const bridge = new DaemonRelayBridge({
+      relayEndpoint: 'ws://127.0.0.1:7781/ws',
+      relayServerUrl: 'http://127.0.0.1:7780',
+      workspaceId: 'workspace_demo',
+      daemonWsUrl: 'ws://127.0.0.1:7070/ws',
+    });
+    const daemon = crypto.createECDH('prime256v1');
+    const daemonPublic = daemon.generateKeys();
+    const daemonPrivate = daemon.getPrivateKey();
+    (bridge as any).daemonIdentity = {
+      algorithm: 'p256',
+      publicKey: toBase64Url(daemonPublic),
+      privateKey: toBase64Url(daemonPrivate),
+    };
+    (bridge as any).requiredProfile = 'noise-ik';
+
+    const client = crypto.createECDH('prime256v1');
+    const clientPublic = client.generateKeys();
+    const clientPrivate = client.getPrivateKey();
+    const requestId = 'kex-replay-cached-state';
+    const clientNonce = toBase64Url(crypto.randomBytes(16));
+    const clientPublicKey = toBase64Url(clientPublic);
+
+    const init = parseRelayKeyExchangeInitFrame({
+      type: 'relay_key_exchange_init',
+      version: 2,
+      profile: 'noise-ik',
+      requestId,
+      clientPublicKey,
+      clientNonce,
+      clientProof: deriveClientInitProof({
+        daemonPublicKey: toBase64Url(daemonPublic),
+        clientPrivateKey: clientPrivate,
+        profile: 'noise-ik',
+        requestId,
+        clientPublicKey,
+        clientNonce,
+      }),
+    });
+    expect(init).toBeTruthy();
+
+    const sent: string[] = [];
+    const relayWs = {
+      readyState: 1,
+      send: vi.fn((payload: string) => {
+        sent.push(payload);
+      }),
+    };
+
+    await (bridge as any).handleKeyExchangeInit(init!, relayWs);
+
+    expect(sent.length).toBe(1);
+    const response = JSON.parse(sent[0] ?? '{}') as Record<string, unknown>;
+    expect(response.type).toBe('relay_key_exchange_response');
+  });
+
   it('validates relay_key_update_required epoch transitions before enabling rekey', async () => {
     const bridge = new DaemonRelayBridge({
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
     });
 
@@ -1182,7 +1324,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
       maxPendingOutbound: 100,
       maxPendingOutboundBytes: 20,
@@ -1205,7 +1346,6 @@ describe('daemon relay bridge helpers', () => {
       relayEndpoint: 'ws://127.0.0.1:7781/ws',
       relayServerUrl: 'http://127.0.0.1:7780',
       workspaceId: 'workspace_demo',
-      enrollToken: 'enroll-token',
       daemonWsUrl: 'ws://127.0.0.1:7070/ws',
       relaySessionMaxEntries: 1,
     } as any);

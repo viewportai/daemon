@@ -7,6 +7,7 @@ import { Daemon, createDaemon } from '../../src/core/daemon.js';
 import { DirectoryManager } from '../../src/directories/manager.js';
 import type {
   AgentAdapter,
+  AgentAdapterDescriptor,
   DiscoveredSession,
   Session,
   SessionDiscovery,
@@ -64,26 +65,139 @@ class MockSession extends EventEmitter implements Session {
 class MockAdapter implements AgentAdapter {
   readonly agentId: string;
   lastSession: MockSession | null = null;
+  lastOptions: SessionOptions | undefined;
 
   constructor(agentId = 'claude') {
     this.agentId = agentId;
   }
 
-  async startSession(_cwd: string, _options?: SessionOptions): Promise<Session> {
+  describe(): AgentAdapterDescriptor {
+    return testAdapterDescriptor(this.agentId);
+  }
+
+  async startSession(_cwd: string, options?: SessionOptions): Promise<Session> {
+    this.lastOptions = options;
     const session = new MockSession(crypto.randomUUID());
     this.lastSession = session;
     return session;
   }
 
-  async resumeSession(
-    sessionId: string,
-    _cwd: string,
-    _options?: SessionOptions,
-  ): Promise<Session> {
+  async resumeSession(sessionId: string, _cwd: string, options?: SessionOptions): Promise<Session> {
+    this.lastOptions = options;
     const session = new MockSession(sessionId);
     this.lastSession = session;
     return session;
   }
+}
+
+class EagerPromptSession extends EventEmitter implements Session {
+  readonly id = crypto.randomUUID();
+  state: SessionState = 'idle';
+
+  async sendPrompt(text: string): Promise<void> {
+    this.state = 'running';
+    this.emit('state-change', 'running');
+    this.emit('message', {
+      type: 'agent_message',
+      text: `response: ${text}`,
+      messageId: crypto.randomUUID(),
+      timestamp: Date.now(),
+    } satisfies SessionMessage);
+    this.state = 'idle';
+    this.emit('state-change', 'idle');
+  }
+
+  async kill(): Promise<void> {
+    this.state = 'completed';
+    this.emit('ended', 'killed');
+  }
+}
+
+class EagerPromptAdapter implements AgentAdapter {
+  readonly agentId = 'claude';
+  deferInitialPromptSeen = false;
+
+  describe(): AgentAdapterDescriptor {
+    return testAdapterDescriptor(this.agentId);
+  }
+
+  async startSession(_cwd: string, options?: SessionOptions): Promise<Session> {
+    this.deferInitialPromptSeen = options?.deferInitialPrompt === true;
+    return new EagerPromptSession();
+  }
+
+  async resumeSession(
+    _sessionId: string,
+    _cwd: string,
+    options?: SessionOptions,
+  ): Promise<Session> {
+    this.deferInitialPromptSeen = options?.deferInitialPrompt === true;
+    return new EagerPromptSession();
+  }
+}
+
+class FailingPromptSession extends EventEmitter implements Session {
+  readonly id = crypto.randomUUID();
+  state: SessionState = 'idle';
+
+  async sendPrompt(): Promise<void> {
+    this.state = 'running';
+    this.emit('state-change', 'running');
+    throw new Error('adapter quota exhausted');
+  }
+
+  async kill(): Promise<void> {
+    this.state = 'completed';
+    this.emit('ended', 'killed');
+  }
+}
+
+class FailingPromptAdapter implements AgentAdapter {
+  readonly agentId = 'claude';
+  deferInitialPromptSeen = false;
+
+  describe(): AgentAdapterDescriptor {
+    return testAdapterDescriptor(this.agentId);
+  }
+
+  async startSession(_cwd: string, options?: SessionOptions): Promise<Session> {
+    this.deferInitialPromptSeen = options?.deferInitialPrompt === true;
+    return new FailingPromptSession();
+  }
+
+  async resumeSession(
+    _sessionId: string,
+    _cwd: string,
+    options?: SessionOptions,
+  ): Promise<Session> {
+    this.deferInitialPromptSeen = options?.deferInitialPrompt === true;
+    return new FailingPromptSession();
+  }
+}
+
+function testAdapterDescriptor(agentId: string): AgentAdapterDescriptor {
+  return {
+    schema: 'viewport.agent_adapter/v2',
+    agentId,
+    displayName: 'Test adapter',
+    adapterVersion: 'test',
+    capabilities: {
+      executionModes: {
+        plan: 'hard',
+        read_only: 'hard',
+        review: 'hard',
+        implement: 'hard',
+      },
+      toolAllowlist: 'hard',
+      structuredOutput: 'hard',
+      permissionHooks: 'hard',
+      usageReporting: 'reported',
+      costReporting: 'reported',
+      maxTurns: 'hard',
+      maxBudget: 'hard',
+      hardTimeout: 'hard',
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -118,10 +232,13 @@ class MockTracker implements RunTracker {
 class MockDiscovery implements SessionDiscovery {
   readonly agentId: string;
   private sessions: DiscoveredSession[];
+  calls = 0;
+  private delayMs = 0;
 
-  constructor(agentId: string, sessions: DiscoveredSession[]) {
+  constructor(agentId: string, sessions: DiscoveredSession[], options: { delayMs?: number } = {}) {
     this.agentId = agentId;
     this.sessions = sessions;
+    this.delayMs = options.delayMs ?? 0;
   }
 
   setSessions(sessions: DiscoveredSession[]): void {
@@ -129,6 +246,10 @@ class MockDiscovery implements SessionDiscovery {
   }
 
   async discoverSessions(_projectPath: string): Promise<DiscoveredSession[]> {
+    this.calls += 1;
+    if (this.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    }
     return this.sessions;
   }
 }
@@ -311,6 +432,19 @@ describe('Daemon', () => {
     expect(daemon.getDiscoveredSessions(dirId).get(dirId)).toBeUndefined();
   });
 
+  it('coalesces concurrent discovery requests into one follow-up run', async () => {
+    const { daemon } = await setupDaemon();
+    const secondProject = path.join(tempHome, 'second-project');
+    await fs.mkdir(secondProject, { recursive: true });
+    await daemon.directoryManager.register(secondProject);
+    const discovery = new MockDiscovery('claude', [], { delayMs: 25 });
+    daemon.registerDiscovery(discovery);
+
+    await Promise.all([daemon.runDiscovery(), daemon.runDiscovery(), daemon.runDiscovery()]);
+
+    expect(discovery.calls).toBe(4);
+  });
+
   // ---------------------------------------------------------------------------
   // session events
   // ---------------------------------------------------------------------------
@@ -335,6 +469,56 @@ describe('Daemon', () => {
 
     expect(messages).toHaveLength(1);
     expect(messages[0]).toEqual(expect.objectContaining({ sessionId, message: msg }));
+  });
+
+  it('wires session listeners before dispatching the initial prompt', async () => {
+    const daemon = new Daemon();
+    const adapter = new EagerPromptAdapter();
+    daemon.registerAdapter(adapter);
+    await daemon.initialize();
+    await daemon.directoryManager.register(testDir);
+
+    const messages: Array<{ sessionId: string; message: SessionMessage }> = [];
+    daemon.on('session:message', (data) => messages.push(data));
+
+    const sessionId = await daemon.launchSession(getDirectoryId(), 'Hello');
+
+    await vi.waitFor(() => {
+      expect(messages.length).toBe(1);
+    });
+
+    expect(adapter.deferInitialPromptSeen).toBe(true);
+    expect(messages[0]).toMatchObject({
+      sessionId,
+      message: {
+        type: 'agent_message',
+        text: 'response: Hello',
+      },
+    });
+  });
+
+  it('marks initial prompt dispatch failures as ended sessions', async () => {
+    const daemon = new Daemon();
+    const adapter = new FailingPromptAdapter();
+    daemon.registerAdapter(adapter);
+    await daemon.initialize();
+    await daemon.directoryManager.register(testDir);
+
+    const ended: Array<{ sessionId: string; reason: string }> = [];
+    daemon.on('session:ended', (data) => ended.push(data));
+
+    const sessionId = await daemon.launchSession(getDirectoryId(), 'Hello');
+
+    await vi.waitFor(() => {
+      expect(ended).toHaveLength(1);
+    });
+
+    expect(adapter.deferInitialPromptSeen).toBe(true);
+    expect(ended[0]).toMatchObject({
+      sessionId,
+      reason: 'error: adapter quota exhausted',
+    });
+    expect(daemon.getSessionEndReason(sessionId)).toBe('error: adapter quota exhausted');
   });
 
   it('forwards messages to tracker', async () => {
@@ -492,6 +676,33 @@ describe('Daemon', () => {
     expect(info.directoryId).toBe(dirId);
     expect(info.mode).toBe('detect');
     expect(info.steps).toEqual([]);
+  });
+
+  it('launches automated never-approval sessions in bypass mode', async () => {
+    const { daemon, adapter } = await setupDaemon();
+    const dirId = getDirectoryId();
+    const permissionEvents: unknown[] = [];
+    daemon.on('permission:requested', (data) => permissionEvents.push(data));
+
+    const sessionId = await daemon.launchSession(dirId, 'Hello', {
+      trust: 'automated',
+      approvalPolicy: 'never',
+    });
+
+    expect(daemon.getSessionMode(sessionId)).toBe('bypass');
+    expect(daemon.getSessionInfo(sessionId).mode).toBe('bypass');
+
+    const decision = await adapter.lastOptions!.canUseTool!(
+      'Write',
+      { file_path: '/tmp/test' },
+      {
+        signal: new AbortController().signal,
+        toolUseId: 'tool-automated',
+      },
+    );
+
+    expect(decision.behavior).toBe('allow');
+    expect(permissionEvents).toHaveLength(0);
   });
 
   it('sets and retrieves session mode', async () => {

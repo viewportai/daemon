@@ -209,6 +209,16 @@ export const UnknownUpdateSchema = z.object({
   timestamp: TimestampSchema,
 });
 
+const SessionInteractionCapabilitiesSchema = z.object({
+  readTranscript: z.boolean(),
+  tailTranscript: z.boolean(),
+  resume: z.boolean(),
+  sendPrompt: z.boolean(),
+  interrupt: z.boolean(),
+  respondToPermissions: z.boolean(),
+  modelOverride: z.boolean(),
+});
+
 export const SessionUpdatePayloadSchema = z.discriminatedUnion('updateType', [
   AgentMessageUpdateSchema,
   AgentMessageChunkUpdateSchema,
@@ -249,6 +259,7 @@ export const HelloMessageSchema = z.object({
       id: z.string(),
       directoryId: z.string(),
       state: z.enum(['starting', 'running', 'waiting_permission', 'idle', 'completed', 'errored']),
+      capabilities: SessionInteractionCapabilitiesSchema.optional(),
     }),
   ),
   discoveredSessions: z
@@ -261,6 +272,12 @@ export const HelloMessageSchema = z.object({
         lastActivity: z.number(),
         messageCount: z.number(),
         resumable: z.boolean(),
+        capabilities: SessionInteractionCapabilitiesSchema.optional(),
+        workflowRunId: z.string().optional(),
+        workflowNodeId: z.string().optional(),
+        parentDirectoryId: z.string().optional(),
+        parentDirectoryPath: z.string().optional(),
+        worktreePath: z.string().optional(),
       }),
     )
     .optional(),
@@ -304,6 +321,10 @@ export const AckMessageSchema = z.object({
   errorCode: z.string().optional(),
   lastSeq: z.number().optional(),
   replayCount: z.number().optional(),
+  messages: z.array(z.unknown()).optional(),
+  originalReturned: z.number().optional(),
+  droppedCount: z.number().optional(),
+  truncated: z.boolean().optional(),
 });
 
 export const SessionStartedMessageSchema = z.object({
@@ -350,6 +371,8 @@ export const SessionAlertMessageSchema = z.object({
 export const SessionListMessageSchema = z.object({
   type: z.literal('session-list'),
   directoryId: z.string(),
+  offset: z.number().optional(),
+  limit: z.number().optional(),
   sessions: z.array(
     z.object({
       id: z.string(),
@@ -362,6 +385,28 @@ export const SessionListMessageSchema = z.object({
   ),
   total: z.number(),
   hasMore: z.boolean(),
+});
+
+export const ReadSessionMessagesCommandSchema = z.object({
+  type: z.literal('read-session-messages'),
+  directoryId: z.string(),
+  sessionId: z.string(),
+  limit: z.number().int().positive().max(200).optional(),
+  offset: z.number().int().nonnegative().optional(),
+  delivery: z.enum(['ack', 'event-stream']).optional(),
+  requestId: z.string().optional(),
+});
+
+export const ContextCandidatePreviewCommandSchema = z.object({
+  type: z.literal('context-candidate-preview'),
+  contextResourceId: z.string(),
+  workspaceId: z.string().optional(),
+  actorName: z.string(),
+  candidateEventId: z.string().optional(),
+  payloadDigest: z.string().optional(),
+  passphrase: z.string().optional(),
+  recoveryCode: z.string().optional(),
+  requestId: z.string().optional(),
 });
 
 export const DiscoveredSessionTailMessageSchema = z.object({
@@ -644,6 +689,8 @@ export const OutgoingMessageSchema = z.discriminatedUnion('type', [
   BranchRetryCommandSchema,
   SquashMergeCommandSchema,
   ResumeCommandSchema,
+  ReadSessionMessagesCommandSchema,
+  ContextCandidatePreviewCommandSchema,
   WatchDiscoveredSessionCommandSchema,
   UnwatchDiscoveredSessionCommandSchema,
   SuperviseCommandSchema,

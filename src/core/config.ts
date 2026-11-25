@@ -7,6 +7,7 @@
  * Config file: ~/.viewport/config.json
  */
 
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -15,6 +16,7 @@ import type { AgentRegistry } from './agent-registry.js';
 import { ViewportConfigSchema } from './config-schema.js';
 import type { RuntimeLaunchConfig } from '../cli/supervisor-protocol.js';
 import { validateRelayRuntimeSecurity } from '../startup-relay-security.js';
+import { resolveProfileAwareViewportHome } from './profiles.js';
 
 // ---------------------------------------------------------------------------
 // Built-in defaults — AGENT-AGNOSTIC framework defaults only.
@@ -41,6 +43,8 @@ export const BUILT_IN_DEFAULTS: SessionConfig = {
     requireApproval: [], // Populated from agent definition
     deny: [],
   },
+  executionMode: undefined,
+  allowedTools: undefined,
   costCapUsd: undefined,
   trust: 'operator',
 };
@@ -73,6 +77,33 @@ export function deepMerge<T>(...sources: Array<Partial<T> | undefined>): T {
   return result as T;
 }
 
+function mergeWithDeletes<T>(base: T, update: Partial<T> | undefined): T {
+  if (update === undefined) {
+    return base;
+  }
+
+  const initial = isPlainObject(base) ? { ...base } : {};
+  const result = initial as Record<string, unknown>;
+
+  for (const [key, value] of Object.entries(update as Record<string, unknown>)) {
+    if (isUnsafeMergeKey(key)) continue;
+    if (value === undefined) {
+      delete result[key];
+      continue;
+    }
+
+    const existing = result[key];
+    if (isPlainObject(existing) && isPlainObject(value)) {
+      result[key] = mergeWithDeletes(existing, value);
+      continue;
+    }
+
+    result[key] = value;
+  }
+
+  return result as T;
+}
+
 function toRuntimeConfigForDaemonValidation(
   daemonConfig: NonNullable<ViewportConfig['daemon']>,
 ): RuntimeLaunchConfig {
@@ -85,11 +116,14 @@ function toRuntimeConfigForDaemonValidation(
     profile: daemonConfig.profile ?? 'local',
     authEnabled: daemonConfig.authEnabled ?? true,
     detached: false,
+    serverUrl: daemonConfig.server?.url,
+    serverTlsVerify: daemonConfig.server?.tlsVerify ?? 'auto',
+    serverCaCertPath: daemonConfig.server?.caCertPath,
+    serverTlsPins: daemonConfig.server?.tlsPins,
     relayEnabled: relay.enabled ?? false,
     relayEndpoint: relay.endpoint,
     relayServerUrl: relay.serverUrl,
     relayWorkspaceId: relay.workspaceId,
-    relayEnrollToken: relay.enrollToken,
     relayIssueToken: relay.issueToken,
     relayTlsVerify: relay.tlsVerify ?? 'auto',
     relayCaCertPath: relay.caCertPath,
@@ -125,10 +159,6 @@ export interface ViewportConfig {
   defaults?: Partial<SessionConfig>;
   /** Per-directory config overrides. Keyed by directory ID. */
   directories?: Record<string, { path: string; config?: Partial<SessionConfig> }>;
-  /** Relay URL for remote access. */
-  relayUrl?: string;
-  /** Machine token for relay auth. */
-  relayToken?: string;
   /** Machine ID. */
   machineId?: string;
   /** Daemon runtime defaults (listen/profile/security/lifecycle options). */
@@ -139,13 +169,42 @@ export interface ViewportConfig {
     allowedOrigins?: string[] | true;
     authEnabled?: boolean;
     logFile?: string;
+    server?: {
+      url?: string;
+      appUrl?: string;
+      tlsVerify?: 'auto' | '0' | '1';
+      caCertPath?: string;
+      tlsPins?: string[];
+      contextCandidateDecisionKeys?: Record<string, string>;
+    };
     relay?: {
       enabled?: boolean;
+      bindings?: Array<{
+        enabled?: boolean;
+        endpoint?: string;
+        serverUrl?: string;
+        workspaceId?: string;
+        installId?: string;
+        runtimeTargetId?: string;
+        machineId?: string;
+        machineName?: string;
+        issueToken?: string;
+        tlsVerify?: 'auto' | '0' | '1';
+        caCertPath?: string;
+        tlsPins?: string[];
+        tokenIssuer?: string;
+        tokenAudience?: string;
+        tokenJwksUrl?: string;
+        signingKeys?: Record<string, string>;
+        tokenClockSkewSec?: number;
+      }>;
       endpoint?: string;
-      publicEndpoint?: string;
       serverUrl?: string;
       workspaceId?: string;
-      enrollToken?: string;
+      installId?: string;
+      runtimeTargetId?: string;
+      machineId?: string;
+      machineName?: string;
       issueToken?: string;
       tlsVerify?: 'auto' | '0' | '1';
       caCertPath?: string;
@@ -156,15 +215,67 @@ export interface ViewportConfig {
       signingKeys?: Record<string, string>;
       tokenClockSkewSec?: number;
     };
+    worker?: {
+      lifecycle?: 'persistent' | 'ephemeral';
+      transport?: 'polling' | 'relay' | 'inbound';
+      inbound?: {
+        enabled?: boolean;
+        signedRequests?: boolean;
+        replayProtection?: boolean;
+        controlPlaneClaimVerify?: boolean;
+      };
+      serverUrl?: string;
+      serverId?: string;
+      appUrl?: string;
+      workspaceId?: string;
+      managedExecutorId?: string;
+      credential?: string;
+      workspaceRoot?: string;
+      logsDir?: string;
+      cacheDir?: string;
+      stateDir?: string;
+      identityKeyPath?: string;
+      publicKeyFingerprint?: string;
+      runnerPool?: string;
+      capabilities?: {
+        agents?:
+          | Array<{
+              id: string;
+              displayName?: string;
+              tier?: 'sdk' | 'pty';
+              available: boolean;
+              models?: string[];
+              default_model?: string;
+              tools?: string[];
+              supports_plan_mode?: boolean;
+            }>
+          | Record<
+              string,
+              {
+                id?: string;
+                displayName?: string;
+                tier?: 'sdk' | 'pty';
+                available?: boolean;
+                models?: string[];
+                default_model?: string;
+                tools?: string[];
+                supports_plan_mode?: boolean;
+              }
+            >;
+        models?: string[];
+        tools?: string[];
+        integrations?: string[];
+        secrets?: string[];
+        tags?: string[];
+        runner_pool?: string;
+        runnerPool?: string;
+      };
+    };
   };
 }
 
 export function resolveViewportHome(env: NodeJS.ProcessEnv = process.env): string {
-  const explicit = env['VIEWPORT_HOME'] ?? env['VPD_HOME'];
-  if (typeof explicit === 'string' && explicit.trim().length > 0) {
-    return path.resolve(explicit.trim());
-  }
-  return path.join(os.homedir(), '.viewport');
+  return resolveProfileAwareViewportHome(env);
 }
 
 /** Returns the path to the Viewport config directory. */
@@ -177,26 +288,149 @@ export function configFilePath(): string {
   return path.join(configDir(), 'config.json');
 }
 
-/** Load the config file, returning empty config if it doesn't exist. */
-export async function loadConfig(): Promise<ViewportConfig> {
+export interface ResourceOverrideConfigResolution {
+  dir: string | null;
+  source: 'explicit' | null;
+}
+
+export function resolveResourceOverrideConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): ResourceOverrideConfigResolution {
+  const explicit = env['VIEWPORT_RESOURCE_OVERRIDE_DIR'] ?? env['VPD_RESOURCE_OVERRIDE_DIR'];
+  if (typeof explicit === 'string' && explicit.trim().length > 0) {
+    const resolved = path.resolve(explicit.trim());
+    try {
+      const configPath = path.join(resolved, 'config.json');
+      if (
+        fsSync.statSync(resolved).isDirectory() &&
+        fsSync.statSync(configPath).isFile() &&
+        isDaemonConfigFile(configPath)
+      ) {
+        return { dir: resolved, source: 'explicit' };
+      }
+    } catch {
+      // Ignore explicit resource override directories that do not contain a config file.
+    }
+  }
+
+  return { dir: null, source: null };
+}
+
+function isDaemonConfigFile(configPath: string): boolean {
   try {
-    const raw = await fs.readFile(configFilePath(), 'utf-8');
+    const raw = fsSync.readFileSync(configPath, 'utf8');
+    return hasDaemonConfigShape(JSON.parse(raw));
+  } catch {
+    // Keep malformed daemon override behavior actionable: if the file is not
+    // parseable, let loadConfigFromPath surface the exact JSON/schema error.
+    return true;
+  }
+}
+
+function hasDaemonConfigShape(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  if (hasRepoResourceConfigShape(value)) return false;
+
+  return Boolean(
+    value['daemon'] ||
+    value['directories'] ||
+    value['machineId'] ||
+    hasSessionDefaultsShape(value['defaults']),
+  );
+}
+
+function hasRepoResourceConfigShape(value: Record<string, unknown>): boolean {
+  if (value['resources'] || value['scope'] || value['$schema']) return true;
+
+  const defaults = value['defaults'];
+  if (!isPlainObject(defaults)) return false;
+  return Boolean(
+    defaults['inboxRoute'] || defaults['visibility'] || defaults['contextCandidateReview'],
+  );
+}
+
+function hasSessionDefaultsShape(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  return Boolean(
+    value['agent'] ||
+    value['model'] ||
+    value['sandboxMode'] ||
+    value['approvalPolicy'] ||
+    value['executionMode'] ||
+    value['allowedTools'] ||
+    value['gitTracker'] ||
+    value['permissions'] ||
+    value['costCapUsd'] ||
+    value['trust'],
+  );
+}
+
+export function resolveResourceOverrideConfigDir(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  return resolveResourceOverrideConfig(env).dir;
+}
+
+export function resourceOverrideConfigFilePath(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const dir = resolveResourceOverrideConfigDir(env);
+  return dir ? path.join(dir, 'config.json') : null;
+}
+
+function migrateViewportConfig(raw: unknown): { config: unknown; migrated: boolean } {
+  if (!isPlainObject(raw)) {
+    return { config: raw, migrated: false };
+  }
+
+  let migrated = false;
+  const daemon = raw['daemon'];
+  if (isPlainObject(daemon)) {
+    const relay = daemon['relay'];
+    if (isPlainObject(relay)) {
+      if ('enrollToken' in relay) {
+        delete relay['enrollToken'];
+        migrated = true;
+      }
+      if ('projectMachineBindingId' in relay) {
+        if (!('runtimeTargetId' in relay) && typeof relay['projectMachineBindingId'] === 'string') {
+          relay['runtimeTargetId'] = relay['projectMachineBindingId'];
+        }
+        delete relay['projectMachineBindingId'];
+        migrated = true;
+      }
+    }
+  }
+
+  return { config: raw, migrated };
+}
+
+/** Load the config file, returning empty config if it doesn't exist. */
+async function loadConfigFromPath(filePath: string): Promise<ViewportConfig> {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8');
     let parsedRaw: unknown;
     try {
       parsedRaw = JSON.parse(raw);
     } catch (err) {
       throw new Error(
-        `Invalid viewport config JSON at ${configFilePath()}: ${err instanceof Error ? err.message : String(err)}`,
+        `Invalid viewport config JSON at ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
-    const parsed = ViewportConfigSchema.safeParse(parsedRaw);
+    const migrated = migrateViewportConfig(parsedRaw);
+    const parsed = ViewportConfigSchema.safeParse(migrated.config);
     if (!parsed.success) {
       const detail = parsed.error.issues
         .map((issue) => `${issue.path.join('.') || '<root>'}: ${issue.message}`)
         .join('; ');
-      throw new Error(`Invalid viewport config schema at ${configFilePath()}: ${detail}`);
+      throw new Error(`Invalid viewport config schema at ${filePath}: ${detail}`);
     }
+
+    if (migrated.migrated) {
+      await saveConfigToPath(filePath, parsed.data as ViewportConfig);
+    }
+
     return parsed.data as ViewportConfig;
   } catch (err) {
     if ((err as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
@@ -209,14 +443,35 @@ export async function loadConfig(): Promise<ViewportConfig> {
   }
 }
 
+/** Load only the global config file, returning empty config if it doesn't exist. */
+export async function loadGlobalConfig(): Promise<ViewportConfig> {
+  return loadConfigFromPath(configFilePath());
+}
+
+/** Load the effective daemon config (global plus optional resource override). */
+export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<ViewportConfig> {
+  const globalConfig = await loadGlobalConfig();
+  const overridePath = resourceOverrideConfigFilePath(env);
+  if (!overridePath) {
+    return globalConfig;
+  }
+  const resourceOverride = await loadConfigFromPath(overridePath);
+  return deepMerge(globalConfig, resourceOverride);
+}
+
 /** Save the config file, creating the directory if needed. */
 export async function saveConfig(config: ViewportConfig): Promise<void> {
-  const dir = configDir();
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(configFilePath(), JSON.stringify(config, null, 2) + '\n', {
+  await saveConfigToPath(configFilePath(), config);
+}
+
+async function saveConfigToPath(filePath: string, config: ViewportConfig): Promise<void> {
+  const targetDir = path.dirname(filePath);
+  await fs.mkdir(targetDir, { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify(config, null, 2) + '\n', {
     encoding: 'utf-8',
     mode: 0o600,
   });
+  await fs.chmod(filePath, 0o600);
 }
 
 // ---------------------------------------------------------------------------
@@ -252,12 +507,20 @@ export function resolveConfig(
 
 export class ConfigManager {
   private config: ViewportConfig = {};
+  private globalConfig: ViewportConfig = {};
+  private resourceOverrideConfig: ViewportConfig | null = null;
+  private resourceOverridePath: string | null = null;
   private loaded = false;
   private agentRegistry: AgentRegistry | null = null;
 
   /** Load config from disk. Safe to call multiple times. */
   async load(): Promise<void> {
-    this.config = await loadConfig();
+    this.globalConfig = await loadGlobalConfig();
+    this.resourceOverridePath = resourceOverrideConfigFilePath();
+    this.resourceOverrideConfig = this.resourceOverridePath
+      ? await loadConfigFromPath(this.resourceOverridePath)
+      : null;
+    this.config = deepMerge(this.globalConfig, this.resourceOverrideConfig ?? {});
     this.loaded = true;
   }
 
@@ -270,6 +533,14 @@ export class ConfigManager {
   getConfig(): ViewportConfig {
     this.ensureLoaded();
     return this.config;
+  }
+
+  getConfigPaths(): { globalPath: string; resourceOverridePath: string | null } {
+    this.ensureLoaded();
+    return {
+      globalPath: configFilePath(),
+      resourceOverridePath: this.resourceOverridePath,
+    };
   }
 
   /** Resolve a full SessionConfig for a directory, with agent-specific defaults. */
@@ -315,12 +586,6 @@ export class ConfigManager {
     };
   }
 
-  /** Get the relay URL (if configured). */
-  getRelayUrl(): string | undefined {
-    this.ensureLoaded();
-    return this.config.relayUrl;
-  }
-
   /** Get the machine ID. */
   getMachineId(): string {
     this.ensureLoaded();
@@ -336,21 +601,107 @@ export class ConfigManager {
         allowedOrigins?: string[] | true;
         authEnabled?: boolean;
         logFile?: string;
+        server?: {
+          url?: string;
+          appUrl?: string;
+          tlsVerify?: 'auto' | '0' | '1';
+          caCertPath?: string;
+          tlsPins?: string[];
+          contextCandidateDecisionKeys?: Record<string, string>;
+        };
         relay?: {
           enabled?: boolean;
+          bindings?: Array<{
+            enabled?: boolean;
+            endpoint?: string;
+            serverUrl?: string;
+            workspaceId?: string;
+            installId?: string;
+            runtimeTargetId?: string;
+            machineId?: string;
+            machineName?: string;
+            issueToken?: string;
+            tlsVerify?: 'auto' | '0' | '1';
+            caCertPath?: string;
+            tlsPins?: string[];
+            tokenIssuer?: string;
+            tokenAudience?: string;
+            tokenJwksUrl?: string;
+            signingKeys?: Record<string, string>;
+            tokenClockSkewSec?: number;
+          }>;
           endpoint?: string;
-          publicEndpoint?: string;
           serverUrl?: string;
           workspaceId?: string;
-          enrollToken?: string;
+          installId?: string;
+          runtimeTargetId?: string;
+          machineId?: string;
+          machineName?: string;
           issueToken?: string;
           tlsVerify?: 'auto' | '0' | '1';
           caCertPath?: string;
           tlsPins?: string[];
           tokenIssuer?: string;
           tokenAudience?: string;
+          tokenJwksUrl?: string;
           signingKeys?: Record<string, string>;
           tokenClockSkewSec?: number;
+        };
+        worker?: {
+          lifecycle?: 'persistent' | 'ephemeral';
+          transport?: 'polling' | 'relay' | 'inbound';
+          inbound?: {
+            enabled?: boolean;
+            signedRequests?: boolean;
+            replayProtection?: boolean;
+            controlPlaneClaimVerify?: boolean;
+          };
+          serverUrl?: string;
+          serverId?: string;
+          appUrl?: string;
+          workspaceId?: string;
+          managedExecutorId?: string;
+          credential?: string;
+          workspaceRoot?: string;
+          logsDir?: string;
+          cacheDir?: string;
+          stateDir?: string;
+          identityKeyPath?: string;
+          publicKeyFingerprint?: string;
+          runnerPool?: string;
+          capabilities?: {
+            agents?:
+              | Array<{
+                  id: string;
+                  displayName?: string;
+                  tier?: 'sdk' | 'pty';
+                  available: boolean;
+                  models?: string[];
+                  default_model?: string;
+                  tools?: string[];
+                  supports_plan_mode?: boolean;
+                }>
+              | Record<
+                  string,
+                  {
+                    id?: string;
+                    displayName?: string;
+                    tier?: 'sdk' | 'pty';
+                    available?: boolean;
+                    models?: string[];
+                    default_model?: string;
+                    tools?: string[];
+                    supports_plan_mode?: boolean;
+                  }
+                >;
+            models?: string[];
+            tools?: string[];
+            integrations?: string[];
+            secrets?: string[];
+            tags?: string[];
+            runner_pool?: string;
+            runnerPool?: string;
+          };
         };
       }
     | undefined {
@@ -361,13 +712,29 @@ export class ConfigManager {
   /** Merge daemon runtime settings into config. */
   async setDaemonConfig(daemonConfig: NonNullable<ViewportConfig['daemon']>): Promise<void> {
     this.ensureLoaded();
-    const merged = deepMerge<NonNullable<ViewportConfig['daemon']>>(
-      this.config.daemon ?? {},
-      daemonConfig,
-    );
+    const base =
+      this.resourceOverridePath && this.resourceOverrideConfig
+        ? (this.resourceOverrideConfig.daemon ?? {})
+        : (this.globalConfig.daemon ?? {});
+    const merged = mergeWithDeletes<NonNullable<ViewportConfig['daemon']>>(base, daemonConfig);
     validateRelayRuntimeSecurity(toRuntimeConfigForDaemonValidation(merged));
-    this.config.daemon = merged;
-    await saveConfig(this.config);
+
+    if (this.resourceOverridePath) {
+      const nextResourceConfig = {
+        ...(this.resourceOverrideConfig ?? {}),
+        daemon: merged,
+      };
+      this.resourceOverrideConfig = nextResourceConfig;
+      await saveConfigToPath(this.resourceOverridePath, nextResourceConfig);
+    } else {
+      this.globalConfig = {
+        ...this.globalConfig,
+        daemon: merged,
+      };
+      await saveConfig(this.globalConfig);
+    }
+
+    this.config = deepMerge(this.globalConfig, this.resourceOverrideConfig ?? {});
   }
 
   /** Update global defaults. */

@@ -165,6 +165,7 @@ export function registerWsServer(
 
   const handlers = createWsCommandHandlers({
     daemon,
+    registry,
     hookRouter,
     supervision,
     sendAck,

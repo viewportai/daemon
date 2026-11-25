@@ -2,11 +2,15 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { sendHello } from '../../src/server/hello-builder.js';
+import {
+  buildSnapshotPayload,
+  sendHello,
+  sendSyncSnapshot,
+} from '../../src/server/hello-builder.js';
 import type { ConnectedClient } from '../../src/server/hello-builder.js';
 import { Daemon } from '../../src/core/daemon.js';
 
-describe('sendHello', () => {
+describe('daemon snapshot builder', () => {
   let tempHome: string;
   let originalHome: string;
   let daemon: Daemon;
@@ -36,20 +40,16 @@ describe('sendHello', () => {
     return { client, messages };
   }
 
-  it('sends a hello message with required fields', () => {
-    const { client, messages } = createMockClient();
-    sendHello(client, daemon);
+  it('builds a snapshot payload with required fields', () => {
+    const payload = buildSnapshotPayload(daemon);
 
-    expect(messages).toHaveLength(1);
-    const msg = JSON.parse(messages[0]!);
-    expect(msg.type).toBe('hello');
-    expect(msg.protocolVersion).toBe(2);
-    expect(msg.machine).toBeDefined();
-    expect(msg.directories).toEqual([]);
-    expect(msg.activeSessions).toEqual([]);
-    expect(msg.discoveredSessions).toEqual([]);
-    expect(msg.discoveredSessionsTruncated).toBe(false);
-    expect(msg.availableAgents).toEqual([]);
+    expect(payload.protocolVersion).toBe(2);
+    expect(payload.machine).toBeDefined();
+    expect(payload.directories).toEqual([]);
+    expect(payload.activeSessions).toEqual([]);
+    expect(payload.discoveredSessions).toEqual([]);
+    expect(payload.discoveredSessionsTruncated).toBe(false);
+    expect(payload.availableAgents).toEqual([]);
   });
 
   it('includes directories when registered', async () => {
@@ -94,6 +94,44 @@ describe('sendHello', () => {
     expect(msg.models[0].displayName).toBe('Sonnet 4');
   });
 
+  it('uses the paired runtime target as the canonical snapshot machine id', async () => {
+    const isolatedHome = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hello-runtime-home-'));
+    const previousHome = process.env['HOME']!;
+    process.env['HOME'] = isolatedHome;
+
+    const isolatedDaemon = new Daemon();
+    await isolatedDaemon.initialize();
+
+    try {
+      await isolatedDaemon.configManager.setDaemonConfig({
+        profile: 'local',
+        relay: {
+          enabled: true,
+          endpoint: 'ws://127.0.0.1:7781/ws',
+          tlsVerify: 'auto',
+          workspaceId: 'workspace-1',
+          runtimeTargetId: 'runtime-target-1',
+          machineId: 'mutable-hostname',
+          machineName: "Mehr's MacBook Pro",
+          signingKeys: {
+            k1: 'b'.repeat(32),
+          },
+        },
+      });
+
+      const payload = buildSnapshotPayload(isolatedDaemon);
+
+      expect(payload.machine).toMatchObject({
+        id: 'runtime-target-1',
+        name: "Mehr's MacBook Pro",
+      });
+    } finally {
+      await isolatedDaemon.shutdown();
+      process.env['HOME'] = previousHome;
+      await fs.rm(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
   it('dedupes discovered sessions with the same id within a directory', async () => {
     const isolatedHome = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hello-dedupe-home-'));
     const isolatedDir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hello-dedupe-dir-'));
@@ -105,6 +143,7 @@ describe('sendHello', () => {
 
     try {
       const directory = await isolatedDaemon.directoryManager.register(isolatedDir);
+      const now = Date.now();
       isolatedDaemon.registerDiscovery({
         agentId: 'dup-test',
         discoverSessions: async () => [
@@ -112,7 +151,7 @@ describe('sendHello', () => {
             agentId: 'dup-test',
             sessionId: 'sess-1',
             summary: '',
-            lastModified: 100,
+            lastModified: now - 1_000,
             messageCount: 0,
             resumable: true,
           },
@@ -120,7 +159,7 @@ describe('sendHello', () => {
             agentId: 'dup-test',
             sessionId: 'sess-1',
             summary: 'what agent are you',
-            lastModified: 200,
+            lastModified: now,
             messageCount: 3,
             resumable: true,
           },
@@ -141,7 +180,7 @@ describe('sendHello', () => {
       expect(sameSession[0]).toMatchObject({
         summary: 'what agent are you',
         messageCount: 3,
-        lastActivity: 200,
+        lastActivity: now,
       });
     } finally {
       await isolatedDaemon.shutdown();
@@ -149,5 +188,131 @@ describe('sendHello', () => {
       await fs.rm(isolatedDir, { recursive: true, force: true });
       await fs.rm(isolatedHome, { recursive: true, force: true });
     }
+  });
+
+  it('keeps discovered sessions unbound while exposing repo-local resource manifests', async () => {
+    const isolatedHome = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hello-binding-home-'));
+    const isolatedDir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hello-binding-dir-'));
+    const previousHome = process.env['HOME']!;
+    process.env['HOME'] = isolatedHome;
+
+    const isolatedDaemon = new Daemon();
+    await isolatedDaemon.initialize();
+
+    try {
+      const directory = await isolatedDaemon.directoryManager.register(isolatedDir);
+      await fs.mkdir(path.join(isolatedDir, '.viewport'), { recursive: true });
+      await fs.writeFile(
+        path.join(isolatedDir, '.viewport', 'config.json'),
+        JSON.stringify({
+          version: 1,
+          resources: { contexts: ['ctx-auth'], workflows: ['wf-review'] },
+        }),
+      );
+      isolatedDaemon.registerDiscovery({
+        agentId: 'binding-test',
+        discoverSessions: async () => [
+          {
+            agentId: 'binding-test',
+            sessionId: 'sess-claimed',
+            summary: 'claimed work',
+            lastModified: Date.now(),
+            messageCount: 1,
+            resumable: true,
+            cwd: isolatedDir,
+          },
+        ],
+      });
+      await isolatedDaemon.runDiscovery();
+
+      const payload = buildSnapshotPayload(isolatedDaemon);
+      const session = payload.discoveredSessions.find((entry) => entry.id === 'sess-claimed');
+
+      expect(session).toMatchObject({
+        directoryId: directory.id,
+        workingDirectory: isolatedDir,
+        resourceManifest: expect.objectContaining({
+          schema: 'viewport.session_resource_manifest/v1',
+          resources: expect.objectContaining({
+            contexts: [expect.objectContaining({ id: 'ctx-auth' })],
+            workflows: [expect.objectContaining({ id: 'wf-review' })],
+          }),
+        }),
+      });
+      expect(session).not.toHaveProperty('projectId');
+      expect(session).not.toHaveProperty('projectBindingSource');
+    } finally {
+      await isolatedDaemon.shutdown();
+      process.env['HOME'] = previousHome;
+      await fs.rm(isolatedDir, { recursive: true, force: true });
+      await fs.rm(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
+  it('only announces recent discovered sessions in bootstrap snapshots', async () => {
+    const isolatedHome = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hello-recent-home-'));
+    const isolatedDir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hello-recent-dir-'));
+    const previousHome = process.env['HOME']!;
+    process.env['HOME'] = isolatedHome;
+
+    const isolatedDaemon = new Daemon();
+    await isolatedDaemon.initialize();
+
+    try {
+      const directory = await isolatedDaemon.directoryManager.register(isolatedDir);
+      isolatedDaemon.registerDiscovery({
+        agentId: 'recent-window-test',
+        discoverSessions: async () => [
+          {
+            agentId: 'recent-window-test',
+            sessionId: 'recent-session',
+            summary: 'recent work',
+            lastModified: Date.now() - 60_000,
+            messageCount: 2,
+            resumable: true,
+          },
+          {
+            agentId: 'recent-window-test',
+            sessionId: 'older-session',
+            summary: 'older local history',
+            lastModified: Date.now() - 25 * 60 * 60 * 1000,
+            messageCount: 8,
+            resumable: true,
+          },
+        ],
+      });
+      await isolatedDaemon.runDiscovery();
+
+      const payload = buildSnapshotPayload(isolatedDaemon);
+
+      expect(payload.discoveredSessions).toEqual([
+        expect.objectContaining({ id: 'recent-session', directoryId: directory.id }),
+      ]);
+      expect(isolatedDaemon.getDiscoveredSessions(directory.id).get(directory.id)).toEqual(
+        expect.arrayContaining([expect.objectContaining({ sessionId: 'older-session' })]),
+      );
+    } finally {
+      await isolatedDaemon.shutdown();
+      process.env['HOME'] = previousHome;
+      await fs.rm(isolatedDir, { recursive: true, force: true });
+      await fs.rm(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
+  it('sends a fresh sync snapshot with required fields', () => {
+    const { client, messages } = createMockClient();
+    const expected = buildSnapshotPayload(daemon);
+    sendSyncSnapshot(client, daemon);
+
+    expect(messages).toHaveLength(1);
+    const msg = JSON.parse(messages[0]!);
+    expect(msg.type).toBe('sync-snapshot');
+    expect(msg.protocolVersion).toBe(2);
+    expect(msg.machine).toBeDefined();
+    expect(msg.directories).toEqual(expected.directories);
+    expect(msg.activeSessions).toEqual(expected.activeSessions);
+    expect(msg.discoveredSessions).toEqual(expected.discoveredSessions);
+    expect(msg.discoveredSessionsTruncated).toBe(expected.discoveredSessionsTruncated);
+    expect(msg.availableAgents).toEqual(expected.availableAgents);
   });
 });

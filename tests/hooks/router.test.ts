@@ -1,9 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { HookRouter } from '../../src/hooks/router.js';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { HookRouter, safeHookLogInput } from '../../src/hooks/router.js';
 import { SupervisionManager } from '../../src/hooks/supervision.js';
 import { TypedEventEmitter } from '../../src/core/events.js';
 import type { DaemonEvents } from '../../src/core/events.js';
 import type { ConnectedClient } from '../../src/server/hello-builder.js';
+import { workflowHookRegistry } from '../../src/workflows/hook-registry.js';
+import { PLAN_PROPOSAL_SCHEMA_VERSION } from '../../src/hooks/plan-extractor.js';
 
 function mockClient(): ConnectedClient {
   return {
@@ -20,6 +25,7 @@ describe('HookRouter', () => {
   let router: HookRouter;
 
   beforeEach(() => {
+    workflowHookRegistry.clear();
     eventBus = new TypedEventEmitter<DaemonEvents>();
     supervision = new SupervisionManager();
     router = new HookRouter(eventBus, supervision);
@@ -50,6 +56,94 @@ describe('HookRouter', () => {
       cwd: '/tmp/project',
       source: 'startup',
     });
+  });
+
+  it('injects Claude session guidance when a repo has Viewport context configured', async () => {
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hook-context-repo-'));
+    await fs.mkdir(path.join(repo, '.viewport'), { recursive: true });
+    await fs.writeFile(
+      path.join(repo, '.viewport', 'config.yaml'),
+      ['version: 1', 'resources:', '  contexts:', '    - ctx-team', ''].join('\n'),
+      'utf8',
+    );
+
+    const result = await router.handleEvent({
+      hook_event_name: 'SessionStart',
+      session_id: 's1',
+      cwd: repo,
+      source: 'startup',
+    });
+
+    expect(result.passthrough).toBe(false);
+    expect(result.hookSpecificOutput).toMatchObject({
+      hookEventName: 'SessionStart',
+    });
+    expect(result.hookSpecificOutput?.additionalContext).toContain(
+      'Viewport context is configured for this repo.',
+    );
+    expect(result.suppressOutput).toBe(true);
+
+    await fs.rm(repo, { recursive: true, force: true });
+  });
+
+  it('injects resolved approved context into UserPromptSubmit hook output', async () => {
+    const previousHome = process.env['HOME'];
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hook-context-home-'));
+    const repo = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-hook-context-repo-'));
+    process.env['HOME'] = home;
+
+    try {
+      await fs.mkdir(path.join(repo, '.viewport'), { recursive: true });
+      await fs.writeFile(
+        path.join(repo, '.viewport', 'config.json'),
+        JSON.stringify({ version: 1, resources: { contexts: ['ctx-auth'] } }),
+        'utf8',
+      );
+
+      const { initContextResource, addContextEntry } =
+        await import('../../src/context/local-edge-store.js');
+      const credentials = { passphrase: 'alice-passphrase', recoveryCode: 'alice-recovery' };
+      await initContextResource({
+        contextResourceId: 'ctx-auth',
+        userName: 'alice',
+        deviceName: 'alice-laptop',
+        credentials,
+        home: path.join(home, '.viewport'),
+      });
+      await addContextEntry({
+        contextResourceId: 'ctx-auth',
+        actorName: 'alice-laptop',
+        title: 'Auth rule',
+        body: 'Dashboard auth changes require session rotation tests.',
+        credentials,
+        home: path.join(home, '.viewport'),
+      });
+
+      const result = await router.handleEvent({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 's1',
+        cwd: repo,
+        prompt: 'Change dashboard auth middleware.',
+      });
+
+      expect(result.passthrough).toBe(false);
+      expect(result.hookSpecificOutput).toMatchObject({
+        hookEventName: 'UserPromptSubmit',
+      });
+      expect(result.hookSpecificOutput?.additionalContext).toContain('<viewport_context>');
+      expect(result.hookSpecificOutput?.additionalContext).toContain('### Auth rule');
+      expect(result.hookSpecificOutput?.additionalContext).toContain(
+        'Dashboard auth changes require session rotation tests.',
+      );
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env['HOME'];
+      } else {
+        process.env['HOME'] = previousHome;
+      }
+      await fs.rm(repo, { recursive: true, force: true });
+      await fs.rm(home, { recursive: true, force: true });
+    }
   });
 
   it('handles SessionEnd — emits hook:session-end', async () => {
@@ -97,6 +191,101 @@ describe('HookRouter', () => {
     expect(events[0]).toMatchObject({ toolName: 'Bash' });
   });
 
+  it('extracts Claude plan mode drafts from ExitPlanMode PreToolUse hooks', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    const result = await router.handleEvent({
+      hook_event_name: 'PreToolUse',
+      session_id: 's1',
+      cwd: '/tmp/project',
+      tool_name: 'ExitPlanMode',
+      tool_input: {
+        plan: '## Migrate auth\n\n1. Inspect routes\n2. Add tests',
+        planFilePath: '/tmp/claude/plan.md',
+        allowedPrompts: [],
+      },
+    });
+
+    expect(result).toEqual({ passthrough: false });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      sessionId: 's1',
+      adapter: 'claude',
+      cwd: '/tmp/project',
+      title: 'Migrate auth',
+      body: '## Migrate auth\n\n1. Inspect routes\n2. Add tests',
+      source: 'claude-exit-plan-mode',
+      sourceRef: 'hook://exit-plan-mode/s1',
+      metadata: {
+        schema: PLAN_PROPOSAL_SCHEMA_VERSION,
+        extractedFrom: 'exit-plan-mode',
+        planFilePath: '/tmp/claude/plan.md',
+      },
+    });
+  });
+
+  it('holds Claude ExitPlanMode PermissionRequest hooks and opens a plan draft even without supervision', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    const resultPromise = router.handleEvent({
+      hook_event_name: 'PermissionRequest',
+      session_id: 's1',
+      cwd: '/tmp/project',
+      tool_name: 'ExitPlanMode',
+      tool_input: {
+        plan: '## Migrate auth\n\n1. Inspect routes\n2. Add tests',
+        planFilePath: '/tmp/claude/plan.md',
+        allowedPrompts: [],
+      },
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      sessionId: 's1',
+      adapter: 'claude',
+      cwd: '/tmp/project',
+      title: 'Migrate auth',
+      body: '## Migrate auth\n\n1. Inspect routes\n2. Add tests',
+      source: 'claude-exit-plan-mode',
+      metadata: {
+        extractedFrom: 'exit-plan-mode',
+        hookRequestId: expect.stringMatching(/^hk-/),
+      },
+    });
+
+    const hookRequestId = (
+      (events[0] as Record<string, unknown>).metadata as Record<string, unknown>
+    ).hookRequestId as string;
+    expect(router.getPendingPermissions().has(hookRequestId)).toBe(true);
+
+    eventBus.emit('hook:permission-response', {
+      hookRequestId,
+      decision: { behavior: 'allow' },
+    });
+
+    await expect(resultPromise).resolves.toEqual({
+      passthrough: false,
+      decision: { behavior: 'allow' },
+    });
+  });
+
+  it('ignores non-plan PreToolUse hooks for plan draft extraction', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    await router.handleEvent({
+      hook_event_name: 'PreToolUse',
+      session_id: 's1',
+      cwd: '/tmp/project',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' },
+    });
+
+    expect(events).toHaveLength(0);
+  });
+
   it('handles PostToolUseFailure — emits hook:tool-failed', async () => {
     const events: unknown[] = [];
     eventBus.on('hook:tool-failed', (data) => events.push(data));
@@ -124,6 +313,106 @@ describe('HookRouter', () => {
 
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ lastMessage: 'All done' });
+  });
+
+  it('extracts explicit viewport-plan blocks from Stop hooks', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    await router.handleEvent({
+      hook_event_name: 'Stop',
+      session_id: 's1',
+      cwd: '/tmp/project',
+      last_assistant_message: [
+        'Drafted the requested plan.',
+        '```viewport-plan',
+        `schema: ${PLAN_PROPOSAL_SCHEMA_VERSION}`,
+        'title: Refactor auth callbacks',
+        'summary: Move callback handling behind one service.',
+        'source: claude-code',
+        'source_ref: claude://session/s1',
+        '---',
+        '## Plan',
+        '1. Extract callback service.',
+        '2. Add regression tests.',
+        '```',
+      ].join('\n'),
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      sessionId: 's1',
+      adapter: 'claude',
+      cwd: '/tmp/project',
+      title: 'Refactor auth callbacks',
+      summary: 'Move callback handling behind one service.',
+      body: '## Plan\n1. Extract callback service.\n2. Add regression tests.',
+      source: 'claude-code',
+      sourceRef: 'claude://session/s1',
+      metadata: { extractedFrom: 'explicit-marker' },
+    });
+  });
+
+  it('opens Claude plan-mode Stop responses as unsaved plan drafts when no explicit block is present', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    await router.handleEvent({
+      hook_event_name: 'Stop',
+      session_id: 's1',
+      cwd: '/tmp/project',
+      permission_mode: 'plan',
+      last_assistant_message: [
+        '## Plan: localStorage to Firebase',
+        '',
+        '### Phase 0 — Audit',
+        'Goal: find every localStorage key.',
+        '',
+        '### Key Risks',
+        '- Async UI bugs.',
+      ].join('\n'),
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      sessionId: 's1',
+      adapter: 'claude',
+      cwd: '/tmp/project',
+      title: 'Plan: localStorage to Firebase',
+      body: expect.stringContaining('### Phase 0'),
+      source: 'claude-plan-mode-stop',
+      sourceRef: 'hook://stop/s1',
+      metadata: {
+        schema: PLAN_PROPOSAL_SCHEMA_VERSION,
+        extractedFrom: 'claude-plan-mode-stop',
+      },
+    });
+  });
+
+  it('does not convert ordinary Stop prose into a plan draft outside Claude plan mode', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    await router.handleEvent({
+      hook_event_name: 'Stop',
+      session_id: 's1',
+      last_assistant_message: '## Plan: this heading alone should not be enough outside plan mode',
+    });
+
+    expect(events).toHaveLength(0);
+  });
+
+  it('does not infer plans from unmarked Stop prose', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    await router.handleEvent({
+      hook_event_name: 'Stop',
+      session_id: 's1',
+      last_assistant_message: 'Here is a plan in normal prose, but it is not explicitly marked.',
+    });
+
+    expect(events).toHaveLength(0);
   });
 
   it('handles SubagentStart — emits hook:subagent-start', async () => {
@@ -154,6 +443,97 @@ describe('HookRouter', () => {
 
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ agentId: 'sub-1', lastMessage: 'Found 3 files' });
+  });
+
+  it('handles PlanProposed — emits provider-neutral plan proposal', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    const result = await router.handleEvent({
+      hook_event_name: 'PlanProposed',
+      schema: PLAN_PROPOSAL_SCHEMA_VERSION,
+      session_id: 's1',
+      cwd: '/tmp/project',
+      title: 'Refactor auth callbacks',
+      summary: 'Move WorkOS callback handling behind one service.',
+      plan_markdown: '## Plan\n\n1. Extract service\n2. Add tests',
+      source: 'claude-code',
+      source_ref: 'claude://session/s1',
+      metadata: { providerModel: 'sonnet', secret: 'do-not-broadcast' },
+    });
+
+    expect(result).toEqual({ passthrough: false });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      sessionId: 's1',
+      adapter: 'claude',
+      cwd: '/tmp/project',
+      title: 'Refactor auth callbacks',
+      body: '## Plan\n\n1. Extract service\n2. Add tests',
+      source: 'claude-code',
+      sourceRef: 'claude://session/s1',
+      metadata: { providerModel: 'sonnet', schema: PLAN_PROPOSAL_SCHEMA_VERSION },
+    });
+  });
+
+  it('redacts sensitive hook payloads before invalid base input logging', () => {
+    expect(
+      safeHookLogInput({
+        hook_event_name: 'PlanProposed',
+        body: 'secret plan body',
+        metadata: { secret: 'token' },
+        plan: 'secret alternative body',
+        plan_markdown: 'secret markdown body',
+        tool_input: { token: 'tool-token' },
+        tool_response: { output: 'tool-output' },
+        session_id: 's1',
+      }),
+    ).toEqual({
+      hook_event_name: 'PlanProposed',
+      adapter: undefined,
+      has_session_id: true,
+      keys: ['hook_event_name', 'session_id'],
+    });
+  });
+
+  it('rejects PlanProposed hooks without the explicit plan contract schema', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    const result = await router.handleEvent({
+      hook_event_name: 'PlanProposed',
+      session_id: 's1',
+      body: '## Plan\n\nMissing schema.',
+    });
+
+    expect(result).toEqual({ passthrough: true });
+    expect(events).toHaveLength(0);
+  });
+
+  it('rejects PlanProposed hooks with blank or ambiguous plan bodies', async () => {
+    const events: unknown[] = [];
+    eventBus.on('hook:plan-proposed', (data) => events.push(data));
+
+    await expect(
+      router.handleEvent({
+        hook_event_name: 'PlanProposed',
+        schema: PLAN_PROPOSAL_SCHEMA_VERSION,
+        session_id: 's1',
+        body: '   ',
+      }),
+    ).resolves.toEqual({ passthrough: true });
+
+    await expect(
+      router.handleEvent({
+        hook_event_name: 'PlanProposed',
+        schema: PLAN_PROPOSAL_SCHEMA_VERSION,
+        session_id: 's1',
+        body: 'Plan A',
+        plan_markdown: 'Plan B',
+      }),
+    ).resolves.toEqual({ passthrough: true });
+
+    expect(events).toHaveLength(0);
   });
 
   it('emits generic hook:event for all events', async () => {
@@ -207,6 +587,91 @@ describe('HookRouter', () => {
     });
 
     expect(result.passthrough).toBe(true);
+  });
+
+  it('applies workflow-scoped permission decisions before supervision', async () => {
+    const hookEvents: unknown[] = [];
+    eventBus.on('workflow:hook-fired', (data) => hookEvents.push(data));
+
+    workflowHookRegistry.register({
+      sessionId: 's1',
+      workflowRunId: 'run-1',
+      workflowNodeId: 'review',
+      hooks: {
+        PermissionRequest: {
+          tools: {
+            Bash: { behavior: 'deny', message: 'Bash is disabled for this workflow node' },
+          },
+          default: { behavior: 'allow' },
+        },
+      },
+    });
+
+    const result = await router.handleEvent({
+      hook_event_name: 'PermissionRequest',
+      session_id: 's1',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf /tmp/junk' },
+    });
+
+    expect(result).toEqual({
+      passthrough: false,
+      decision: { behavior: 'deny', message: 'Bash is disabled for this workflow node' },
+    });
+    expect(hookEvents).toHaveLength(1);
+    expect(hookEvents[0]).toMatchObject({
+      workflowRunId: 'run-1',
+      workflowNodeId: 'review',
+      sessionId: 's1',
+      kind: 'PermissionRequest',
+      response: {
+        passthrough: false,
+        decision: { behavior: 'deny' },
+      },
+    });
+  });
+
+  it('records workflow-scoped tool hooks without blocking the agent', async () => {
+    const hookEvents: unknown[] = [];
+    eventBus.on('workflow:hook-fired', (data) => hookEvents.push(data));
+
+    workflowHookRegistry.register({
+      sessionId: 's1',
+      workflowRunId: 'run-1',
+      workflowNodeId: 'review',
+      hooks: {
+        PreToolUse: {},
+        PostToolUse: {},
+        PostToolUseFailure: {},
+      },
+    });
+
+    const pre = await router.handleEvent({
+      hook_event_name: 'PreToolUse',
+      session_id: 's1',
+      tool_name: 'Read',
+      tool_input: { file_path: 'README.md' },
+    });
+    const post = await router.handleEvent({
+      hook_event_name: 'PostToolUse',
+      session_id: 's1',
+      tool_name: 'Read',
+      tool_response: 'ok',
+    });
+    const failed = await router.handleEvent({
+      hook_event_name: 'PostToolUseFailure',
+      session_id: 's1',
+      tool_name: 'Bash',
+      error: 'command not found',
+    });
+
+    expect(pre).toEqual({ passthrough: false });
+    expect(post).toEqual({ passthrough: false });
+    expect(failed).toEqual({ passthrough: false });
+    expect(hookEvents).toHaveLength(3);
+    expect(hookEvents[0]).toMatchObject({ kind: 'PreToolUse', workflowNodeId: 'review' });
+    expect(hookEvents[1]).toMatchObject({ kind: 'PostToolUse', workflowNodeId: 'review' });
+    expect(hookEvents[2]).toMatchObject({ kind: 'PostToolUseFailure', workflowNodeId: 'review' });
   });
 
   it('blocks and waits for response when supervised', async () => {

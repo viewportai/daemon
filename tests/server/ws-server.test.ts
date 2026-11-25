@@ -7,6 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { registerWsServer } from '../../src/server/ws-server.js';
 import { Daemon } from '../../src/core/daemon.js';
+import { RingBuffer } from '../../src/server/ring-buffer.js';
 
 /**
  * Buffered WebSocket wrapper — attaches message listener immediately on creation
@@ -162,6 +163,28 @@ describe('WebSocket Server', () => {
     const dirs = msg.directories as Array<Record<string, unknown>>;
     expect(dirs).toHaveLength(1);
     expect(dirs[0]!.path).toBe(path.resolve(testDir));
+
+    client.close();
+  });
+
+  it('returns a fresh sync snapshot on sync-request', async () => {
+    await daemon.directoryManager.register(testDir);
+
+    const client = await connect();
+    await client.nextMessage(); // compatibility hello
+
+    client.send(JSON.stringify({ type: 'sync-request', requestId: 'req-sync' }));
+    const snapshot = await client.nextMessage();
+    const ack = await client.nextMessage();
+
+    expect(snapshot.type).toBe('sync-snapshot');
+    const dirs = snapshot.directories as Array<Record<string, unknown>>;
+    expect(dirs.some((dir) => dir.path === path.resolve(testDir))).toBe(true);
+    expect(ack).toMatchObject({
+      type: 'ack',
+      requestId: 'req-sync',
+      status: 'ok',
+    });
 
     client.close();
   });
@@ -371,6 +394,110 @@ describe('WebSocket Server', () => {
     expect(ack.status).toBe('error');
     // The daemon throws ViewportError with SESSION_NOT_FOUND
     expect(ack.errorCode).toBe('SESSION_NOT_FOUND');
+
+    client.close();
+  });
+
+  it('reads discovered session messages over a real websocket round trip', async () => {
+    const directory = await daemon.directoryManager.register(testDir);
+    const buffer = new RingBuffer({ sessionId: 'ws-history-session' });
+    buffer.setDirectoryId(directory.id);
+    buffer.push('ws-history-session', {
+      updateType: 'user-message',
+      messageId: 'ws-history-user',
+      text: 'show websocket transcript',
+      timestamp: Date.now(),
+    });
+    buffer.push('ws-history-session', {
+      updateType: 'agent-message',
+      messageId: 'ws-history-agent',
+      text: 'websocket transcript response',
+      timestamp: Date.now() + 1,
+    });
+    await buffer.flushPersistence();
+
+    const client = await connect();
+    await client.nextMessage(); // hello
+
+    client.send(
+      JSON.stringify({
+        type: 'read-session-messages',
+        directoryId: directory.id,
+        sessionId: 'ws-history-session',
+        requestId: 'req-read-session',
+      }),
+    );
+
+    const ack = await client.nextMessage();
+    expect(ack).toMatchObject({
+      type: 'ack',
+      requestId: 'req-read-session',
+      status: 'ok',
+      truncated: false,
+      originalReturned: 2,
+      droppedCount: 0,
+    });
+    expect(
+      (ack.messages as Array<{ text?: string }>).map((message) => message.text).filter(Boolean),
+    ).toEqual(['show websocket transcript', 'websocket transcript response']);
+
+    client.close();
+  });
+
+  it('streams discovered session messages as a page event over a real websocket round trip', async () => {
+    const directory = await daemon.directoryManager.register(testDir);
+    const buffer = new RingBuffer({ sessionId: 'ws-stream-history-session' });
+    buffer.setDirectoryId(directory.id);
+    buffer.push('ws-stream-history-session', {
+      updateType: 'user-message',
+      messageId: 'ws-stream-user',
+      text: 'show streamed websocket transcript',
+      timestamp: Date.now(),
+    });
+    buffer.push('ws-stream-history-session', {
+      updateType: 'agent-message',
+      messageId: 'ws-stream-agent',
+      text: 'streamed websocket transcript response',
+      timestamp: Date.now() + 1,
+    });
+    await buffer.flushPersistence();
+
+    const client = await connect();
+    await client.nextMessage(); // hello
+
+    client.send(
+      JSON.stringify({
+        type: 'read-session-messages',
+        directoryId: directory.id,
+        sessionId: 'ws-stream-history-session',
+        requestId: 'req-stream-session',
+        delivery: 'event-stream',
+      }),
+    );
+
+    const ack = await client.nextMessage();
+    expect(ack).toMatchObject({
+      type: 'ack',
+      requestId: 'req-stream-session',
+      status: 'ok',
+      streamed: true,
+    });
+    expect(ack).not.toHaveProperty('messages');
+
+    const page = await client.nextMessage();
+    expect(page).toMatchObject({
+      type: 'session-messages-page',
+      requestId: 'req-stream-session',
+      directoryId: directory.id,
+      sessionId: 'ws-stream-history-session',
+      final: true,
+      truncated: false,
+      originalReturned: 2,
+      droppedCount: 0,
+    });
+    expect(
+      (page.messages as Array<{ text?: string }>).map((message) => message.text).filter(Boolean),
+    ).toEqual(['show streamed websocket transcript', 'streamed websocket transcript response']);
 
     client.close();
   });

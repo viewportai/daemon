@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { configDir } from '../core/config.js';
 import { getArgs } from './args.js';
 import { isJsonMode, printJson } from './command-shared.js';
 
@@ -27,6 +28,16 @@ interface ServiceSpec {
   cwd: string;
   pathEnv: string;
   displayName: string;
+}
+
+export function resolveServiceWorkingDirectory(): string {
+  return configDir();
+}
+
+export async function ensureServiceWorkingDirectory(): Promise<string> {
+  const cwd = resolveServiceWorkingDirectory();
+  await fs.mkdir(cwd, { recursive: true });
+  return cwd;
 }
 
 function supportedPlatform(): ServicePlatform | null {
@@ -66,7 +77,7 @@ function serviceSpec(): ServiceSpec {
   return {
     nodePath: process.execPath,
     daemonEntryPath: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../index.js'),
-    cwd: process.cwd(),
+    cwd: resolveServiceWorkingDirectory(),
     pathEnv: process.env['PATH'] ?? '',
     displayName: 'ViewportAI Daemon',
   };
@@ -160,9 +171,18 @@ export function resolveServiceSubcommand(args = getArgs()): ServiceSubcommand {
   throw new Error('Usage: vpd service <install|uninstall|status>');
 }
 
+function serviceUsage(): string {
+  return 'Usage: vpd service <install|uninstall|status>';
+}
+
+function showServiceHelp(): void {
+  console.log(serviceUsage());
+}
+
 async function installService(platform: ServicePlatform): Promise<Record<string, unknown>> {
   const files = serviceFiles(platform);
   const spec = serviceSpec();
+  await ensureServiceWorkingDirectory();
   const content =
     platform === 'darwin'
       ? renderLaunchdPlist(files.label, spec)
@@ -277,6 +297,15 @@ export async function userServiceStatus(): Promise<Record<string, unknown>> {
 }
 
 export async function service(): Promise<void> {
+  const args = getArgs();
+  if (
+    (args[0] === 'service' && !args[1]) ||
+    (args[0] === 'daemon' && args[1] === 'service' && !args[2])
+  ) {
+    showServiceHelp();
+    return;
+  }
+
   const asJson = isJsonMode();
   const platform = supportedPlatform();
   if (!platform) {

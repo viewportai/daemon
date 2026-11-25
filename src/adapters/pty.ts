@@ -10,9 +10,15 @@
 
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcess } from 'node:child_process';
-import type { AgentAdapter, Session, SessionOptions } from '../core/interfaces.js';
+import type {
+  AgentAdapter,
+  AgentAdapterDescriptor,
+  Session,
+  SessionOptions,
+} from '../core/interfaces.js';
 import type { SessionState } from '../core/types.js';
 import { metrics } from '../core/metrics.js';
+import { cleanChildProcessEnv } from '../security/child-env.js';
 
 // ---------------------------------------------------------------------------
 // PTY Session — wraps a child process as a Session
@@ -42,7 +48,7 @@ export class PtySession extends EventEmitter implements Session {
     this.process = spawn(command, args, {
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...env },
+      env: cleanChildProcessEnv(env),
       shell: false,
     });
 
@@ -207,6 +213,31 @@ export class PtyAdapter implements AgentAdapter {
     this.options = options ?? {};
   }
 
+  describe(): AgentAdapterDescriptor {
+    return {
+      schema: 'viewport.agent_adapter/v2',
+      agentId: this.agentId,
+      displayName: `Custom command (${this.agentId})`,
+      adapterVersion: 'pty',
+      capabilities: {
+        executionModes: {
+          plan: 'prompt_only',
+          read_only: 'unsupported',
+          review: 'prompt_only',
+          implement: 'prompt_only',
+        },
+        toolAllowlist: 'unsupported',
+        structuredOutput: 'prompt_only',
+        permissionHooks: 'unsupported',
+        usageReporting: 'unavailable',
+        costReporting: 'unavailable',
+        maxTurns: 'unsupported',
+        maxBudget: 'unsupported',
+        hardTimeout: 'hard',
+      },
+    };
+  }
+
   async startSession(cwd: string, options?: SessionOptions): Promise<Session> {
     const sessionId = crypto.randomUUID();
     const session = new PtySession(sessionId, this.options.maxOutputBufferBytes);
@@ -214,25 +245,26 @@ export class PtyAdapter implements AgentAdapter {
     const args = [...(this.options.defaultArgs ?? [])];
 
     // Add initial prompt based on mode
-    if (options?.initialPrompt) {
+    const initialPrompt = options?.deferInitialPrompt ? undefined : options?.initialPrompt;
+    if (initialPrompt) {
       const mode = this.options.promptMode ?? 'positional';
       if (mode === 'positional') {
-        args.push(options.initialPrompt);
+        args.push(initialPrompt);
       } else if (mode === 'stdin') {
         // Will be sent after process starts
       } else {
         // Flag mode: --flag "prompt"
-        args.push(mode, options.initialPrompt);
+        args.push(mode, initialPrompt);
       }
     }
 
     session.start(this.command, args, cwd, this.options.env);
 
     // For stdin mode, send prompt after process starts
-    if (this.options.promptMode === 'stdin' && options?.initialPrompt) {
+    if (this.options.promptMode === 'stdin' && initialPrompt) {
       // Small delay for the process to be ready
       setTimeout(() => {
-        session.sendPrompt(options.initialPrompt!).catch(() => {
+        session.sendPrompt(initialPrompt).catch(() => {
           // Process may have exited quickly
         });
       }, 100);
@@ -250,20 +282,21 @@ export class PtyAdapter implements AgentAdapter {
     const resumed = new PtySession(crypto.randomUUID(), this.options.maxOutputBufferBytes);
     const args = [...(this.options.defaultArgs ?? []), ...this.options.resumeArgs, sessionId];
 
-    if (options?.initialPrompt) {
+    const initialPrompt = options?.deferInitialPrompt ? undefined : options?.initialPrompt;
+    if (initialPrompt) {
       const mode = this.options.promptMode ?? 'positional';
       if (mode === 'positional') {
-        args.push(options.initialPrompt);
+        args.push(initialPrompt);
       } else if (mode !== 'stdin') {
-        args.push(mode, options.initialPrompt);
+        args.push(mode, initialPrompt);
       }
     }
 
     resumed.start(this.command, args, cwd, this.options.env);
 
-    if (this.options.promptMode === 'stdin' && options?.initialPrompt) {
+    if (this.options.promptMode === 'stdin' && initialPrompt) {
       setTimeout(() => {
-        resumed.sendPrompt(options.initialPrompt!).catch(() => {
+        resumed.sendPrompt(initialPrompt).catch(() => {
           // Process may have exited quickly
         });
       }, 100);

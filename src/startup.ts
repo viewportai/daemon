@@ -11,7 +11,6 @@ import Fastify from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import fastifyCors from '@fastify/cors';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs/promises';
 import { readFileSync, existsSync } from 'node:fs';
 import { logger } from './core/output.js';
@@ -20,6 +19,7 @@ import { GitTracker } from './tracking/git-tracker.js';
 import { registerHttpRoutes } from './server/http-server.js';
 import { registerWsServer } from './server/ws-server.js';
 import { HookRouter, SupervisionManager } from './hooks/index.js';
+import { PlatformPlanHookSync } from './hooks/platform-plan-sync.js';
 import { LocalAuthProvider } from './server/auth.js';
 import type { AuthProvider } from './server/auth.js';
 import type { GitTrackerConfig } from './core/types.js';
@@ -39,9 +39,11 @@ import {
   startSupervisorDetached,
   loadWorkerConfigFromEnv,
 } from './cli/supervisor.js';
+import { resolveLocalTlsState } from './cli/local-tls.js';
 import {
   WORKER_EXIT_RESTART,
   WORKER_EXIT_SHUTDOWN,
+  type RelayLaunchBinding,
   type RuntimeLaunchConfig,
 } from './cli/supervisor-protocol.js';
 import { buildSecurityProfile, isOriginAllowed } from './server/security.js';
@@ -52,7 +54,10 @@ import { maybeOfferAgentPrerequisites } from './startup-prereqs.js';
 import { setupSessionPersistence } from './startup-session-persistence.js';
 import { validateRelayRuntimeSecurity } from './startup-relay-security.js';
 import { DaemonRelayBridge } from './relay/daemon-relay-bridge.js';
+import { createOrgRoutingFilter } from './relay/bridge-org-routing-filter.js';
+import { createRelayMachineId } from './cli/relay-binding-config.js';
 import { configDir } from './core/config.js';
+import { activeProfileName } from './core/profiles.js';
 
 export { decodeAutoRegisterEntry };
 
@@ -76,46 +81,140 @@ async function readDaemonAuthToken(): Promise<string | null> {
   }
 }
 
-function localDaemonWsUrl(config: RuntimeLaunchConfig): string | null {
+export function localDaemonWsUrl(config: RuntimeLaunchConfig): string | null {
   if (config.socketPath) {
     // ws+unix is not currently supported by the ws client in this relay bridge.
     return null;
   }
   const tls = resolveTlsOptions();
   const host = config.host === '0.0.0.0' || config.host === '::' ? '127.0.0.1' : config.host;
-  return tls ? `wss://${tls.tlsHost}:${config.port}/ws` : `ws://${host}:${config.port}/ws`;
+  return tls ? `wss://127.0.0.1:${config.port}/ws` : `ws://${host}:${config.port}/ws`;
+}
+
+export function localDaemonBridgeTlsOptions(): {
+  daemonTlsVerify: '0';
+} | null {
+  const tls = resolveTlsOptions();
+  if (!tls) return null;
+  // The relay bridge is connecting back into the daemon's own local socket.
+  // Use loopback transport and disable PKI verification for this self-connection.
+  return {
+    daemonTlsVerify: '0',
+  };
+}
+
+export function missingRelayRuntimeConfig(config: RuntimeLaunchConfig): string[] {
+  const binding = relayRuntimeBindings(config)[0];
+  if (binding) {
+    return missingRelayBindingRuntimeConfig(config, binding);
+  }
+  const missing: string[] = [];
+  if (!config.relayEndpoint) missing.push('relay endpoint');
+  if (!config.relayServerUrl) missing.push('relay server URL');
+  if (!config.relayWorkspaceId) missing.push('relay workspace ID');
+  if (!config.relayIssueToken) {
+    missing.push('relay issue token');
+  }
+  if (!localDaemonWsUrl(config)) {
+    missing.push(
+      'tcp listen target (relay runtime currently requires tcp listen, not unix socket)',
+    );
+  }
+  return missing;
+}
+
+function relayRuntimeBindings(config: RuntimeLaunchConfig): RelayLaunchBinding[] {
+  if (config.relayBindings && config.relayBindings.length > 0) {
+    return config.relayBindings.filter((binding) => binding.enabled !== false);
+  }
+  if (
+    config.relayEndpoint ||
+    config.relayServerUrl ||
+    config.relayWorkspaceId ||
+    config.relayIssueToken
+  ) {
+    return [
+      {
+        enabled: true,
+        endpoint: config.relayEndpoint,
+        serverUrl: config.relayServerUrl,
+        workspaceId: config.relayWorkspaceId,
+        runtimeTargetId: config.relayRuntimeTargetId,
+        machineId: config.relayMachineId ?? createRelayMachineId(),
+        issueToken: config.relayIssueToken,
+        tlsVerify: config.relayTlsVerify,
+        caCertPath: config.relayCaCertPath,
+        tlsPins: config.relayTlsPins,
+        tokenIssuer: config.relayTokenIssuer,
+        tokenAudience: config.relayTokenAudience,
+        tokenJwksUrl: config.relayTokenJwksUrl,
+        tokenSigningKeys: config.relayTokenSigningKeys,
+        tokenClockSkewSec: config.relayTokenClockSkewSec,
+      },
+    ];
+  }
+  return [];
+}
+
+function runtimeConfigForRelayBinding(
+  config: RuntimeLaunchConfig,
+  binding: RelayLaunchBinding,
+): RuntimeLaunchConfig {
+  return {
+    ...config,
+    relayEndpoint: binding.endpoint,
+    relayServerUrl: binding.serverUrl,
+    relayWorkspaceId: binding.workspaceId,
+    relayRuntimeTargetId: binding.runtimeTargetId,
+    relayMachineId: binding.machineId,
+    relayIssueToken: binding.issueToken,
+    relayTlsVerify: binding.tlsVerify ?? config.relayTlsVerify,
+    relayCaCertPath: binding.caCertPath,
+    relayTlsPins: binding.tlsPins,
+    relayTokenIssuer: binding.tokenIssuer,
+    relayTokenAudience: binding.tokenAudience,
+    relayTokenJwksUrl: binding.tokenJwksUrl,
+    relayTokenSigningKeys: binding.tokenSigningKeys,
+    relayTokenClockSkewSec: binding.tokenClockSkewSec,
+  };
+}
+
+function missingRelayBindingRuntimeConfig(
+  config: RuntimeLaunchConfig,
+  binding: RelayLaunchBinding,
+): string[] {
+  const scoped = runtimeConfigForRelayBinding(config, binding);
+  const missing: string[] = [];
+  if (!scoped.relayEndpoint) missing.push('relay endpoint');
+  if (!scoped.relayServerUrl) missing.push('relay server URL');
+  if (!scoped.relayWorkspaceId) missing.push('relay workspace ID');
+  if (!scoped.relayIssueToken) missing.push('relay issue token');
+  if (!localDaemonWsUrl(scoped)) {
+    missing.push(
+      'tcp listen target (relay runtime currently requires tcp listen, not unix socket)',
+    );
+  }
+  return missing;
 }
 
 function resolveTlsOptions(): { cert: Buffer; key: Buffer; tlsHost: string } | null {
-  const tlsEnv = (process.env['VIEWPORT_TLS'] ?? 'auto').toLowerCase();
-  if (tlsEnv === '0' || tlsEnv === 'false' || tlsEnv === 'off') return null;
+  const tls = resolveLocalTlsState();
+  if (!tls.enabled) return null;
 
-  const tlsHost = process.env['VIEWPORT_TLS_HOST'] ?? 'getviewport.test';
-  const certDir = path.join(
-    os.homedir(),
-    'Library',
-    'Application Support',
-    'Herd',
-    'config',
-    'valet',
-    'Certificates',
-  );
-  const certPath = process.env['VIEWPORT_TLS_CERT'] ?? path.join(certDir, `${tlsHost}.crt`);
-  const keyPath = process.env['VIEWPORT_TLS_KEY'] ?? path.join(certDir, `${tlsHost}.key`);
-
-  if (tlsEnv === 'auto' && (!existsSync(certPath) || !existsSync(keyPath))) return null;
-  if (tlsEnv === '1' || tlsEnv === 'true' || tlsEnv === 'on') {
-    if (!existsSync(certPath) || !existsSync(keyPath)) {
+  if (!tls.certPath || !tls.keyPath || !existsSync(tls.certPath) || !existsSync(tls.keyPath)) {
+    const tlsEnv = (process.env['VIEWPORT_TLS'] ?? 'auto').toLowerCase();
+    if (tlsEnv === '1' || tlsEnv === 'true' || tlsEnv === 'on') {
       throw new Error(
-        `VIEWPORT_TLS enabled but certs not found (cert=${certPath}, key=${keyPath})`,
+        `VIEWPORT_TLS enabled but certs not found (cert=${tls.certPath}, key=${tls.keyPath})`,
       );
     }
+    return null;
   }
 
   return {
-    cert: readFileSync(certPath),
-    key: readFileSync(keyPath),
-    tlsHost,
+    cert: readFileSync(tls.certPath),
+    key: readFileSync(tls.keyPath),
+    tlsHost: tls.host,
   };
 }
 
@@ -136,8 +235,15 @@ export async function start(options?: { silent?: boolean; json?: boolean }): Pro
   const silent = options?.silent ?? false;
   const asJson = options?.json ?? hasFlag('json');
   const resolved = await resolveDaemonSettingsFromSources();
-  const config = resolved.launch;
+  await startWithLaunchConfig(resolved.launch, { silent, json: asJson });
+}
 
+export async function startWithLaunchConfig(
+  config: RuntimeLaunchConfig,
+  options?: { silent?: boolean; json?: boolean },
+): Promise<void> {
+  const silent = options?.silent ?? false;
+  const asJson = options?.json ?? hasFlag('json');
   await maybeOfferAgentPrerequisites({ silent, asJson });
 
   const existingRuntime = await readDaemonRuntimeState();
@@ -240,35 +346,35 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
   await daemon.initialize();
 
   const registry = await loadAgents(daemon);
-  await autoRegisterDirectories(daemon, registry);
-
-  try {
-    const models = await registry.fetchAllModels();
-    logger.log(`Models:  ${models.map((m) => m.displayName).join(', ') || 'none'}`);
-  } catch {
-    logger.log('Models:  fetch failed (will use fallback)');
+  daemon.setModelProvider(() => registry.fetchAllModels());
+  daemon.resumePendingWorkflowRuns();
+  const startupDiscoveryDisabled = isStartupDiscoveryDisabled();
+  if (startupDiscoveryDisabled) {
+    logger.log('Startup session discovery disabled by VIEWPORT_DISABLE_STARTUP_DISCOVERY.');
+  } else {
+    await autoRegisterDirectories(daemon, registry);
   }
-
-  await daemon.runDiscovery();
-  const discoveryWatches = await startDiscoveryWatchers(daemon, registry);
 
   daemon.setTrackerFactory(
     (trackerConfig: GitTrackerConfig, sessionId: string) =>
       new GitTracker(trackerConfig, sessionId),
   );
 
-  const sessionPersistence = await setupSessionPersistence(daemon);
-
   const tls = resolveTlsOptions();
 
-  // When TLS is enabled, automatically allow the TLS hostname + its subdomains
-  // so that app.getviewport.test can reach wss://getviewport.test:7070
+  // When TLS is enabled, automatically allow the configured TLS hostname and subdomains
+  // so browser clients can reach the local daemon over WSS.
   const tlsHostAllowance = tls ? `,${tls.tlsHost},.${tls.tlsHost}` : '';
+  const viewportWebOriginAllowance =
+    config.profile === 'local'
+      ? ',getviewport.com,.getviewport.com,getviewport.test,.getviewport.test'
+      : '';
   const securityProfile = buildSecurityProfile({
     profile: config.profile,
     host: config.host,
     allowedHostsRaw: (config.allowedHostsRaw ?? '') + tlsHostAllowance,
-    allowedOriginsRaw: (config.allowedOriginsRaw ?? '') + tlsHostAllowance,
+    allowedOriginsRaw:
+      (config.allowedOriginsRaw ?? '') + tlsHostAllowance + viewportWebOriginAllowance,
     explicitAuthFlag: config.authEnabled,
   });
 
@@ -278,14 +384,23 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
     const localAuth = new LocalAuthProvider();
     await localAuth.initialize();
     auth = localAuth;
-    logger.log(`Auth:    token-based (see ~/.viewport/auth-token)`);
+    logger.log(`Daemon HTTP auth: token-based (local API guarded by auth-token)`);
   } else {
-    logger.log(`Auth:    disabled (local mode)`);
+    logger.log(`Daemon HTTP auth: local profile (token auth not required on loopback)`);
   }
 
   // Hook system — enables remote supervision of terminal-started sessions
   const supervision = new SupervisionManager();
   const hookRouter = new HookRouter(daemon, supervision);
+  const platformPlanHookSync = new PlatformPlanHookSync(daemon);
+  daemon.on('hook:plan-proposed', (event) => {
+    void platformPlanHookSync.send(event).catch((error) => {
+      logger.warn(
+        '[hooks] failed to sync plan proposal:',
+        error instanceof Error ? error.message : String(error),
+      );
+    });
+  });
 
   if (tls) {
     logger.log(`TLS:     enabled (host=${tls.tlsHost})`);
@@ -313,7 +428,15 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
   let shutdownExitCode = 0;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | null = null;
-  let relayBridge: DaemonRelayBridge | null = null;
+  let relayBridges: DaemonRelayBridge[] = [];
+  let discoveryWatches: { stop: () => void } = { stop: () => undefined };
+  let sessionPersistence: {
+    flush: () => Promise<void>;
+    clearPersistedState: () => Promise<void>;
+  } = {
+    flush: async () => undefined,
+    clearPersistedState: async () => undefined,
+  };
 
   const shutdown = async (exitCode = 0) => {
     if (shuttingDown) return;
@@ -324,9 +447,9 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
     await sessionPersistence.flush();
     discoveryWatches.stop();
     hookRouter.shutdown();
-    if (relayBridge) {
-      await relayBridge.stop();
-      relayBridge = null;
+    if (relayBridges.length > 0) {
+      await Promise.all(relayBridges.map((bridge) => bridge.stop()));
+      relayBridges = [];
     }
     await daemon.shutdown();
     await sessionPersistence.clearPersistedState();
@@ -349,6 +472,7 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
       socketPath: config.socketPath,
       startedAt: runtimeStartedAt,
       version,
+      relayEnabled: config.relayEnabled,
     },
     onLifecycleShutdown: async () => {
       if (!shutdownPromise) {
@@ -362,6 +486,8 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
       }
       await shutdownPromise;
     },
+    getRelayStatus: () => relayBridges[0]?.getStatus() ?? null,
+    getRelayStatuses: () => relayBridges.map((bridge) => bridge.getStatus()),
   });
   registerWsServer(app, daemon, registry, { hookRouter, supervision, auth, securityProfile });
 
@@ -395,48 +521,103 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
   }
   logger.log(`  Agents:    ${registry.getIds().join(', ') || 'none'}`);
 
-  if (config.relayEnabled) {
-    validateRelayRuntimeSecurity(config);
-    const missing: string[] = [];
-    if (!config.relayEndpoint) missing.push('relay endpoint');
-    if (!config.relayServerUrl) missing.push('relay server URL');
-    if (!config.relayWorkspaceId) missing.push('relay workspace ID');
-    if (!config.relayEnrollToken) missing.push('relay enroll token');
-    const daemonWsUrl = localDaemonWsUrl(config);
-    if (!daemonWsUrl) {
-      missing.push(
-        'tcp listen target (relay runtime currently requires tcp listen, not unix socket)',
-      );
+  void (async () => {
+    if (!config.relayEnabled) {
+      return;
     }
 
-    if (missing.length > 0) {
-      logger.warn(`[relay] disabled due to incomplete config: ${missing.join(', ')}`);
-    } else {
-      const daemonToken = securityProfile.requireAuth ? await readDaemonAuthToken() : null;
-      relayBridge = new DaemonRelayBridge({
-        relayEndpoint: config.relayEndpoint!,
-        relayServerUrl: config.relayServerUrl!,
-        workspaceId: config.relayWorkspaceId!,
-        enrollToken: config.relayEnrollToken!,
-        issueToken: config.relayIssueToken,
-        daemonWsUrl: daemonWsUrl!,
-        daemonAuthToken: daemonToken ?? undefined,
-        relayTlsVerify: config.relayTlsVerify ?? 'auto',
-        relayCaCertPath: config.relayCaCertPath,
-        relayTlsPins: config.relayTlsPins,
-        relayTokenIssuer: config.relayTokenIssuer,
-        relayTokenAudience: config.relayTokenAudience,
-        relayTokenJwksUrl: config.relayTokenJwksUrl,
-        relayTokenSigningKeys: config.relayTokenSigningKeys,
-        relayTokenClockSkewSec: config.relayTokenClockSkewSec,
-        keyRotateAfterMessages: parsePositiveIntEnv('VIEWPORT_RELAY_KEY_ROTATE_AFTER_MESSAGES'),
-      });
-      await relayBridge.start();
-      logger.log(
-        `[relay] enabled (workspace=${config.relayWorkspaceId}, endpoint=${config.relayEndpoint})`,
-      );
+    const daemonWsUrl = localDaemonWsUrl(config);
+    const bindings = relayRuntimeBindings(config);
+
+    if (bindings.length === 0) {
+      logger.warn('[relay] disabled due to missing relay binding config');
+      return;
     }
-  }
+
+    const daemonToken = securityProfile.requireAuth ? await readDaemonAuthToken() : null;
+    const daemonProfileName = activeProfileName() ?? 'default';
+    const started: DaemonRelayBridge[] = [];
+    for (const binding of bindings) {
+      try {
+        const scopedConfig = runtimeConfigForRelayBinding(config, binding);
+        validateRelayRuntimeSecurity(scopedConfig);
+        const missing = missingRelayBindingRuntimeConfig(config, binding);
+        if (missing.length > 0) {
+          logger.warn(
+            `[relay] binding disabled due to incomplete config (workspace=${binding.workspaceId ?? '-'}): ${missing.join(', ')}`,
+          );
+          continue;
+        }
+
+        const orgRoutingFilter = createOrgRoutingFilter({
+          organizationId: scopedConfig.relayWorkspaceId!,
+          profileName: daemonProfileName,
+        });
+        const bridge = new DaemonRelayBridge({
+          relayEndpoint: scopedConfig.relayEndpoint!,
+          relayServerUrl: scopedConfig.relayServerUrl!,
+          workspaceId: scopedConfig.relayWorkspaceId!,
+          runtimeTargetId: scopedConfig.relayRuntimeTargetId,
+          machineId: scopedConfig.relayMachineId,
+          issueToken: scopedConfig.relayIssueToken,
+          daemonWsUrl: daemonWsUrl!,
+          daemonAuthToken: daemonToken ?? undefined,
+          ...localDaemonBridgeTlsOptions(),
+          relayTlsVerify: scopedConfig.relayTlsVerify ?? 'auto',
+          relayCaCertPath: scopedConfig.relayCaCertPath,
+          relayTlsPins: scopedConfig.relayTlsPins,
+          relayTokenIssuer: scopedConfig.relayTokenIssuer,
+          relayTokenAudience: scopedConfig.relayTokenAudience,
+          relayTokenJwksUrl: scopedConfig.relayTokenJwksUrl,
+          relayTokenSigningKeys: scopedConfig.relayTokenSigningKeys,
+          relayTokenClockSkewSec: scopedConfig.relayTokenClockSkewSec,
+          filterDaemonPayload: (payload) => orgRoutingFilter.filter(payload),
+          keyRotateAfterMessages: parsePositiveIntEnv('VIEWPORT_RELAY_KEY_ROTATE_AFTER_MESSAGES'),
+        });
+        await bridge.start();
+        started.push(bridge);
+        logger.log(
+          `[relay] enabled (workspace=${scopedConfig.relayWorkspaceId}, endpoint=${scopedConfig.relayEndpoint})`,
+        );
+      } catch (err) {
+        logger.warn(
+          `[relay] binding startup failed (workspace=${binding.workspaceId ?? '-'}):`,
+          err,
+        );
+      }
+    }
+    relayBridges = started;
+  })();
+
+  void (async () => {
+    try {
+      sessionPersistence = await setupSessionPersistence(daemon);
+    } catch (err) {
+      logger.warn('Session persistence startup failed:', err);
+    }
+
+    try {
+      const models = await registry.fetchAllModels();
+      logger.log(`Models:  ${models.map((m) => m.displayName).join(', ') || 'none'}`);
+    } catch {
+      logger.log('Models:  fetch failed (will use fallback)');
+    }
+
+    if (!startupDiscoveryDisabled) {
+      try {
+        await daemon.runDiscovery();
+        daemon.emit('discovery:updated', {});
+      } catch (err) {
+        logger.warn('Initial discovery failed:', err);
+      }
+
+      try {
+        discoveryWatches = await startDiscoveryWatchers(daemon, registry);
+      } catch (err) {
+        logger.warn('Discovery watcher startup failed:', err);
+      }
+    }
+  })();
 
   process.on('SIGINT', () => {
     if (!shutdownPromise) {
@@ -448,4 +629,12 @@ export async function runDaemonWorker(config: RuntimeLaunchConfig): Promise<void
       shutdownPromise = shutdown(0);
     }
   });
+}
+
+function isStartupDiscoveryDisabled(): boolean {
+  const raw =
+    process.env['VIEWPORT_DISABLE_STARTUP_DISCOVERY'] ??
+    process.env['VPD_DISABLE_STARTUP_DISCOVERY'];
+
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }

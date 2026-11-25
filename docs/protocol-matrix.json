@@ -7,7 +7,10 @@
       "schema": "src/server/ws-protocol.ts#LaunchSchema",
       "handler": "src/server/ws-command-handlers.ts#launch",
       "unitTests": ["tests/server/ws-protocol.test.ts", "tests/server/ws-command-handlers.test.ts"],
-      "integrationTests": ["tests/server/ws-server.test.ts", "tests/e2e/protocol-session-lifecycle.test.ts"],
+      "integrationTests": [
+        "tests/server/ws-server.test.ts",
+        "tests/e2e/protocol-session-lifecycle.test.ts"
+      ],
       "surfacedInUi": true,
       "surfacedInCli": true
     },
@@ -17,7 +20,10 @@
       "schema": "src/server/ws-protocol.ts#KillSchema",
       "handler": "src/server/ws-command-handlers.ts#kill",
       "unitTests": ["tests/server/ws-protocol.test.ts"],
-      "integrationTests": ["tests/server/ws-server.test.ts", "tests/e2e/protocol-session-lifecycle.test.ts"],
+      "integrationTests": [
+        "tests/server/ws-server.test.ts",
+        "tests/e2e/protocol-session-lifecycle.test.ts"
+      ],
       "surfacedInUi": true,
       "surfacedInCli": false
     },
@@ -27,7 +33,10 @@
       "schema": "src/server/ws-protocol.ts#PromptSchema",
       "handler": "src/server/ws-command-handlers.ts#prompt",
       "unitTests": ["tests/server/ws-protocol.test.ts", "tests/server/ws-command-handlers.test.ts"],
-      "integrationTests": ["tests/server/ws-server.test.ts", "tests/e2e/protocol-session-lifecycle.test.ts"],
+      "integrationTests": [
+        "tests/server/ws-server.test.ts",
+        "tests/e2e/protocol-session-lifecycle.test.ts"
+      ],
       "surfacedInUi": true,
       "surfacedInCli": true
     },
@@ -37,7 +46,10 @@
       "schema": "src/server/ws-protocol.ts#RespondPermissionSchema",
       "handler": "src/server/ws-command-handlers.ts#respond-permission",
       "unitTests": ["tests/server/ws-protocol.test.ts"],
-      "integrationTests": ["tests/server/ws-server.test.ts", "tests/e2e/protocol-session-lifecycle.test.ts"],
+      "integrationTests": [
+        "tests/server/ws-server.test.ts",
+        "tests/e2e/protocol-session-lifecycle.test.ts"
+      ],
       "surfacedInUi": true,
       "surfacedInCli": true
     },
@@ -95,9 +107,61 @@
       "type": "list-sessions",
       "class": "stable",
       "schema": "src/server/ws-protocol.ts#ListSessionsSchema",
-      "handler": "src/server/ws-command-handlers.ts#list-sessions",
+      "handler": "src/server/ws-session-command-handlers.ts#list-sessions",
       "unitTests": ["tests/server/ws-protocol.test.ts", "tests/server/ws-command-handlers.test.ts"],
       "integrationTests": ["tests/server/ws-server.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "read-session-messages",
+      "class": "stable",
+      "schema": "src/server/ws-protocol.ts#ReadSessionMessagesSchema",
+      "handler": "src/server/ws-session-command-handlers.ts#read-session-messages",
+      "unitTests": ["tests/server/ws-protocol.test.ts", "tests/server/ws-command-handlers.test.ts"],
+      "integrationTests": ["tests/server/ws-server.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "context-candidate-preview",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#ContextCandidatePreviewSchema",
+      "handler": "src/server/ws-command-handlers.ts#context-candidate-preview",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-context-preview-command.test.ts",
+        "tests/server/rate-limiter.test.ts"
+      ],
+      "integrationTests": ["tests/server/ws-context-preview-command.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "context-resolve",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#ContextResolveSchema",
+      "handler": "src/server/ws-command-handlers.ts#context-resolve",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-context-preview-command.test.ts",
+        "tests/server/rate-limiter.test.ts"
+      ],
+      "integrationTests": ["tests/server/ws-context-preview-command.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "context-propose",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#ContextProposeSchema",
+      "handler": "src/server/ws-command-handlers.ts#context-propose",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-context-preview-command.test.ts",
+        "tests/server/rate-limiter.test.ts"
+      ],
+      "integrationTests": ["tests/server/ws-context-preview-command.test.ts"],
       "surfacedInUi": true,
       "surfacedInCli": false
     },
@@ -105,19 +169,103 @@
       "type": "resume",
       "class": "stable",
       "schema": "src/server/ws-protocol.ts#ResumeSchema",
-      "handler": "src/server/ws-command-handlers.ts#resume",
+      "handler": "src/server/ws-session-command-handlers.ts#resume",
       "unitTests": ["tests/server/ws-protocol.test.ts", "tests/server/ws-command-handlers.test.ts"],
-      "integrationTests": ["tests/server/ws-server.test.ts", "tests/e2e/protocol-session-lifecycle.test.ts"],
+      "integrationTests": [
+        "tests/server/ws-server.test.ts",
+        "tests/e2e/protocol-session-lifecycle.test.ts"
+      ],
       "surfacedInUi": true,
       "surfacedInCli": false
+    },
+    {
+      "type": "sync-request",
+      "class": "stable",
+      "schema": "src/server/ws-protocol.ts#SyncRequestSchema",
+      "handler": "src/server/ws-command-handlers.ts#sync-request",
+      "unitTests": ["tests/server/ws-protocol.test.ts", "tests/server/ws-command-handlers.test.ts"],
+      "integrationTests": [
+        "tests/server/ws-server.test.ts",
+        "tests/e2e/protocol-session-lifecycle.test.ts"
+      ],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "workflow-run",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#WorkflowRunSchema",
+      "handler": "src/server/ws-workflow-command-handlers.ts#workflow-run",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-workflow-command-handlers.test.ts"
+      ],
+      "integrationTests": ["tests/e2e/protocol-workflow-run.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": true
+    },
+    {
+      "type": "workflow-list-runs",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#WorkflowListRunsSchema",
+      "handler": "src/server/ws-workflow-command-handlers.ts#workflow-list-runs",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-workflow-command-handlers.test.ts"
+      ],
+      "integrationTests": ["tests/e2e/protocol-workflow-run.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": true
+    },
+    {
+      "type": "workflow-show-run",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#WorkflowShowRunSchema",
+      "handler": "src/server/ws-workflow-command-handlers.ts#workflow-show-run",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-workflow-command-handlers.test.ts"
+      ],
+      "integrationTests": ["tests/e2e/protocol-workflow-run.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": true
+    },
+    {
+      "type": "workflow-approve",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#WorkflowApproveRunSchema",
+      "handler": "src/server/ws-workflow-command-handlers.ts#workflow-approve",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-workflow-command-handlers.test.ts"
+      ],
+      "integrationTests": ["tests/e2e/protocol-workflow-run.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": true
+    },
+    {
+      "type": "workflow-cancel",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#WorkflowCancelRunSchema",
+      "handler": "src/server/ws-workflow-command-handlers.ts#workflow-cancel",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-workflow-command-handlers.test.ts"
+      ],
+      "integrationTests": ["tests/e2e/protocol-workflow-run.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": true
     },
     {
       "type": "watch-discovered-session",
       "class": "stable",
       "schema": "src/server/ws-protocol.ts#WatchDiscoveredSessionSchema",
-      "handler": "src/server/ws-command-handlers.ts#watch-discovered-session",
+      "handler": "src/server/ws-session-command-handlers.ts#watch-discovered-session",
       "unitTests": ["tests/server/ws-protocol.test.ts", "tests/server/ws-command-handlers.test.ts"],
-      "integrationTests": ["tests/server/ws-server.test.ts", "tests/e2e/protocol-discovery-hooks.test.ts"],
+      "integrationTests": [
+        "tests/server/ws-server.test.ts",
+        "tests/e2e/protocol-discovery-hooks.test.ts"
+      ],
       "surfacedInUi": true,
       "surfacedInCli": false
     },
@@ -125,9 +273,12 @@
       "type": "unwatch-discovered-session",
       "class": "stable",
       "schema": "src/server/ws-protocol.ts#UnwatchDiscoveredSessionSchema",
-      "handler": "src/server/ws-command-handlers.ts#unwatch-discovered-session",
+      "handler": "src/server/ws-session-command-handlers.ts#unwatch-discovered-session",
       "unitTests": ["tests/server/ws-protocol.test.ts", "tests/server/ws-command-handlers.test.ts"],
-      "integrationTests": ["tests/server/ws-server.test.ts", "tests/e2e/protocol-discovery-hooks.test.ts"],
+      "integrationTests": [
+        "tests/server/ws-server.test.ts",
+        "tests/e2e/protocol-discovery-hooks.test.ts"
+      ],
       "surfacedInUi": true,
       "surfacedInCli": false
     },
@@ -148,6 +299,75 @@
       "handler": "src/server/ws-command-handlers.ts#respond-hook-permission",
       "unitTests": ["tests/server/ws-protocol.test.ts"],
       "integrationTests": ["tests/e2e/protocol-discovery-hooks.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "trusted-edge-plan-decrypt",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#TrustedEdgePlanDecryptSchema",
+      "handler": "src/server/ws-command-handlers.ts#trusted-edge-plan-decrypt",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-plan-decrypt-command.test.ts",
+        "tests/server/rate-limiter.test.ts"
+      ],
+      "integrationTests": ["tests/server/ws-plan-decrypt-command.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "trusted-edge-plan-decrypt-field",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#TrustedEdgePlanDecryptFieldSchema",
+      "handler": "src/server/ws-command-handlers.ts#trusted-edge-plan-decrypt-field",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-plan-decrypt-command.test.ts",
+        "tests/server/rate-limiter.test.ts"
+      ],
+      "integrationTests": ["tests/server/ws-plan-decrypt-command.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "trusted-edge-plan-encrypt-field",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#TrustedEdgePlanEncryptFieldSchema",
+      "handler": "src/server/ws-command-handlers.ts#trusted-edge-plan-encrypt-field",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-plan-decrypt-command.test.ts",
+        "tests/server/rate-limiter.test.ts"
+      ],
+      "integrationTests": ["tests/server/ws-plan-decrypt-command.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "trusted-edge-plan-wrap-key",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#TrustedEdgePlanWrapKeySchema",
+      "handler": "src/server/ws-command-handlers.ts#trusted-edge-plan-wrap-key",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-plan-decrypt-command.test.ts",
+        "tests/server/rate-limiter.test.ts"
+      ],
+      "integrationTests": ["tests/server/ws-plan-decrypt-command.test.ts"],
+      "surfacedInUi": true,
+      "surfacedInCli": false
+    },
+    {
+      "type": "trusted-edge-team-epoch-publish",
+      "class": "experimental",
+      "schema": "src/server/ws-protocol.ts#TrustedEdgeTeamEpochPublishSchema",
+      "handler": "src/server/ws-command-handlers.ts#trusted-edge-team-epoch-publish",
+      "unitTests": [
+        "tests/server/ws-protocol.test.ts",
+        "tests/server/ws-plan-decrypt-command.test.ts"
+      ],
+      "integrationTests": ["tests/server/ws-plan-decrypt-command.test.ts"],
       "surfacedInUi": true,
       "surfacedInCli": false
     }

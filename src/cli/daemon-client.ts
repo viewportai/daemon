@@ -6,9 +6,11 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { configDir } from '../core/config.js';
-import { getFlag, getDaemonPort } from './args.js';
+import { getFlag, getDaemonPort, hasFlag } from './args.js';
 import { readDaemonRuntimeState } from './daemon-lifecycle.js';
 import { parseListenTarget } from './listen-target.js';
+import { parseCsvList, parseTlsVerifyMode, transportFetch } from './network.js';
+import { resolveLocalTlsState } from './local-tls.js';
 
 export interface DaemonDirectoryInfo {
   id: string;
@@ -60,7 +62,27 @@ async function readAuthToken(): Promise<string | null> {
   return cachedAuthToken;
 }
 
+function resolveTlsPreferenceFromStateOrEnv(
+  state?: {
+    tlsEnabled?: boolean;
+    tlsHost?: string;
+  } | null,
+): { enabled: boolean; host: string } {
+  if (typeof state?.tlsEnabled === 'boolean') {
+    return {
+      enabled: state.tlsEnabled,
+      host: state.tlsHost?.trim() || process.env['VIEWPORT_TLS_HOST'] || 'localhost',
+    };
+  }
+  const tls = resolveLocalTlsState();
+  return { enabled: tls.enabled, host: tls.host };
+}
+
 function resolveEndpointFromFlags(): DaemonEndpoint {
+  const tlsInfo = resolveTlsPreferenceFromStateOrEnv(null);
+  const httpScheme = tlsInfo.enabled ? 'https' : 'http';
+  const wsScheme = tlsInfo.enabled ? 'wss' : 'ws';
+
   const listenFlag = getFlag('listen');
   if (listenFlag) {
     const parsed = parseListenTarget(listenFlag);
@@ -72,30 +94,73 @@ function resolveEndpointFromFlags(): DaemonEndpoint {
         wsUrl: `ws+unix://${parsed.path}:/ws`,
       };
     }
+    const host = tlsInfo.enabled ? tlsInfo.host : resolveClientHost(parsed.host);
     return {
       type: 'tcp',
-      host: resolveClientHost(parsed.host),
+      host,
       port: parsed.port,
-      baseUrl: `http://${resolveClientHost(parsed.host)}:${parsed.port}`,
-      wsUrl: `ws://${resolveClientHost(parsed.host)}:${parsed.port}/ws`,
+      baseUrl: `${httpScheme}://${host}:${parsed.port}`,
+      wsUrl: `${wsScheme}://${host}:${parsed.port}/ws`,
     };
   }
 
-  const host = getFlag('host') ?? '127.0.0.1';
+  const host = tlsInfo.enabled ? tlsInfo.host : resolveClientHost(getFlag('host') ?? '127.0.0.1');
   const port = getDaemonPort();
-  const resolvedHost = resolveClientHost(host);
   return {
     type: 'tcp',
-    host: resolvedHost,
+    host,
     port,
-    baseUrl: `http://${resolvedHost}:${port}`,
-    wsUrl: `ws://${resolvedHost}:${port}/ws`,
+    baseUrl: `${httpScheme}://${host}:${port}`,
+    wsUrl: `${wsScheme}://${host}:${port}/ws`,
+  };
+}
+
+function hasExplicitDaemonEndpointFlag(): boolean {
+  return hasFlag('listen') || hasFlag('host') || hasFlag('port');
+}
+
+export function daemonEndpointLabel(endpoint: DaemonEndpoint): string {
+  if (endpoint.type === 'socket') {
+    return `unix://${endpoint.socketPath}`;
+  }
+
+  return endpoint.baseUrl;
+}
+
+function resolveDaemonTransportOptions(endpoint: DaemonEndpoint): {
+  tlsVerify?: 'auto' | '0' | '1';
+  caCertPath?: string;
+  tlsPins?: string[];
+} {
+  if (endpoint.type !== 'tcp' || !endpoint.baseUrl.startsWith('https://')) {
+    return {};
+  }
+
+  return {
+    tlsVerify:
+      parseTlsVerifyMode(process.env['VPD_DAEMON_TLS_VERIFY']) ??
+      parseTlsVerifyMode(process.env['VIEWPORT_DAEMON_TLS_VERIFY']) ??
+      'auto',
+    caCertPath:
+      process.env['VPD_DAEMON_CA_CERT'] ??
+      process.env['VIEWPORT_DAEMON_CA_CERT'] ??
+      process.env['VIEWPORT_TLS_CERT'],
+    tlsPins:
+      parseCsvList(process.env['VPD_DAEMON_TLS_PINS']) ??
+      parseCsvList(process.env['VIEWPORT_DAEMON_TLS_PINS']),
   };
 }
 
 export async function resolveDaemonEndpoint(): Promise<DaemonEndpoint> {
+  if (hasExplicitDaemonEndpointFlag()) {
+    return resolveEndpointFromFlags();
+  }
+
   const state = await readDaemonRuntimeState();
   if (state) {
+    const tlsInfo = resolveTlsPreferenceFromStateOrEnv(state);
+    const httpScheme = tlsInfo.enabled ? 'https' : 'http';
+    const wsScheme = tlsInfo.enabled ? 'wss' : 'ws';
     if (state.socketPath) {
       return {
         type: 'socket',
@@ -104,13 +169,15 @@ export async function resolveDaemonEndpoint(): Promise<DaemonEndpoint> {
         wsUrl: `ws+unix://${state.socketPath}:/ws`,
       };
     }
-    const resolvedHost = resolveClientHost(state.host);
+    // When TLS is enabled, prefer the configured TLS hostname instead of the
+    // bound listen host so local certs can terminate correctly.
+    const host = tlsInfo.enabled ? tlsInfo.host : resolveClientHost(state.host);
     return {
       type: 'tcp',
-      host: resolvedHost,
+      host,
       port: state.port,
-      baseUrl: `http://${resolvedHost}:${state.port}`,
-      wsUrl: `ws://${resolvedHost}:${state.port}/ws`,
+      baseUrl: `${httpScheme}://${host}:${state.port}`,
+      wsUrl: `${wsScheme}://${host}:${state.port}/ws`,
     };
   }
 
@@ -199,10 +266,10 @@ export async function daemonFetch(
       headers.set('Authorization', `Bearer ${token}`);
     }
 
-    return await fetch(`${endpoint.baseUrl}${urlPath}`, {
+    return await transportFetch(`${endpoint.baseUrl}${urlPath}`, {
       ...options,
       headers,
-      signal: options.signal ?? AbortSignal.timeout(options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS),
+      ...resolveDaemonTransportOptions(endpoint),
     });
   } catch {
     return null;

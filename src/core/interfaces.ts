@@ -11,6 +11,7 @@ import type {
   SessionState,
   SessionMessage,
   SessionConfig,
+  SessionExecutionMode,
   Step,
   PermissionDecision,
   GitTrackerConfig,
@@ -24,6 +25,16 @@ export interface AgentAdapter {
   /** Unique identifier for this agent (e.g. 'claude', 'codex'). */
   readonly agentId: string;
 
+  /** Describe the adapter's workflow-relevant capability and accounting contract. */
+  describe(): AgentAdapterDescriptor;
+
+  /**
+   * Transactional workflow-agent entrypoint. Existing adapters may bridge this
+   * through session streams during migration, but durable workflow accounting
+   * must normalize into AgentRunResult.
+   */
+  runAgentTurn?(request: AgentRunRequest): Promise<AgentRunResult>;
+
   /** Start a new agent session in the given working directory. */
   startSession(cwd: string, options?: SessionOptions): Promise<Session>;
 
@@ -34,12 +45,145 @@ export interface AgentAdapter {
 export interface SessionOptions {
   /** Initial prompt to send to the agent. */
   initialPrompt?: string;
+  /**
+   * Internal daemon option: create the session without dispatching the initial
+   * prompt so SessionManager can wire lifecycle/message listeners first.
+   */
+  deferInitialPrompt?: boolean;
   /** Model override (e.g. 'claude-sonnet-4-6'). */
   model?: string;
+  /** Agent-specific reasoning/effort hint translated by adapters that support it. */
+  effort?: 'low' | 'medium' | 'high' | 'xhigh';
+  /**
+   * Exact tool allowlist for this session. An empty array means the adapter
+   * should run the agent without tools when the provider supports it.
+   */
+  allowedTools?: string[];
   /** Permission handler — called before each tool execution. */
   canUseTool?: PermissionHandler;
   /** Resolved config for this session. */
   config?: SessionConfig;
+}
+
+export type AgentCapabilitySupport = 'hard' | 'provider' | 'prompt_only' | 'unsupported';
+export type AgentReportingSupport = 'reported' | 'estimated' | 'unavailable';
+
+export interface AgentAdapterDescriptor {
+  schema: 'viewport.agent_adapter/v2';
+  agentId: string;
+  displayName: string;
+  adapterVersion: string;
+  capabilities: {
+    executionModes: Record<SessionExecutionMode, AgentCapabilitySupport>;
+    toolAllowlist: AgentCapabilitySupport;
+    structuredOutput: AgentCapabilitySupport;
+    permissionHooks: AgentCapabilitySupport;
+    usageReporting: AgentReportingSupport;
+    costReporting: AgentReportingSupport;
+    maxTurns: AgentCapabilitySupport;
+    maxBudget: AgentCapabilitySupport;
+    hardTimeout: AgentCapabilitySupport;
+  };
+}
+
+export type AgentRunStopReason =
+  | 'completed'
+  | 'idle'
+  | 'max_turns'
+  | 'budget_exceeded'
+  | 'timeout'
+  | 'tool_denied'
+  | 'canceled'
+  | 'error'
+  | 'unknown';
+
+export interface AgentRunUsage {
+  available: boolean;
+  inputTokens?: number;
+  inputTokenScope?: 'billable' | 'raw_provider';
+  outputTokens?: number;
+  totalTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  billableInputTokens?: number;
+  budgetedTotalTokens?: number;
+  totalCostUsd?: number;
+  estimated?: boolean;
+  reason?: 'adapter_no_usage' | 'provider_no_cost' | 'stream_missing_final_usage';
+  modelUsage?: Record<
+    string,
+    {
+      inputTokens: number;
+      outputTokens: number;
+      costUsd: number;
+      cacheReadInputTokens?: number;
+      cacheCreationInputTokens?: number;
+    }
+  >;
+  durationMs?: number;
+  numTurns?: number;
+}
+
+export interface AgentRunToolCall {
+  id: string;
+  name: string;
+  status: 'in_progress' | 'completed' | 'error' | 'denied';
+  title?: string;
+  startedAt?: number;
+  completedAt?: number;
+  inputDigest?: string;
+}
+
+export interface AgentRunEnforcement {
+  executionMode: SessionExecutionMode;
+  planMode: AgentCapabilitySupport;
+  readOnlyMode: AgentCapabilitySupport;
+  toolAllowlist: AgentCapabilitySupport;
+  structuredOutput: AgentCapabilitySupport;
+  sandbox: AgentCapabilitySupport;
+}
+
+export interface AgentRunRequest {
+  prompt: string;
+  cwd: string;
+  agentId: string;
+  model?: string;
+  effort?: 'low' | 'medium' | 'high' | 'xhigh';
+  executionMode: SessionExecutionMode;
+  allowedTools?: string[];
+  timeoutMs?: number;
+  budget?: {
+    maxCostUsd?: number;
+    maxInputTokens?: number;
+    maxOutputTokens?: number;
+    maxTurns?: number;
+  };
+  onEvent?: (event: AgentRunEvent) => void;
+}
+
+export type AgentRunEvent =
+  | { type: 'started'; timestamp: number }
+  | { type: 'text_delta'; text: string; timestamp: number }
+  | { type: 'tool_call'; toolCall: AgentRunToolCall; timestamp: number }
+  | { type: 'usage_delta'; usage: AgentRunUsage; timestamp: number }
+  | { type: 'completed'; result: AgentRunResult; timestamp: number }
+  | { type: 'failed'; error: string; timestamp: number };
+
+export interface AgentRunResult {
+  schema: 'viewport.agent_run_result/v1';
+  agentId: string;
+  adapterVersion: string;
+  model?: string;
+  executionMode: SessionExecutionMode;
+  enforcement: AgentRunEnforcement;
+  output: string;
+  usage: AgentRunUsage;
+  toolCalls: AgentRunToolCall[];
+  permissionDenials: Array<{ toolName: string; reason: string; timestamp: number }>;
+  stopReason: AgentRunStopReason;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
 }
 
 /**
@@ -149,6 +293,23 @@ export interface SessionDiscovery {
   discoverSessions(projectPath: string): Promise<DiscoveredSession[]>;
 }
 
+export interface SessionInteractionCapabilities {
+  /** Transcript/history can be read from the owning machine. */
+  readTranscript: boolean;
+  /** Transcript tail updates can be streamed while the source file changes. */
+  tailTranscript: boolean;
+  /** The provider can resume this session by id. */
+  resume: boolean;
+  /** The daemon can send a new prompt to the running session. */
+  sendPrompt: boolean;
+  /** The daemon can interrupt the running session. */
+  interrupt: boolean;
+  /** Pending permission requests can be answered through Viewport. */
+  respondToPermissions: boolean;
+  /** Resume accepts a model override. */
+  modelOverride: boolean;
+}
+
 export interface DiscoveredSession {
   /** Source agent that owns this session (e.g. 'claude', 'codex', 'gemini'). */
   agentId: string;
@@ -156,6 +317,26 @@ export interface DiscoveredSession {
   sessionId: string;
   /** First user prompt or summary. */
   summary: string;
+  /** Provider-native user-facing title, when the agent stores one. */
+  nativeTitle?: string;
+  /** Viewport-generated fallback title, when no provider-native title exists. */
+  generatedTitle?: string;
+  /** Title the UI should render. */
+  displayTitle?: string;
+  /** Where displayTitle came from. */
+  titleSource?: 'native' | 'generated' | 'first_prompt' | 'fallback';
+  /** First meaningful user prompt, excluding injected environment/context metadata. */
+  firstPrompt?: string;
+  /** Last meaningful user prompt, excluding injected environment/context metadata. */
+  lastPrompt?: string;
+  /** Latest known provider/model label. */
+  latestModel?: string;
+  /** Latest known provider approval policy. */
+  approvalPolicy?: string;
+  /** Latest known sandbox mode. */
+  sandboxMode?: string;
+  /** Latest known reasoning effort or thinking mode. */
+  reasoningEffort?: string;
   /** Last modified timestamp (ms since epoch). */
   lastModified: number;
   /** Working directory for the session. */
@@ -164,8 +345,20 @@ export interface DiscoveredSession {
   gitBranch?: string;
   /** Whether this session can be resumed. */
   resumable: boolean;
+  /** Explicit interaction capabilities for this session. */
+  capabilities?: SessionInteractionCapabilities;
   /** Number of messages in the session. */
   messageCount?: number;
   /** Optional source file backing this discovered session. */
   sourcePath?: string;
+  /** Workflow run that spawned this session, when it came from a workflow node. */
+  workflowRunId?: string;
+  /** Workflow node that spawned this session, when it came from a workflow node. */
+  workflowNodeId?: string;
+  /** Original registered directory that launched a worktree-backed workflow session. */
+  parentDirectoryId?: string;
+  /** Original registered directory path that launched a worktree-backed workflow session. */
+  parentDirectoryPath?: string;
+  /** Working tree path used by the spawned session, when different from the parent directory. */
+  worktreePath?: string;
 }

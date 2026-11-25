@@ -1,16 +1,64 @@
 import type { Daemon } from '../core/daemon.js';
+import type { AgentRegistry } from '../core/agent-registry.js';
 import type { HookRouter } from '../hooks/router.js';
 import type { SupervisionManager } from '../hooks/supervision.js';
-import type { ConnectedClient } from './hello-builder.js';
+import { sendSyncSnapshot, type ConnectedClient } from './hello-builder.js';
 import type { RingBuffer } from './ring-buffer.js';
 import type { IncomingMessage } from './ws-protocol.js';
-import { discoveredWatchKey, removeDiscoveredWatch } from './discovered-watch-key.js';
 import { ErrorCodes } from '../core/error-codes.js';
+import { createWsWorkflowCommandHandlers } from './ws-workflow-command-handlers.js';
+import { createWsSessionCommandHandlers } from './ws-session-command-handlers.js';
+import { previewContextCandidateForTrustedEdge } from './context-preview-service.js';
+import { resolveContextBundle } from '../context/local-edge-store.js';
+import { proposeContextEntry } from '../context/local-edge-candidates.js';
+import { refreshContextFromSavedTarget } from '../context/local-edge-auto-sync.js';
+import { pushContextEvents } from '../context/local-edge-sync.js';
+import { ConfigManager } from '../core/config.js';
+import {
+  resolveConfiguredContextSyncTarget,
+  resolveConfiguredWorkspaceSyncTarget,
+} from '../cli/context-sync-target.js';
+import {
+  ensureTeamCryptoEpoch,
+  processPendingCryptoRotationRequests,
+} from '../security/epoch-sync.js';
+import { grantTeamEpochToWorkspaceUserEpochs } from '../security/team-epoch-grants.js';
+import type { LocalTeamCryptoEpoch } from '../security/epoch-store.js';
+import {
+  decryptTrustedEdgePlanBody,
+  decryptTrustedEdgePlanFeedbackField,
+  encryptTrustedEdgePlanFeedbackField,
+  type TrustedEdgePlanAnyBodyKeyGrant,
+  type TrustedEdgePlanGrantRecipient,
+  wrapTrustedEdgePlanBodyKey,
+} from '../hooks/trusted-edge-plan-artifacts.js';
+import {
+  resolveSessionResourceManifestSync,
+  type SessionResourceManifest,
+} from '../config-resolution/index.js';
+import { verifyTrustedEdgeCommandCapability } from './trusted-edge-command-capability.js';
 
 const MAX_CLIENT_SUBSCRIPTIONS = 1024;
-const MAX_CLIENT_DISCOVERED_WATCHES = 2048;
 
-function addBoundedSetEntry(set: Set<string>, value: string, maxEntries: number): void {
+function publicTeamEpoch(epoch: LocalTeamCryptoEpoch): Record<string, unknown> {
+  return {
+    workspaceId: epoch.workspaceId,
+    teamId: epoch.teamId,
+    platformTeamId: epoch.platformTeamId ?? null,
+    platformEpochId: epoch.platformEpochId ?? null,
+    epoch: epoch.epoch,
+    schema: epoch.schema,
+    status: epoch.status,
+    encryptionPublicKeyJwk: epoch.encryptionPublicKeyJwk,
+    signingPublicKeyJwk: epoch.signingPublicKeyJwk,
+    fingerprint: epoch.fingerprint,
+    previousEpochFingerprint: epoch.previousEpochFingerprint ?? null,
+    createdAt: epoch.createdAt,
+    updatedAt: epoch.updatedAt,
+  };
+}
+
+export function addBoundedSetEntry(set: Set<string>, value: string, maxEntries: number): void {
   if (set.has(value)) return;
   while (set.size >= maxEntries) {
     const oldest = set.values().next();
@@ -34,6 +82,7 @@ export interface AckSender {
 
 interface HandlerContext {
   daemon: Daemon;
+  registry?: AgentRegistry;
   hookRouter?: HookRouter;
   supervision?: SupervisionManager;
   sendAck: AckSender;
@@ -48,7 +97,7 @@ type HandlerMap = {
 };
 
 export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
-  const { daemon, hookRouter, supervision, sendAck, getOrCreateBuffer } = ctx;
+  const { daemon, registry, hookRouter, supervision, sendAck, getOrCreateBuffer } = ctx;
 
   function sendBufferedReplay(client: ConnectedClient, sessionId: string): void {
     const replay = getOrCreateBuffer(sessionId).getAll();
@@ -66,19 +115,18 @@ export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
 
   return {
     launch: async (client, msg) => {
+      const resourceId = msg.resourceId;
       const overrides = {
         ...msg.configOverrides,
         ...(msg.model ? { model: msg.model } : {}),
+        ...(resourceId ? { resourceId } : {}),
       };
       const initialPrompt = msg.prompt?.trim() ?? '';
       const sessionId = await daemon.launchSession(
         msg.directoryId,
-        '',
+        initialPrompt,
         Object.keys(overrides).length > 0 ? overrides : undefined,
       );
-      if (initialPrompt.length > 0) {
-        await daemon.sendPrompt(sessionId, initialPrompt);
-      }
       addBoundedSetEntry(client.subscriptions, sessionId, MAX_CLIENT_SUBSCRIPTIONS);
 
       const dir = daemon.directoryManager.get(msg.directoryId);
@@ -89,7 +137,10 @@ export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
           directoryId: msg.directoryId,
           agent: overrides.agent ?? 'claude',
           model: overrides.model,
+          resourceId,
           cwd: dir?.path,
+          summary: initialPrompt || undefined,
+          resourceManifest: resolveManifest(dir?.path ?? null),
         }),
       );
       sendBufferedReplay(client, sessionId);
@@ -181,92 +232,347 @@ export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
       sendAck(client, msg.requestId, 'ok');
     },
 
-    'list-sessions': async (client, msg) => {
-      const discovered = daemon.getDiscoveredSessions(msg.directoryId);
-      const sessions = discovered.get(msg.directoryId) ?? [];
-      const offset = Math.max(0, msg.offset ?? 0);
-      const limit = Math.min(200, Math.max(1, msg.limit ?? 50));
-      const sliced = sessions.slice(offset, offset + limit);
+    ...createWsSessionCommandHandlers({
+      daemon,
+      sendAck,
+      getOrCreateBuffer,
+      addBoundedSetEntry,
+    }),
 
-      client.send(
-        JSON.stringify({
-          type: 'session-list',
-          directoryId: msg.directoryId,
-          sessions: sliced.map((s) => ({
-            id: s.sessionId,
-            agentId: s.agentId,
-            summary: s.summary,
-            lastActivity: s.lastModified,
-            messageCount: s.messageCount ?? 0,
-            resumable: s.resumable,
-          })),
-          total: sessions.length,
-          hasMore: offset + limit < sessions.length,
-        }),
-      );
-      sendAck(client, msg.requestId, 'ok');
-    },
-
-    resume: async (client, msg) => {
-      const resumeDir = daemon.directoryManager.get(msg.directoryId);
-      if (!resumeDir) {
-        sendAck(client, msg.requestId, 'error', `Directory not found: ${msg.directoryId}`, {
-          errorCode: ErrorCodes.DIRECTORY_NOT_FOUND,
+    'context-candidate-preview': async (client, msg) => {
+      try {
+        await verifyTrustedEdgeCommandCapability(daemon, {
+          token: msg.capabilityToken,
+          workspaceId: msg.workspaceId ?? '',
+          purpose: 'context-candidate-preview',
+          contextResourceId: msg.contextResourceId,
+          candidateEventId: msg.candidateEventId,
+          payloadDigest: msg.payloadDigest,
         });
-        return;
-      }
-
-      const discovered = daemon.getDiscoveredSessions(msg.directoryId);
-      const discoveredList = discovered.get(msg.directoryId) ?? [];
-      const discoveredMatch = discoveredList.find((s) => s.sessionId === msg.sessionId);
-      if (!discoveredMatch) {
-        sendAck(client, msg.requestId, 'error', `Discovered session not found: ${msg.sessionId}`, {
-          errorCode: ErrorCodes.DISCOVERED_SESSION_NOT_FOUND,
+        await refreshContextFromSavedTarget({
+          contextResourceId: msg.contextResourceId,
+          workspaceId: msg.workspaceId,
+          actorName: msg.actorName,
         });
-        return;
+        const result = await previewContextCandidateForTrustedEdge({
+          contextResourceId: msg.contextResourceId,
+          workspaceId: msg.workspaceId,
+          actorName: msg.actorName,
+          candidateEventId: msg.candidateEventId,
+          payloadDigest: msg.payloadDigest,
+          passphrase: msg.passphrase,
+          recoveryCode: msg.recoveryCode,
+        });
+        sendAck(client, msg.requestId, 'ok', undefined, result);
+      } catch (error) {
+        sendAck(
+          client,
+          msg.requestId,
+          'error',
+          error instanceof Error ? error.message : 'Context preview failed',
+          { errorCode: ErrorCodes.INVALID_INPUT },
+        );
       }
-      const overrides = {
-        ...(msg.model ? { model: msg.model } : {}),
-        agent: discoveredMatch.agentId,
-      };
-      const initialPrompt = msg.prompt?.trim() ?? '';
-      const resumeSessionId = await daemon.resumeSession(
-        msg.sessionId,
-        msg.directoryId,
-        undefined,
-        overrides,
-      );
-      if (initialPrompt.length > 0) {
-        await daemon.sendPrompt(resumeSessionId, initialPrompt);
+    },
+
+    'context-resolve': async (client, msg) => {
+      try {
+        await verifyTrustedEdgeCommandCapability(daemon, {
+          token: msg.capabilityToken,
+          workspaceId: msg.workspaceId,
+          purpose: 'context-resolve',
+          contextResourceId: msg.contextResourceId,
+        });
+        await refreshContextFromSavedTarget({
+          contextResourceId: msg.contextResourceId,
+          workspaceId: msg.workspaceId,
+          actorName: msg.actorName,
+        });
+        const bundle = await resolveContextBundle({
+          contextResourceId: msg.contextResourceId,
+          actorName: msg.actorName,
+          query: msg.query,
+          maxItems: msg.maxItems,
+          includePrivate: msg.includePrivate,
+          profile: msg.profile,
+          profilePin: msg.profilePin,
+          credentials: {
+            passphrase: msg.passphrase ?? '',
+            recoveryCode: msg.recoveryCode ?? '',
+          },
+        });
+        sendAck(client, msg.requestId, 'ok', undefined, { bundle });
+      } catch (error) {
+        sendAck(
+          client,
+          msg.requestId,
+          'error',
+          error instanceof Error ? error.message : 'Context resolve failed',
+          { errorCode: ErrorCodes.INVALID_INPUT },
+        );
       }
-      addBoundedSetEntry(client.subscriptions, resumeSessionId, MAX_CLIENT_SUBSCRIPTIONS);
-      client.send(
-        JSON.stringify({
-          type: 'session-started',
-          sessionId: resumeSessionId,
-          directoryId: msg.directoryId,
-          cwd: resumeDir.path,
-          agent: discoveredMatch.agentId,
-          summary: discoveredMatch?.summary,
-        }),
-      );
-      sendBufferedReplay(client, resumeSessionId);
+    },
+
+    'context-propose': async (client, msg) => {
+      try {
+        await verifyTrustedEdgeCommandCapability(daemon, {
+          token: msg.capabilityToken,
+          workspaceId: msg.workspaceId,
+          purpose: 'context-propose',
+          contextResourceId: msg.contextResourceId,
+        });
+        const candidate = await proposeContextEntry({
+          contextResourceId: msg.contextResourceId,
+          actorName: msg.actorName,
+          title: msg.title,
+          body: msg.body,
+          source: msg.source ?? 'web://vault-detail',
+          sourceKind: msg.sourceKind ?? 'integration',
+          credentials: {
+            passphrase: msg.passphrase ?? '',
+            recoveryCode: msg.recoveryCode ?? '',
+          },
+        });
+
+        let sync:
+          | { ok: true; accepted: number; pushed: number; repoId: string; workspaceId: string }
+          | { ok: false; error: string }
+          | null = null;
+        if (msg.sync !== false) {
+          try {
+            const target = await resolveSavedContextSyncTarget(
+              msg.contextResourceId,
+              msg.workspaceId,
+            );
+            if (!target) {
+              sync = {
+                ok: false,
+                error: `No saved remote credentials are available for workspace ${msg.workspaceId}.`,
+              };
+            } else {
+              const result = await pushContextEvents({
+                contextResourceId: msg.contextResourceId,
+                workspaceId: target.workspaceId,
+                serverUrl: target.serverUrl,
+                credential: target.credential,
+                tlsVerify: target.tlsVerify,
+                caCertPath: target.caCertPath,
+                tlsPins: target.tlsPins,
+              });
+              sync = { ok: true, workspaceId: target.workspaceId, ...result };
+            }
+          } catch (error) {
+            sync = {
+              ok: false,
+              error: error instanceof Error ? error.message : 'Context sync failed',
+            };
+          }
+        }
+
+        sendAck(client, msg.requestId, 'ok', undefined, { candidate, sync });
+      } catch (error) {
+        sendAck(
+          client,
+          msg.requestId,
+          'error',
+          error instanceof Error ? error.message : 'Context proposal failed',
+          { errorCode: ErrorCodes.INVALID_INPUT },
+        );
+      }
+    },
+
+    'trusted-edge-plan-decrypt': async (client, msg) => {
+      try {
+        await verifyTrustedEdgeCommandCapability(daemon, {
+          token: msg.capabilityToken,
+          workspaceId: msg.workspaceId,
+          purpose: 'trusted-edge-plan-decrypt',
+          planId: msg.planId,
+        });
+        const result = await decryptTrustedEdgePlanBody({
+          workspaceId: msg.workspaceId,
+          planId: msg.planId,
+          sourceRef: msg.sourceRef,
+          envelope: { ...msg.bodyEncryption, aad: msg.bodyEncryption.aad ?? {} },
+          bodyKeyGrants: msg.bodyKeyGrants as TrustedEdgePlanAnyBodyKeyGrant[] | undefined,
+        });
+        sendAck(client, msg.requestId, 'ok', undefined, {
+          planId: msg.planId,
+          sourceRef: msg.sourceRef,
+          body: result.body,
+          bodySha256: result.bodySha256,
+          keyRef: result.keyRef,
+        });
+      } catch (error) {
+        sendAck(
+          client,
+          msg.requestId,
+          'error',
+          error instanceof Error ? error.message : 'Trusted-edge plan decrypt failed',
+          { errorCode: ErrorCodes.INVALID_INPUT },
+        );
+      }
+    },
+
+    'trusted-edge-plan-encrypt-field': async (client, msg) => {
+      try {
+        await verifyTrustedEdgeCommandCapability(daemon, {
+          token: msg.capabilityToken,
+          workspaceId: msg.workspaceId,
+          purpose: 'trusted-edge-plan-encrypt-field',
+          planId: msg.planId,
+        });
+        const field = await encryptTrustedEdgePlanFeedbackField({
+          workspaceId: msg.workspaceId,
+          planId: msg.planId,
+          sourceRef: msg.sourceRef,
+          envelope: { ...msg.bodyEncryption, aad: msg.bodyEncryption.aad ?? {} },
+          bodyKeyGrants: msg.bodyKeyGrants as TrustedEdgePlanAnyBodyKeyGrant[] | undefined,
+          text: msg.text,
+          aad: msg.aad,
+        });
+        sendAck(client, msg.requestId, 'ok', undefined, {
+          planId: msg.planId,
+          sourceRef: msg.sourceRef,
+          field,
+        });
+      } catch (error) {
+        sendAck(
+          client,
+          msg.requestId,
+          'error',
+          error instanceof Error ? error.message : 'Trusted-edge plan feedback encryption failed',
+          { errorCode: ErrorCodes.INVALID_INPUT },
+        );
+      }
+    },
+
+    'trusted-edge-plan-decrypt-field': async (client, msg) => {
+      try {
+        await verifyTrustedEdgeCommandCapability(daemon, {
+          token: msg.capabilityToken,
+          workspaceId: msg.workspaceId,
+          purpose: 'trusted-edge-plan-decrypt-field',
+          planId: msg.planId,
+        });
+        const field = await decryptTrustedEdgePlanFeedbackField({
+          workspaceId: msg.workspaceId,
+          planId: msg.planId,
+          sourceRef: msg.sourceRef,
+          bodyEnvelope: { ...msg.bodyEncryption, aad: msg.bodyEncryption.aad ?? {} },
+          fieldEnvelope: { ...msg.fieldEncryption, aad: msg.fieldEncryption.aad ?? {} },
+          bodyKeyGrants: msg.bodyKeyGrants as TrustedEdgePlanAnyBodyKeyGrant[] | undefined,
+        });
+        sendAck(client, msg.requestId, 'ok', undefined, {
+          planId: msg.planId,
+          sourceRef: msg.sourceRef,
+          field,
+        });
+      } catch (error) {
+        sendAck(
+          client,
+          msg.requestId,
+          'error',
+          error instanceof Error ? error.message : 'Trusted-edge plan feedback decryption failed',
+          { errorCode: ErrorCodes.INVALID_INPUT },
+        );
+      }
+    },
+
+    'trusted-edge-plan-wrap-key': async (client, msg) => {
+      try {
+        await verifyTrustedEdgeCommandCapability(daemon, {
+          token: msg.capabilityToken,
+          workspaceId: msg.workspaceId,
+          purpose: 'trusted-edge-plan-wrap-key',
+          planId: msg.planId,
+        });
+        const bodyKeyGrants = await wrapTrustedEdgePlanBodyKey({
+          workspaceId: msg.workspaceId,
+          planId: msg.planId,
+          sourceRef: msg.sourceRef,
+          envelope: { ...msg.bodyEncryption, aad: msg.bodyEncryption.aad ?? {} },
+          bodyKeyGrants: msg.bodyKeyGrants as TrustedEdgePlanAnyBodyKeyGrant[] | undefined,
+          recipients: msg.recipients as TrustedEdgePlanGrantRecipient[],
+        });
+        sendAck(client, msg.requestId, 'ok', undefined, {
+          planId: msg.planId,
+          sourceRef: msg.sourceRef,
+          bodyKeyGrants,
+        });
+      } catch (error) {
+        sendAck(
+          client,
+          msg.requestId,
+          'error',
+          error instanceof Error ? error.message : 'Trusted-edge plan key wrap failed',
+          { errorCode: ErrorCodes.INVALID_INPUT },
+        );
+      }
+    },
+
+    'trusted-edge-team-epoch-publish': async (client, msg) => {
+      try {
+        await verifyTrustedEdgeCommandCapability(daemon, {
+          token: msg.capabilityToken,
+          workspaceId: msg.workspaceId,
+          purpose: 'trusted-edge-team-epoch-publish',
+          teamId: msg.teamId,
+        });
+
+        const daemonConfig = daemon.configManager.getDaemonConfig() ?? {};
+        const target = resolveConfiguredWorkspaceSyncTarget(daemonConfig, {
+          requestedWorkspaceId: msg.workspaceId,
+        });
+        if (!target) {
+          throw new Error('No configured remote workspace credential is available for this team.');
+        }
+
+        await processPendingCryptoRotationRequests({
+          target,
+        });
+
+        const epoch = await ensureTeamCryptoEpoch({
+          target,
+          teamId: msg.teamId,
+        });
+        const memberGrants = epoch.platformEpochId
+          ? await grantTeamEpochToWorkspaceUserEpochs({
+              target,
+              teamCryptoEpochId: epoch.platformEpochId,
+            })
+          : null;
+
+        sendAck(client, msg.requestId, 'ok', undefined, {
+          teamId: msg.teamId,
+          teamEpoch: publicTeamEpoch(epoch),
+          ...(memberGrants
+            ? {
+                teamMemberGrants: {
+                  attempted: memberGrants.attempted,
+                  granted: memberGrants.granted,
+                  skipped: memberGrants.skipped,
+                },
+              }
+            : {}),
+        });
+      } catch (error) {
+        sendAck(
+          client,
+          msg.requestId,
+          'error',
+          error instanceof Error ? error.message : 'Trusted-edge team epoch publish failed',
+          { errorCode: ErrorCodes.INVALID_INPUT },
+        );
+      }
+    },
+
+    'sync-request': async (client, msg) => {
+      sendSyncSnapshot(client, daemon, registry);
       sendAck(client, msg.requestId, 'ok');
     },
 
-    'watch-discovered-session': async (client, msg) => {
-      addBoundedSetEntry(
-        client.watchedDiscoveredSessions,
-        discoveredWatchKey(msg.sessionId, msg.directoryId),
-        MAX_CLIENT_DISCOVERED_WATCHES,
-      );
-      sendAck(client, msg.requestId, 'ok');
-    },
-
-    'unwatch-discovered-session': async (client, msg) => {
-      removeDiscoveredWatch(client.watchedDiscoveredSessions, msg.sessionId, msg.directoryId);
-      sendAck(client, msg.requestId, 'ok');
-    },
+    ...createWsWorkflowCommandHandlers({ daemon, sendAck }),
 
     supervise: async (client, msg) => {
       if (!supervision) {
@@ -303,4 +609,30 @@ export function createWsCommandHandlers(ctx: HandlerContext): HandlerMap {
       sendAck(client, msg.requestId, 'ok');
     },
   };
+}
+
+function resolveManifest(workingDirectory: string | null | undefined): SessionResourceManifest {
+  return resolveSessionResourceManifestSync({
+    workingDirectory: workingDirectory ?? process.cwd(),
+  });
+}
+
+async function resolveSavedContextSyncTarget(
+  contextResourceId: string,
+  workspaceId: string,
+): Promise<{
+  workspaceId: string;
+  serverUrl: string;
+  credential: string;
+  tlsVerify?: 'auto' | '0' | '1';
+  caCertPath?: string;
+  tlsPins?: string[];
+} | null> {
+  const manager = new ConfigManager();
+  await manager.load();
+  const daemonConfig = manager.getDaemonConfig() ?? {};
+  return resolveConfiguredContextSyncTarget(daemonConfig, {
+    contextResourceId,
+    requestedWorkspaceId: workspaceId,
+  });
 }

@@ -1,17 +1,18 @@
 {
   "name": "@viewportai/daemon",
-  "version": "0.2.0",
+  "version": "0.31.0",
   "description": "Viewport daemon — supervision and orchestration layer for AI coding agents",
   "license": "Apache-2.0",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/viewportai/daemon"
+    "url": "https://github.com/viewportai/viewport.git",
+    "directory": "packages/daemon"
   },
   "bugs": {
-    "url": "https://github.com/viewportai/daemon/issues"
+    "url": "https://github.com/viewportai/viewport/issues"
   },
-  "homepage": "https://github.com/viewportai/daemon#readme",
+  "homepage": "https://github.com/viewportai/viewport/tree/main/packages/daemon#readme",
   "bin": {
     "vpd": "bin/vpd.js"
   },
@@ -19,7 +20,11 @@
     "bin",
     "dist",
     "README.md",
-    "docs"
+    "docs",
+    "schemas"
+  ],
+  "bundledDependencies": [
+    "@viewportai/context-engine"
   ],
   "publishConfig": {
     "access": "public"
@@ -29,23 +34,28 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:daemon": "tsx watch src/index.ts start --foreground",
     "build": "tsc",
-    "prepack": "npm run build",
+    "start:foreground": "npm run build && node dist/index.js start --foreground",
+    "prepack": "npm run build && node ./scripts/vendor-context-engine.mjs prepare",
+    "postpack": "node ./scripts/vendor-context-engine.mjs clean",
     "typecheck": "tsc --noEmit",
     "test": "bash ./scripts/test.sh",
-    "test:unit": "vitest run",
+    "test:unit": "vitest run --pool=forks",
     "test:verify": "npm run test -- --verify",
     "test:setup": "vitest run tests/cli/setup-command.test.ts tests/cli/service-commands.test.ts tests/startup-prereqs.test.ts tests/core/built-in-agents.test.ts",
     "test:e2e": "vitest run tests/e2e",
     "test:e2e:fullstack": "VIEWPORT_RUN_NET_E2E=1 vitest run tests/e2e/cli-fullstack-workflow.test.ts",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage",
+    "test:coverage": "vitest run --coverage --pool=forks",
     "check:file-size": "node ./scripts/check-file-sizes.mjs",
     "check:protocol-matrix": "node ./scripts/check-protocol-matrix.mjs",
+    "check:protocol-pin": "node ./scripts/check-protocol-pin.mjs",
+    "check:protocol-contracts": "node ./scripts/check-protocol-contracts.mjs",
     "lint": "eslint src/ tests/ --no-error-on-unmatched-pattern",
     "format": "prettier --write \"{src,tests}/**/*.ts\"",
     "format:check": "prettier --check \"{src,tests}/**/*.ts\"",
-    "check": "npm run check:file-size && npm run check:protocol-matrix && npm run typecheck && npm run lint && npm run format:check && npm run test",
+    "check": "npm run check:file-size && npm run check:protocol-matrix && npm run check:protocol-pin && npm run check:protocol-contracts && npm run typecheck && npm run lint && npm run format:check && npm run test",
     "dev:install": "bash ./scripts/install-dev.sh --yes --no-service --no-prereqs --no-hooks",
     "dev:link": "bash ./scripts/install-dev.sh --link --yes --no-service --no-prereqs --no-hooks",
     "dev:uninstall": "bash ./scripts/uninstall.sh --service",
@@ -59,12 +69,21 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.63",
+    "@anthropic-ai/claude-code": "^2.1.168",
     "@fastify/cors": "^10.0.1",
     "@fastify/websocket": "^11.0.1",
+    "@hpke/core": "^1.9.0",
+    "@hpke/dhkem-x25519": "^1.8.0",
     "@openai/codex-sdk": "^0.107.0",
+    "@viewportai/context-engine": "^0.0.1",
+    "@viewportai/protocol": "^1.8.0",
+    "ajv": "^8.20.0",
+    "better-sqlite3": "^11.10.0",
     "fastify": "^5.2.1",
+    "jsonata": "^2.1.0",
     "pino": "^9.6.0",
     "pino-pretty": "^13.1.3",
+    "yaml": "^2.8.3",
     "zod": "^4.0.0"
   },
   "devDependencies": {
@@ -80,5 +99,8 @@
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.24.1",
     "vitest": "^3.0.5"
-  }
+  },
+  "bundleDependencies": [
+    "@viewportai/context-engine"
+  ]
 }

@@ -1,15 +1,13 @@
 import type { WebSocket as WsType } from 'ws';
 import WebSocket from 'ws';
-import crypto from 'node:crypto';
 import { computeBackoffMs, sleep } from './bridge-backoff.js';
+import { registerDaemonPublicKeyWithControlPlane } from './bridge-daemon-key-registration.js';
 import {
   CIRCUIT_BREAKER_MS,
   DEFAULT_MAX_PENDING_OUTBOUND,
   DEFAULT_MAX_PENDING_OUTBOUND_BYTES,
   ISSUE_FAILURE_THRESHOLD,
   RELAY_KEY_ROTATE_AFTER_MESSAGES,
-  RELAY_REPLAY_WINDOW,
-  RELAY_SESSION_IDLE_TTL_MS,
 } from './bridge-constants.js';
 import {
   decryptEnvelope,
@@ -18,11 +16,12 @@ import {
   parseRelayEnvelope,
   toBase64Url,
 } from './bridge-crypto.js';
+import { logDaemonFrameSummary } from './bridge-frame-logger.js';
+import { isCompatibleProfile } from './bridge-handshake-profile.js';
 import {
   deriveSessionFromKeyExchange,
   type DaemonRelayIdentity,
   loadOrCreateIdentity,
-  parseRelayHandshakeProfile,
   parseRelayKeyExchangeInitFrame,
   type RelayHandshakeProfile,
   type RelayKeyExchangeInitFrame,
@@ -32,67 +31,51 @@ import {
   parseRelayKeyExchangeInitFrameV3,
   type RelayKeyExchangeInitFrameV3,
 } from './bridge-noise-v3.js';
-import { BridgeError, type BridgeErrorCode } from './bridge-errors.js';
-import { type RelayTokenClaims, verifyRelayTokenClaims } from './bridge-jwt.js';
-import { closeQuietly, resolveRelayTlsOptions, wsOpen } from './bridge-network.js';
 import {
-  issuePairingOffer,
-  redeemPairingOffer,
-  resolveRelayPairingSecret,
-} from '../server/pairing-offers.js';
-import { loadConfig, saveConfig } from '../core/config.js';
+  BridgeError,
+  isControlPlaneBridgeError,
+  normalizeBridgeError,
+  type BridgeErrorCode,
+} from './bridge-errors.js';
+import { openDaemonSocket, openRelayDaemonSocket } from './bridge-connections.js';
+import { closeQuietly } from './bridge-network.js';
+import {
+  handleRelayPairingOfferRequest,
+  handleRelayPairingRedeemRequest,
+  pruneRelayPairingChannelKeys,
+  type PairingChannelKey,
+} from './bridge-pairing-control-handler.js';
+import { RelayTokenIssuer } from './bridge-token-issuer.js';
+import {
+  isRelayControlFrame,
+  parsePairingOfferRequestFrame,
+  parsePairingRedeemRequestFrame,
+  type RelayControlFrame,
+  type RelayPairingOfferRequestFrame,
+  type RelayPairingRedeemRequestFrame,
+} from './relay-control-frames.js';
+import {
+  acceptInboundRelaySeq,
+  createRelaySessionState,
+  enforceRelaySessionCapacity,
+  sendToAllRelaySessions,
+  type RelaySessionState,
+} from './bridge-relay-sessions.js';
+import { resolveRelayPairingSecret } from '../server/pairing-offers.js';
 import { logger as out } from '../core/output.js';
-
-interface RelayTokenResponse {
-  ok: boolean;
-  relayToken?: string;
-  claims?: RelayTokenClaims;
-  reason?: string;
-  error?: string;
-}
-
-interface RelayStatusFrame {
-  type: 'relay_status';
-  code?: string;
-  message?: string;
-  relayWsBaseUrl?: string;
-}
-
-interface RelayKeyUpdateRequiredFrame {
-  type: 'relay_key_update_required';
-  sessionId: string;
-  nextEpoch: number;
-  reason: 'message_threshold';
-}
-
-interface RelayPairingOfferRequestFrame {
-  type: 'relay_pairing_offer_request';
-  requestId: string;
-  ttlSeconds?: number;
-  clientChannelPublicKey: string;
-}
-
-interface RelayPairingRedeemRequestFrame {
-  type: 'relay_pairing_redeem_request';
-  requestId: string;
-  offerId: string;
-  encIv: string;
-  encTag: string;
-  encCiphertext: string;
-}
-
-type RelayControlFrame = RelayStatusFrame | RelayKeyUpdateRequiredFrame;
-type JwksResponse = { keys?: Array<Record<string, unknown>> };
-const MAX_JWKS_KEYS = 64;
 
 export interface DaemonRelayBridgeOptions {
   relayEndpoint: string;
   relayServerUrl: string;
   workspaceId: string;
-  enrollToken: string;
+  runtimeTargetId?: string;
+  machineId?: string;
   issueToken?: string;
   daemonWsUrl: string;
   daemonAuthToken?: string;
+  daemonTlsVerify?: 'auto' | '0' | '1';
+  daemonCaCertPath?: string;
+  daemonTlsPins?: string[];
   relayTlsVerify?: 'auto' | '0' | '1';
   relayCaCertPath?: string;
   relayTlsPins?: string[];
@@ -107,18 +90,7 @@ export interface DaemonRelayBridgeOptions {
   pairingChannelTtlMs?: number;
   pairingChannelMaxEntries?: number;
   relaySessionMaxEntries?: number;
-}
-
-interface RelaySessionState {
-  key: Buffer;
-  profile: RelayHandshakeProfile;
-  sessionId: string;
-  epoch: number;
-  txSeq: number;
-  rxHighestSeq: number;
-  rxSeenSeq: Set<number>;
-  lastActivityAt: number;
-  keyRotationRequested: boolean;
+  filterDaemonPayload?: (payload: string) => string | null;
 }
 
 type RelayWs = WsType;
@@ -131,149 +103,14 @@ const DEFAULT_PAIRING_CHANNEL_MAX_ENTRIES = 2_048;
 const DEFAULT_RELAY_SESSION_MAX_ENTRIES = 4_096;
 
 export interface DaemonRelayBridgeStatus {
+  workspaceId: string;
+  relayEndpoint: string;
   state: 'stopped' | 'connecting' | 'connected' | 'waiting_retry' | 'circuit_open';
   reconnectAttempt: number;
   lastErrorCode?: BridgeErrorCode;
   lastErrorMessage?: string;
   lastErrorAt?: number;
   circuitOpenUntil?: number;
-}
-
-async function parseRelayIssueResponse(res: Response): Promise<RelayTokenResponse> {
-  const json = (await res.json().catch(() => null)) as RelayTokenResponse | null;
-  if (!json) {
-    return {
-      ok: false,
-      reason: `relay token endpoint returned non-JSON (${res.status})`,
-    };
-  }
-  return json;
-}
-
-function isRelayControlFrame(value: unknown): value is RelayControlFrame {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const frame = value as Record<string, unknown>;
-  if (frame['type'] === 'relay_status') return true;
-  return (
-    frame['type'] === 'relay_key_update_required' &&
-    typeof frame['sessionId'] === 'string' &&
-    typeof frame['nextEpoch'] === 'number'
-  );
-}
-
-function parsePairingOfferRequestFrame(value: unknown): RelayPairingOfferRequestFrame | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const frame = value as Record<string, unknown>;
-  if (frame['type'] !== 'relay_pairing_offer_request') return null;
-  if (typeof frame['requestId'] !== 'string' || frame['requestId'].trim().length === 0) {
-    return null;
-  }
-  const ttlSeconds = frame['ttlSeconds'];
-  if (
-    typeof ttlSeconds !== 'undefined' &&
-    (!Number.isInteger(ttlSeconds) || (ttlSeconds as number) < 30 || (ttlSeconds as number) > 3600)
-  ) {
-    return null;
-  }
-  if (
-    typeof frame['clientChannelPublicKey'] !== 'string' ||
-    frame['clientChannelPublicKey'].trim().length === 0
-  ) {
-    return null;
-  }
-  return {
-    type: 'relay_pairing_offer_request',
-    requestId: frame['requestId'],
-    ttlSeconds: typeof ttlSeconds === 'number' ? ttlSeconds : undefined,
-    clientChannelPublicKey: frame['clientChannelPublicKey'],
-  };
-}
-
-function parsePairingRedeemRequestFrame(value: unknown): RelayPairingRedeemRequestFrame | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const frame = value as Record<string, unknown>;
-  if (frame['type'] !== 'relay_pairing_redeem_request') return null;
-  if (
-    typeof frame['requestId'] !== 'string' ||
-    typeof frame['offerId'] !== 'string' ||
-    typeof frame['encIv'] !== 'string' ||
-    typeof frame['encTag'] !== 'string' ||
-    typeof frame['encCiphertext'] !== 'string'
-  ) {
-    return null;
-  }
-  if (
-    frame['requestId'].trim().length === 0 ||
-    frame['offerId'].trim().length === 0 ||
-    frame['encIv'].trim().length === 0 ||
-    frame['encTag'].trim().length === 0 ||
-    frame['encCiphertext'].trim().length === 0
-  ) {
-    return null;
-  }
-  return {
-    type: 'relay_pairing_redeem_request',
-    requestId: frame['requestId'],
-    offerId: frame['offerId'],
-    encIv: frame['encIv'],
-    encTag: frame['encTag'],
-    encCiphertext: frame['encCiphertext'],
-  };
-}
-
-function derivePairingChannelKey(sharedSecret: Buffer, saltLabel: string): Buffer {
-  const salt = crypto.createHash('sha256').update(saltLabel, 'utf8').digest();
-  const raw = crypto.hkdfSync(
-    'sha256',
-    sharedSecret,
-    salt,
-    Buffer.from('viewport-relay-pairing-channel-v1', 'utf8'),
-    32,
-  );
-  return Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
-}
-
-function encryptPairingPayload(
-  key: Buffer,
-  plaintext: string,
-  aadLabel: string,
-): { encIv: string; encTag: string; encCiphertext: string } {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  cipher.setAAD(Buffer.from(aadLabel, 'utf8'));
-  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return {
-    encIv: toBase64Url(iv),
-    encTag: toBase64Url(tag),
-    encCiphertext: toBase64Url(ciphertext),
-  };
-}
-
-function decryptPairingPayload(
-  key: Buffer,
-  encrypted: { encIv: string; encTag: string; encCiphertext: string },
-  aadLabel: string,
-): string {
-  const iv = fromBase64Url(encrypted.encIv);
-  const tag = fromBase64Url(encrypted.encTag);
-  const ciphertext = fromBase64Url(encrypted.encCiphertext);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAAD(Buffer.from(aadLabel, 'utf8'));
-  decipher.setAuthTag(tag);
-  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-  return plaintext.toString('utf8');
-}
-
-function profileStrength(profile: RelayHandshakeProfile): number {
-  return profile === 'noise-ikpsk2' ? 2 : 1;
-}
-
-function isCompatibleProfile(
-  required: RelayHandshakeProfile,
-  requested: RelayHandshakeProfile,
-): boolean {
-  return profileStrength(requested) >= profileStrength(required);
 }
 
 export class DaemonRelayBridge {
@@ -287,12 +124,9 @@ export class DaemonRelayBridge {
   private daemonIdentity: DaemonRelayIdentity | null = null;
   private daemonIssueToken: string | null;
   private requiredProfile: RelayHandshakeProfile = 'noise-ik';
-  private readonly relayTokenJwksUrl: string | undefined;
-  private readonly relayTokenSigningKeys: Record<string, string>;
-  private jwksCacheExpiresAt = 0;
-  private jwksCacheKeys: Record<string, string> = {};
+  private readonly relayTokenIssuer: RelayTokenIssuer;
   private readonly relaySessions = new Map<string, RelaySessionState>();
-  private readonly pairingChannelKeys = new Map<string, { key: Buffer; createdAt: number }>();
+  private readonly pairingChannelKeys = new Map<string, PairingChannelKey>();
   private consecutiveIssueFailures = 0;
   private circuitOpenUntilMs = 0;
   private lastErrorCode: BridgeErrorCode | undefined;
@@ -332,12 +166,13 @@ export class DaemonRelayBridge {
         ? options.relaySessionMaxEntries
         : DEFAULT_RELAY_SESSION_MAX_ENTRIES;
     this.daemonIssueToken = options.issueToken ?? null;
-    this.relayTokenJwksUrl = options.relayTokenJwksUrl;
-    this.relayTokenSigningKeys = options.relayTokenSigningKeys ?? {};
+    this.relayTokenIssuer = new RelayTokenIssuer(options, this.daemonIssueToken);
   }
 
   getStatus(): DaemonRelayBridgeStatus {
     return {
+      workspaceId: this.options.workspaceId,
+      relayEndpoint: this.relayEndpoint,
       state: this.state,
       reconnectAttempt: this.reconnectAttempt,
       lastErrorCode: this.lastErrorCode,
@@ -376,78 +211,14 @@ export class DaemonRelayBridge {
   }
 
   private async registerDaemonPublicKey(): Promise<void> {
-    if (!this.daemonIdentity) {
-      throw new BridgeError('DAEMON_KEY_REGISTER_FAILED', 'daemon identity unavailable');
-    }
-
-    const url =
-      `${this.options.relayServerUrl.replace(/\/+$/, '')}` +
-      `/api/poc/workspaces/${encodeURIComponent(this.options.workspaceId)}/daemon-key`;
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8_000);
-
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          credential: this.options.enrollToken,
-          issueCredential: this.daemonIssueToken ?? undefined,
-          daemonPublicKey: this.daemonIdentity.publicKey,
-        }),
-        signal: controller.signal,
-      });
-    } catch (error) {
-      clearTimeout(timeout);
-      throw new BridgeError(
-        'DAEMON_KEY_REGISTER_FAILED',
-        error instanceof Error ? error.message : String(error),
-      );
-    }
-    clearTimeout(timeout);
-
-    const parsed = (await res.json().catch(() => null)) as {
-      ok?: boolean;
-      reason?: string;
-      error?: string;
-      daemonIssueToken?: string;
-    } | null;
-
-    if (!res.ok || !parsed?.ok) {
-      const reason = parsed?.reason ?? parsed?.error ?? `HTTP ${res.status}`;
-      throw new BridgeError(
-        'DAEMON_KEY_REGISTER_FAILED',
-        `daemon key registration failed: ${reason}`,
-      );
-    }
-    if (!parsed?.daemonIssueToken || parsed.daemonIssueToken.trim().length === 0) {
-      if (this.daemonIssueToken && this.daemonIssueToken.trim().length > 0) {
-        return;
-      }
-      throw new BridgeError(
-        'DAEMON_KEY_REGISTER_FAILED',
-        'daemon key registration succeeded but daemon issue token was missing',
-      );
-    }
-    this.daemonIssueToken = parsed.daemonIssueToken;
-    await this.persistIssueToken(parsed.daemonIssueToken);
-  }
-
-  private async persistIssueToken(issueToken: string): Promise<void> {
-    const normalized = issueToken.trim();
-    if (normalized.length === 0) return;
-    try {
-      const config = await loadConfig();
-      config.daemon = config.daemon ?? {};
-      config.daemon.relay = config.daemon.relay ?? {};
-      config.daemon.relay.issueToken = normalized;
-      await saveConfig(config);
-    } catch (error) {
-      out.warn(
-        `[relay] failed to persist daemon issue token: ${error instanceof Error ? error.message : String(error)}`,
-      );
+    const issueToken = await registerDaemonPublicKeyWithControlPlane({
+      options: this.options,
+      identity: this.daemonIdentity,
+      daemonIssueToken: this.daemonIssueToken,
+    });
+    if (issueToken && issueToken !== this.daemonIssueToken) {
+      this.daemonIssueToken = issueToken;
+      this.relayTokenIssuer.setDaemonIssueToken(issueToken);
     }
   }
 
@@ -484,33 +255,14 @@ export class DaemonRelayBridge {
       this.consecutiveIssueFailures = 0;
       this.circuitOpenUntilMs = 0;
 
-      const daemonHeaders: Record<string, string> = {};
-      if (this.options.daemonAuthToken) {
-        daemonHeaders.authorization = `Bearer ${this.options.daemonAuthToken}`;
-      }
-      const daemonWs = new WebSocket(this.options.daemonWsUrl, {
-        headers: Object.keys(daemonHeaders).length > 0 ? daemonHeaders : undefined,
-      });
-      await wsOpen(daemonWs);
+      const daemonWs = await openDaemonSocket(this.options);
       this.daemonWs = daemonWs;
 
-      const relayUrl =
-        `${this.relayEndpoint}?role=workspace-daemon` +
-        `&workspaceId=${encodeURIComponent(this.options.workspaceId)}`;
-
-      const relayTlsOptions = resolveRelayTlsOptions(
-        relayUrl,
-        this.options.relayTlsVerify ?? 'auto',
-        this.options.relayCaCertPath,
-        this.options.relayTlsPins,
-      );
-      const relayWs = new WebSocket(relayUrl, {
-        ...relayTlsOptions,
-        headers: {
-          authorization: `Bearer ${issue.relayToken}`,
-        },
+      const relayWs = await openRelayDaemonSocket({
+        ...this.options,
+        relayEndpoint: this.relayEndpoint,
+        relayToken: issue.relayToken,
       });
-      await wsOpen(relayWs);
       this.relayWs = relayWs;
 
       out.log('[relay] daemon bridge connected');
@@ -525,17 +277,13 @@ export class DaemonRelayBridge {
       this.daemonWs = null;
       this.relaySessions.clear();
 
-      const bridgeError = this.normalizeError(error);
+      const bridgeError = normalizeBridgeError(error);
       this.recordError(bridgeError.code, bridgeError.message);
       out.warn(
         `[relay] daemon bridge connect failed [${bridgeError.code}]: ${bridgeError.message}`,
       );
 
-      if (
-        bridgeError.code === 'TOKEN_ISSUE_FAILED' ||
-        bridgeError.code === 'TOKEN_RESPONSE_INVALID' ||
-        bridgeError.code === 'DAEMON_KEY_REGISTER_FAILED'
-      ) {
+      if (isControlPlaneBridgeError(bridgeError.code)) {
         this.consecutiveIssueFailures += 1;
         if (this.consecutiveIssueFailures >= ISSUE_FAILURE_THRESHOLD) {
           this.circuitOpenUntilMs = Date.now() + CIRCUIT_BREAKER_MS;
@@ -563,12 +311,19 @@ export class DaemonRelayBridge {
   private installSocketHandlers(daemonWs: RelayWs, relayWs: RelayWs): void {
     daemonWs.on('message', (raw) => {
       const payload = raw.toString('utf8');
-      if (relayWs.readyState === WebSocket.OPEN) {
-        this.sendToAllRelaySessions(relayWs, payload);
+      const filteredPayload = this.options.filterDaemonPayload
+        ? this.options.filterDaemonPayload(payload)
+        : payload;
+      if (!filteredPayload) {
         return;
       }
-      const payloadBytes = Buffer.byteLength(payload);
-      this.pendingOutbound.push(payload);
+      logDaemonFrameSummary('daemon->relay', filteredPayload);
+      if (relayWs.readyState === WebSocket.OPEN) {
+        this.sendToAllRelaySessions(relayWs, filteredPayload);
+        return;
+      }
+      const payloadBytes = Buffer.byteLength(filteredPayload);
+      this.pendingOutbound.push(filteredPayload);
       this.pendingOutboundBytes += payloadBytes;
       const maxPendingOutbound = this.options.maxPendingOutbound ?? DEFAULT_MAX_PENDING_OUTBOUND;
       const maxPendingBytes =
@@ -602,7 +357,7 @@ export class DaemonRelayBridge {
       const session = this.relaySessions.get(envelope.sessionId);
       if (!session) return;
       if (session.profile !== envelope.profile || session.epoch !== envelope.epoch) return;
-      if (!this.acceptInboundSeq(session, envelope.seq)) {
+      if (!acceptInboundRelaySeq(session, envelope.seq)) {
         out.warn(`[relay] dropped replay/old frame for session ${session.sessionId}`);
         return;
       }
@@ -610,6 +365,7 @@ export class DaemonRelayBridge {
       try {
         const plaintext = decryptEnvelope(session.key, envelope);
         session.lastActivityAt = Date.now();
+        logDaemonFrameSummary('relay->daemon', plaintext);
         if (daemonWs.readyState === WebSocket.OPEN) {
           daemonWs.send(plaintext);
         }
@@ -641,63 +397,20 @@ export class DaemonRelayBridge {
   }
 
   private sendToAllRelaySessions(relayWs: RelayWs, payload: string): void {
-    this.pruneIdleSessions();
-    for (const session of this.relaySessions.values()) {
-      session.txSeq += 1;
-      session.lastActivityAt = Date.now();
-      const envelope = encryptEnvelope(session.key, payload, {
-        profile: session.profile,
-        sessionId: session.sessionId,
-        epoch: session.epoch,
-        seq: session.txSeq,
-      });
-      relayWs.send(envelope);
-
-      if (!session.keyRotationRequested && session.txSeq >= this.keyRotateAfterMessages) {
-        const rotateNotice: RelayKeyUpdateRequiredFrame = {
-          type: 'relay_key_update_required',
-          sessionId: session.sessionId,
-          nextEpoch: session.epoch + 1,
-          reason: 'message_threshold',
-        };
-        relayWs.send(JSON.stringify(rotateNotice));
-        session.keyRotationRequested = true;
-      }
-    }
-  }
-
-  private acceptInboundSeq(session: RelaySessionState, seq: number): boolean {
-    if (seq < 1) return false;
-    if (session.rxSeenSeq.has(seq)) return false;
-    if (seq > session.rxHighestSeq + RELAY_REPLAY_WINDOW) return false;
-    const minimumAllowed = Math.max(1, session.rxHighestSeq - RELAY_REPLAY_WINDOW + 1);
-    if (seq < minimumAllowed) return false;
-
-    session.rxSeenSeq.add(seq);
-    if (seq > session.rxHighestSeq) session.rxHighestSeq = seq;
-
-    const pruneBelow = Math.max(1, session.rxHighestSeq - RELAY_REPLAY_WINDOW + 1);
-    for (const seen of session.rxSeenSeq) {
-      if (seen < pruneBelow) session.rxSeenSeq.delete(seen);
-    }
-    return true;
-  }
-
-  private pruneIdleSessions(): void {
-    const now = Date.now();
-    for (const [sessionId, session] of this.relaySessions.entries()) {
-      if (now - session.lastActivityAt > RELAY_SESSION_IDLE_TTL_MS) {
-        this.relaySessions.delete(sessionId);
-      }
-    }
+    sendToAllRelaySessions({
+      relayWs,
+      sessions: this.relaySessions,
+      payload,
+      keyRotateAfterMessages: this.keyRotateAfterMessages,
+    });
   }
 
   private enforceRelaySessionCapacity(): void {
-    this.pruneIdleSessions();
-    while (this.relaySessions.size > this.relaySessionMaxEntries) {
-      const oldestSessionId = this.relaySessions.keys().next().value;
-      if (!oldestSessionId) break;
-      this.relaySessions.delete(oldestSessionId);
+    const evicted = enforceRelaySessionCapacity({
+      sessions: this.relaySessions,
+      maxEntries: this.relaySessionMaxEntries,
+    });
+    for (const oldestSessionId of evicted) {
       out.warn(
         `[relay] evicted relay session ${oldestSessionId} due to relay session cap (${this.relaySessionMaxEntries})`,
       );
@@ -846,14 +559,7 @@ export class DaemonRelayBridge {
       if (previous && init.previousSessionId) {
         this.relaySessions.delete(init.previousSessionId);
       }
-      this.relaySessions.set(derived.session.sessionId, {
-        ...derived.session,
-        txSeq: 0,
-        rxHighestSeq: 0,
-        rxSeenSeq: new Set<number>(),
-        lastActivityAt: Date.now(),
-        keyRotationRequested: false,
-      });
+      this.relaySessions.set(derived.session.sessionId, createRelaySessionState(derived.session));
       this.enforceRelaySessionCapacity();
       if (relayWs.readyState === WebSocket.OPEN) {
         relayWs.send(JSON.stringify(derived.response));
@@ -927,15 +633,13 @@ export class DaemonRelayBridge {
       if (previous && init.previousSessionId) {
         this.relaySessions.delete(init.previousSessionId);
       }
-      this.relaySessions.set(derived.session.sessionId, {
-        ...derived.session,
-        profile: derived.session.profile as RelayHandshakeProfile,
-        txSeq: 0,
-        rxHighestSeq: 0,
-        rxSeenSeq: new Set<number>(),
-        lastActivityAt: Date.now(),
-        keyRotationRequested: false,
-      });
+      this.relaySessions.set(
+        derived.session.sessionId,
+        createRelaySessionState({
+          ...derived.session,
+          profile: derived.session.profile as RelayHandshakeProfile,
+        }),
+      );
       this.enforceRelaySessionCapacity();
       if (relayWs.readyState === WebSocket.OPEN) {
         relayWs.send(JSON.stringify(derived.response));
@@ -951,177 +655,46 @@ export class DaemonRelayBridge {
     frame: RelayPairingOfferRequestFrame,
     relayWs: RelayWs,
   ): Promise<void> {
-    const requestId = frame.requestId;
     const reply = (payload: Record<string, unknown>): void => {
       if (relayWs.readyState === WebSocket.OPEN) {
         relayWs.send(JSON.stringify(payload));
       }
     };
-
-    try {
-      this.prunePairingChannelKeys();
-      const clientChannelPublicKey = fromBase64Url(frame.clientChannelPublicKey);
-      if (clientChannelPublicKey.length !== 65) {
-        throw new Error('invalid clientChannelPublicKey');
-      }
-      const daemonChannel = crypto.createECDH('prime256v1');
-      daemonChannel.generateKeys();
-      const shared = daemonChannel.computeSecret(clientChannelPublicKey);
-      const channelKey = derivePairingChannelKey(shared, `offer:${frame.requestId}`);
-
-      const daemonUrl = new URL(this.options.daemonWsUrl);
-      const issued = await issuePairingOffer({
-        ttlSeconds: frame.ttlSeconds ?? 600,
-        connection: {
-          host: daemonUrl.hostname || '127.0.0.1',
-          port: daemonUrl.port ? Number(daemonUrl.port) : 7070,
-          listen: `relay:${this.options.workspaceId}`,
-          profile: 'relay',
-        },
-      });
-      this.pairingChannelKeys.set(issued.offerId, { key: channelKey, createdAt: Date.now() });
-      const encryptedOffer = encryptPairingPayload(
-        channelKey,
-        JSON.stringify({
-          offerId: issued.offerId,
-          createdAt: issued.createdAt,
-          expiresAt: issued.expiresAt,
-          redeemSecret: issued.redeemSecret,
-          trustAnchor: issued.trustAnchor,
-          daemonDeviceId: issued.daemonDeviceId,
-          daemonPublicKey: issued.daemonPublicKey,
-        }),
-        `offer:${frame.requestId}`,
-      );
-      reply({
-        type: 'relay_pairing_offer_response',
-        requestId,
-        ok: true,
-        daemonChannelPublicKey: toBase64Url(daemonChannel.getPublicKey()),
-        ...encryptedOffer,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      reply({
-        type: 'relay_pairing_offer_response',
-        requestId,
-        ok: false,
-        errorCode: 'PAIRING_OFFER_FAILED',
-        error: message,
-      });
-    }
+    await handleRelayPairingOfferRequest({
+      frame,
+      reply,
+      pairingChannelKeys: this.pairingChannelKeys,
+      workspaceId: this.options.workspaceId,
+      daemonWsUrl: this.options.daemonWsUrl,
+      maxAgeMs: this.pairingChannelTtlMs,
+      maxEntries: this.pairingChannelMaxEntries,
+    });
   }
 
   private async handlePairingRedeemRequest(
     frame: RelayPairingRedeemRequestFrame,
     relayWs: RelayWs,
   ): Promise<void> {
-    const requestId = frame.requestId;
     const reply = (payload: Record<string, unknown>): void => {
       if (relayWs.readyState === WebSocket.OPEN) {
         relayWs.send(JSON.stringify(payload));
       }
     };
-
-    try {
-      this.prunePairingChannelKeys();
-      const channel = this.pairingChannelKeys.get(frame.offerId);
-      if (!channel) {
-        throw new Error('pairing channel missing or expired');
-      }
-      const decrypted = decryptPairingPayload(
-        channel.key,
-        {
-          encIv: frame.encIv,
-          encTag: frame.encTag,
-          encCiphertext: frame.encCiphertext,
-        },
-        `redeem:${frame.requestId}:${frame.offerId}`,
-      );
-      const parsed = JSON.parse(decrypted) as {
-        redeemSecret?: string;
-        trustAnchor?: string;
-        clientPublicKey?: string;
-        clientProof?: string;
-      };
-      if (
-        typeof parsed.redeemSecret !== 'string' ||
-        typeof parsed.trustAnchor !== 'string' ||
-        typeof parsed.clientPublicKey !== 'string' ||
-        typeof parsed.clientProof !== 'string' ||
-        parsed.redeemSecret.trim().length === 0 ||
-        parsed.trustAnchor.trim().length === 0 ||
-        parsed.clientPublicKey.trim().length === 0 ||
-        parsed.clientProof.trim().length === 0
-      ) {
-        throw new Error('invalid encrypted pairing payload');
-      }
-      const redeemed = await redeemPairingOffer(
-        frame.offerId,
-        parsed.redeemSecret,
-        parsed.trustAnchor,
-        parsed.clientPublicKey,
-        parsed.clientProof,
-      );
-      if (!redeemed) {
-        reply({
-          type: 'relay_pairing_redeem_response',
-          requestId,
-          ok: false,
-          errorCode: 'PAIRING_REDEEM_FAILED',
-          error: 'offer not found or no longer valid',
-        });
-        return;
-      }
-
-      reply({
-        type: 'relay_pairing_redeem_response',
-        requestId,
-        ok: true,
-        redeemed: {
-          offerId: redeemed.offerId,
-          createdAt: redeemed.createdAt,
-          expiresAt: redeemed.expiresAt,
-          peerId: redeemed.peerId,
-          daemonDeviceId: redeemed.daemonDeviceId,
-          daemonPublicKey: redeemed.daemonPublicKey,
-          relayPairingPeerId: redeemed.relayPairingPeerId,
-          serverSignature: redeemed.serverSignature,
-        },
-      });
-      this.pairingChannelKeys.delete(frame.offerId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      reply({
-        type: 'relay_pairing_redeem_response',
-        requestId,
-        ok: false,
-        errorCode: 'PAIRING_REDEEM_FAILED',
-        error: message,
-      });
-    }
+    await handleRelayPairingRedeemRequest({
+      frame,
+      reply,
+      pairingChannelKeys: this.pairingChannelKeys,
+      maxAgeMs: this.pairingChannelTtlMs,
+      maxEntries: this.pairingChannelMaxEntries,
+    });
   }
 
-  private prunePairingChannelKeys(
+  prunePairingChannelKeys(
     now = Date.now(),
     maxAgeMs = this.pairingChannelTtlMs,
     maxEntries = this.pairingChannelMaxEntries,
   ): void {
-    for (const [offerId, channel] of this.pairingChannelKeys.entries()) {
-      if (now - channel.createdAt > maxAgeMs) {
-        this.pairingChannelKeys.delete(offerId);
-      }
-    }
-    const overflow = this.pairingChannelKeys.size - maxEntries;
-    if (overflow <= 0) {
-      return;
-    }
-    const oldest = Array.from(this.pairingChannelKeys.entries())
-      .sort((a, b) => a[1].createdAt - b[1].createdAt)
-      .slice(0, overflow);
-    for (const [offerId] of oldest) {
-      this.pairingChannelKeys.delete(offerId);
-    }
+    pruneRelayPairingChannelKeys(this.pairingChannelKeys, now, maxAgeMs, maxEntries);
   }
 
   private flushPendingOutbound(): void {
@@ -1149,164 +722,11 @@ export class DaemonRelayBridge {
     return resolved;
   }
 
-  private async issueRelayToken(): Promise<{
+  private issueRelayToken(): Promise<{
     relayToken: string;
     profile: RelayHandshakeProfile;
   }> {
-    const url = `${this.options.relayServerUrl.replace(/\/+$/, '')}/api/poc/relay-token`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8_000);
-    let res: Response;
-    if (!this.daemonIssueToken) {
-      throw new BridgeError('TOKEN_ISSUE_FAILED', 'missing daemon issue token');
-    }
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          role: 'workspace-daemon',
-          workspaceId: this.options.workspaceId,
-          credential: this.daemonIssueToken,
-        }),
-        signal: controller.signal,
-      });
-    } catch (error) {
-      clearTimeout(timeout);
-      throw new BridgeError(
-        'TOKEN_ISSUE_FAILED',
-        error instanceof Error ? error.message : String(error),
-      );
-    }
-    clearTimeout(timeout);
-    const parsed = await parseRelayIssueResponse(res);
-    if (!res.ok || !parsed.ok || !parsed.relayToken) {
-      const reason = parsed.reason ?? parsed.error ?? `HTTP ${res.status}`;
-      throw new BridgeError('TOKEN_ISSUE_FAILED', `issue relay token failed: ${reason}`);
-    }
-
-    let tokenClaims: RelayTokenClaims;
-    let verificationKeys = await this.resolveRelayTokenVerificationKeys(false);
-    try {
-      tokenClaims = verifyRelayTokenClaims(parsed.relayToken, {
-        issuer: this.options.relayTokenIssuer ?? 'viewport-server-poc',
-        audience: this.options.relayTokenAudience ?? 'viewport-relay',
-        signingKeys: verificationKeys,
-        clockSkewSec: this.options.relayTokenClockSkewSec ?? 30,
-      });
-    } catch (error) {
-      if (
-        this.relayTokenJwksUrl &&
-        error instanceof BridgeError &&
-        error.code === 'TOKEN_RESPONSE_INVALID' &&
-        error.message.includes('is not trusted')
-      ) {
-        verificationKeys = await this.resolveRelayTokenVerificationKeys(true);
-        tokenClaims = verifyRelayTokenClaims(parsed.relayToken, {
-          issuer: this.options.relayTokenIssuer ?? 'viewport-server-poc',
-          audience: this.options.relayTokenAudience ?? 'viewport-relay',
-          signingKeys: verificationKeys,
-          clockSkewSec: this.options.relayTokenClockSkewSec ?? 30,
-        });
-      } else {
-        throw error;
-      }
-    }
-    const profile = parseRelayHandshakeProfile(tokenClaims.e2eeProfile ?? 'noise-ik');
-    if (!profile) {
-      throw new BridgeError('TOKEN_RESPONSE_INVALID', 'missing/invalid e2eeProfile claim');
-    }
-
-    return {
-      relayToken: parsed.relayToken,
-      profile,
-    };
-  }
-
-  private async resolveRelayTokenVerificationKeys(
-    forceRefresh: boolean,
-  ): Promise<Record<string, string>> {
-    if (!this.relayTokenJwksUrl) {
-      return this.relayTokenSigningKeys;
-    }
-    const now = Date.now();
-    if (!forceRefresh && now < this.jwksCacheExpiresAt && Object.keys(this.jwksCacheKeys).length) {
-      return this.jwksCacheKeys;
-    }
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8_000);
-
-    let res: Response;
-    try {
-      res = await fetch(this.relayTokenJwksUrl, {
-        method: 'GET',
-        headers: { accept: 'application/json' },
-        signal: controller.signal,
-      });
-    } catch (error) {
-      clearTimeout(timeout);
-      throw new BridgeError(
-        'TOKEN_RESPONSE_INVALID',
-        `failed to fetch JWKS: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    clearTimeout(timeout);
-
-    if (!res.ok) {
-      throw new BridgeError('TOKEN_RESPONSE_INVALID', `JWKS endpoint returned HTTP ${res.status}`);
-    }
-
-    const parsed = (await res.json().catch(() => null)) as JwksResponse | null;
-    if (!parsed || !Array.isArray(parsed.keys)) {
-      throw new BridgeError('TOKEN_RESPONSE_INVALID', 'JWKS response missing keys array');
-    }
-    if (parsed.keys.length > MAX_JWKS_KEYS) {
-      throw new BridgeError(
-        'TOKEN_RESPONSE_INVALID',
-        `JWKS response contains too many keys (${parsed.keys.length} > ${MAX_JWKS_KEYS})`,
-      );
-    }
-
-    const keys: Record<string, string> = {};
-    for (const entry of parsed.keys) {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
-      const kid = typeof entry['kid'] === 'string' ? entry['kid'].trim() : '';
-      const kty = typeof entry['kty'] === 'string' ? entry['kty'] : '';
-      const alg = typeof entry['alg'] === 'string' ? entry['alg'] : '';
-      const n = typeof entry['n'] === 'string' ? entry['n'] : '';
-      const e = typeof entry['e'] === 'string' ? entry['e'] : '';
-      if (!kid || kty !== 'RSA' || !n || !e) continue;
-      if (alg && alg !== 'RS256') continue;
-
-      try {
-        const keyObject = crypto.createPublicKey({
-          key: { kty: 'RSA', n, e },
-          format: 'jwk',
-        });
-        keys[kid] = keyObject.export({ format: 'pem', type: 'spki' }).toString();
-      } catch {
-        continue;
-      }
-    }
-
-    if (Object.keys(keys).length === 0) {
-      throw new BridgeError('TOKEN_RESPONSE_INVALID', 'JWKS contained no usable signing keys');
-    }
-
-    this.jwksCacheKeys = keys;
-    this.jwksCacheExpiresAt = Date.now() + 5 * 60_000;
-    return keys;
-  }
-
-  private normalizeError(error: unknown): BridgeError {
-    if (error instanceof BridgeError) {
-      return error;
-    }
-    if (error instanceof Error) {
-      return new BridgeError('UNKNOWN', error.message);
-    }
-    return new BridgeError('UNKNOWN', String(error));
+    return this.relayTokenIssuer.issue();
   }
 
   private recordError(code: BridgeErrorCode, message: string): void {

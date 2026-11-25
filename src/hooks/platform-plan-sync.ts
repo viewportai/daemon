@@ -1,0 +1,142 @@
+import { openUrl } from '../cli/open-url.js';
+import { resolveConfiguredWorkspaceSyncTarget } from '../cli/context-sync-target.js';
+import { resolveLocalOrgBindingSync } from '../cli/org-binding.js';
+import type { Daemon } from '../core/daemon.js';
+import type { DaemonEvents } from '../core/events.js';
+import { saveTrustedEdgePlanDraft } from './trusted-edge-plan-artifacts.js';
+
+type PlanProposedEvent = DaemonEvents['hook:plan-proposed'];
+type UrlOpener = (url: string) => void;
+type PlanSaver = typeof saveTrustedEdgePlanDraft;
+
+export interface PlatformPlanHookSyncResult {
+  opened: boolean;
+  reason?: string;
+  planUrl?: string;
+}
+
+export class PlatformPlanHookSync {
+  private readonly recentlyOpened = new Map<string, number>();
+
+  constructor(
+    private readonly daemon: Pick<Daemon, 'configManager'>,
+    private readonly urlOpener: UrlOpener = openUrl,
+    private readonly planSaver: PlanSaver = saveTrustedEdgePlanDraft,
+  ) {}
+
+  async send(event: PlanProposedEvent): Promise<PlatformPlanHookSyncResult> {
+    const target = this.targetFor(event);
+    if (!target) return { opened: false, reason: 'missing_platform_target' };
+
+    const dedupeKey = this.dedupeKeyFor(event);
+    const now = Date.now();
+    this.pruneRecentlyOpened(now);
+    if (this.recentlyOpened.has(dedupeKey)) {
+      return { opened: false, reason: 'duplicate_plan_event' };
+    }
+    this.recentlyOpened.set(dedupeKey, now);
+
+    let planId: string;
+    let unlockSessionId: string | undefined;
+    try {
+      const saved = await this.planSaver({ event, target });
+      planId = saved.planId;
+      unlockSessionId = saved.unlockSessionId;
+    } catch {
+      this.recentlyOpened.delete(dedupeKey);
+      return { opened: false, reason: 'trusted_edge_save_failed' };
+    }
+
+    const planUrl = buildSavedPlanUrl(target.appUrl, target.workspaceId, planId, unlockSessionId);
+    try {
+      this.urlOpener(planUrl);
+    } catch {
+      this.recentlyOpened.delete(dedupeKey);
+      return { opened: false, reason: 'browser_open_failed', planUrl };
+    }
+
+    return { opened: true, planUrl };
+  }
+
+  private dedupeKeyFor(event: PlanProposedEvent): string {
+    return [event.sessionId, event.body.trim()].join('\0');
+  }
+
+  private pruneRecentlyOpened(now: number): void {
+    for (const [key, seenAt] of this.recentlyOpened) {
+      if (now - seenAt > 30_000) {
+        this.recentlyOpened.delete(key);
+      }
+    }
+  }
+
+  private targetFor(event: PlanProposedEvent): {
+    appUrl: string;
+    workspaceId: string;
+    serverUrl: string;
+    credential: string;
+    tlsVerify?: 'auto' | '0' | '1';
+    caCertPath?: string;
+    tlsPins?: string[];
+  } | null {
+    const daemonConfig = this.daemon.configManager.getDaemonConfig();
+    if (!daemonConfig) return null;
+
+    const explicitCwd = typeof event.cwd === 'string' && event.cwd.length > 0;
+    const cwd = explicitCwd ? event.cwd! : process.cwd();
+    const binding = resolveLocalOrgBindingSync(cwd);
+    if (explicitCwd && !binding) return null;
+    if (binding && !binding.streamEnabled) return null;
+    const requestedWorkspaceId = binding?.organizationId;
+    const target = resolveConfiguredWorkspaceSyncTarget(daemonConfig, { requestedWorkspaceId });
+    if (!target) return null;
+
+    return {
+      appUrl: inferAppUrl(daemonConfig.server?.appUrl, target.serverUrl),
+      workspaceId: target.workspaceId,
+      serverUrl: target.serverUrl,
+      credential: target.credential,
+      tlsVerify: target.tlsVerify,
+      caCertPath: target.caCertPath,
+      tlsPins: target.tlsPins,
+    };
+  }
+}
+
+function buildSavedPlanUrl(
+  appUrl: string,
+  workspaceId: string,
+  planId: string,
+  unlockSessionId?: string,
+): string {
+  const url = new URL('/plans', appUrl);
+  url.searchParams.set('resource_id', workspaceId);
+  url.searchParams.set('plan_id', planId);
+  if (unlockSessionId) {
+    url.searchParams.set('trusted_edge_unlock_session_id', unlockSessionId);
+  }
+  return url.toString();
+}
+
+function inferAppUrl(configuredAppUrl: string | undefined, serverUrl: string): string {
+  if (configuredAppUrl?.trim()) return configuredAppUrl.trim().replace(/\/+$/, '');
+
+  try {
+    const url = new URL(serverUrl);
+    if (url.hostname === 'api.getviewport.com') {
+      url.hostname = 'app.getviewport.com';
+      return url.toString().replace(/\/+$/, '');
+    }
+    if (url.hostname === 'getviewport.test' || url.hostname === 'api.getviewport.test') {
+      url.hostname = 'app.getviewport.test';
+      return url.toString().replace(/\/+$/, '');
+    }
+    if (url.hostname === 'getviewport.dev' || url.hostname === 'api.getviewport.dev') {
+      url.hostname = 'app.getviewport.dev';
+      return url.toString().replace(/\/+$/, '');
+    }
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    return serverUrl.replace(/\/+$/, '');
+  }
+}

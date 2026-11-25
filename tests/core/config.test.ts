@@ -8,8 +8,10 @@ import {
   resolveConfig,
   ConfigManager,
   loadConfig,
+  resolveResourceOverrideConfig,
   saveConfig,
 } from '../../src/core/config.js';
+import { sanitizeMachineDisplayName } from '../../src/core/machine-name.js';
 import { AgentRegistry } from '../../src/core/agent-registry.js';
 import { claudeAgent } from '../../src/agents/claude.js';
 import type { GitTrackerConfig } from '../../src/core/types.js';
@@ -77,6 +79,14 @@ describe('deepMerge', () => {
     const nested = result['nested'] as Record<string, unknown>;
     expect(nested['value']).toBe(3);
     expect(nested['safe']).toBeUndefined();
+  });
+});
+
+describe('sanitizeMachineDisplayName', () => {
+  it('trims whitespace, removes control characters, and bounds display names', () => {
+    expect(sanitizeMachineDisplayName('  Mehr\u0000\n MacBook\t Pro  ')).toBe('Mehr MacBook Pro');
+    expect(sanitizeMachineDisplayName('x'.repeat(120))).toHaveLength(80);
+    expect(sanitizeMachineDisplayName(' \n\t ')).toBeNull();
   });
 });
 
@@ -184,15 +194,35 @@ describe('BUILT_IN_DEFAULTS', () => {
 describe('Config I/O', () => {
   let tmpDir: string;
   let originalHome: string;
+  let originalResourceOverrideDir: string | undefined;
+  let originalLegacyResourceOverrideDir: string | undefined;
+  let originalCwd: string;
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-config-test-'));
     originalHome = process.env['HOME'] ?? '';
+    originalResourceOverrideDir = process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'];
+    originalLegacyResourceOverrideDir = process.env['VPD_RESOURCE_OVERRIDE_DIR'];
+    originalCwd = process.cwd();
     process.env['HOME'] = tmpDir;
+    delete process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'];
+    delete process.env['VPD_RESOURCE_OVERRIDE_DIR'];
+    process.chdir(tmpDir);
   });
 
   afterEach(async () => {
+    process.chdir(originalCwd);
     process.env['HOME'] = originalHome;
+    if (originalResourceOverrideDir === undefined) {
+      delete process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'];
+    } else {
+      process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'] = originalResourceOverrideDir;
+    }
+    if (originalLegacyResourceOverrideDir === undefined) {
+      delete process.env['VPD_RESOURCE_OVERRIDE_DIR'];
+    } else {
+      process.env['VPD_RESOURCE_OVERRIDE_DIR'] = originalLegacyResourceOverrideDir;
+    }
     await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
@@ -214,17 +244,150 @@ describe('Config I/O', () => {
     expect(stat.mode & 0o777).toBe(0o600);
   });
 
+  it('saveConfig tightens permissions on an existing config file', async () => {
+    const configPath = path.join(tmpDir, '.viewport', 'config.json');
+    await fs.mkdir(path.dirname(configPath), { recursive: true });
+    await fs.writeFile(configPath, '{}\n', { encoding: 'utf-8', mode: 0o644 });
+
+    await saveConfig({ machineId: 'test-machine' });
+
+    const stat = await fs.stat(configPath);
+    expect(stat.mode & 0o777).toBe(0o600);
+  });
+
   it('loadConfig reads back what saveConfig wrote', async () => {
-    await saveConfig({ machineId: 'roundtrip', relayUrl: 'wss://relay.test.com' });
+    await saveConfig({ machineId: 'roundtrip' });
     const config = await loadConfig();
     expect(config.machineId).toBe('roundtrip');
-    expect(config.relayUrl).toBe('wss://relay.test.com');
+  });
+
+  it('loadConfig merges a resource override on top of the global config', async () => {
+    await saveConfig({
+      daemon: {
+        server: { url: 'https://getviewport.com' },
+        relay: {
+          enabled: true,
+          serverUrl: 'https://app.getviewport.com',
+          endpoint: 'wss://relay.getviewport.com/ws',
+        },
+      },
+    });
+
+    const resourceOverrideConfigDir = path.join(tmpDir, 'repo', '.viewport');
+    await fs.mkdir(resourceOverrideConfigDir, { recursive: true });
+    await fs.writeFile(
+      path.join(resourceOverrideConfigDir, 'config.json'),
+      JSON.stringify({
+        daemon: {
+          server: { url: 'https://getviewport.test' },
+          relay: {
+            serverUrl: 'https://getviewport.test',
+            endpoint: 'wss://getviewport.test:7781/ws',
+          },
+        },
+      }),
+      'utf-8',
+    );
+
+    process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'] = resourceOverrideConfigDir;
+    const config = await loadConfig();
+    expect(config.daemon?.server?.url).toBe('https://getviewport.test');
+    expect(config.daemon?.relay?.serverUrl).toBe('https://getviewport.test');
+    expect(config.daemon?.relay?.endpoint).toBe('wss://getviewport.test:7781/ws');
+  });
+
+  it('resolveResourceOverrideConfig ignores ancestor .viewport daemon configs', async () => {
+    const sharedConfigDir = path.join(tmpDir, '.viewport');
+    const repoDir = path.join(tmpDir, 'repo');
+    await fs.mkdir(path.join(repoDir, '.viewport', 'worktrees'), { recursive: true });
+    await fs.mkdir(sharedConfigDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sharedConfigDir, 'config.json'),
+      JSON.stringify({ daemon: { server: { url: 'https://getviewport.test' } } }),
+      'utf-8',
+    );
+
+    process.chdir(repoDir);
+
+    expect(resolveResourceOverrideConfig()).toEqual({
+      dir: null,
+      source: null,
+    });
+  });
+
+  it('resolveResourceOverrideConfig ignores explicit directories without config files', async () => {
+    const sharedConfigDir = path.join(tmpDir, '.viewport');
+    const repoConfigDir = path.join(tmpDir, 'repo', '.viewport');
+    await fs.mkdir(repoConfigDir, { recursive: true });
+    await fs.mkdir(sharedConfigDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sharedConfigDir, 'config.json'),
+      JSON.stringify({ daemon: { server: { url: 'https://getviewport.test' } } }),
+      'utf-8',
+    );
+
+    process.env['VPD_RESOURCE_OVERRIDE_DIR'] = repoConfigDir;
+    process.chdir(path.dirname(repoConfigDir));
+
+    expect(resolveResourceOverrideConfig()).toEqual({
+      dir: null,
+      source: null,
+    });
+  });
+
+  it('resolveResourceOverrideConfig ignores checked-in resource configs and ancestor daemon configs', async () => {
+    const repoConfigDir = path.join(tmpDir, 'repo', '.viewport');
+    const sharedConfigDir = path.join(tmpDir, '.viewport');
+    await fs.mkdir(repoConfigDir, { recursive: true });
+    await fs.mkdir(sharedConfigDir, { recursive: true });
+    await fs.writeFile(
+      path.join(repoConfigDir, 'config.json'),
+      JSON.stringify({
+        version: 1,
+        resources: {
+          contexts: ['ctx_auth'],
+        },
+      }),
+      'utf-8',
+    );
+    await fs.writeFile(
+      path.join(sharedConfigDir, 'config.json'),
+      JSON.stringify({ daemon: { server: { url: 'https://getviewport.test' } } }),
+      'utf-8',
+    );
+
+    process.chdir(path.dirname(repoConfigDir));
+
+    expect(resolveResourceOverrideConfig()).toEqual({
+      dir: null,
+      source: null,
+    });
+  });
+
+  it('loadConfig does not parse checked-in resource configs as daemon config', async () => {
+    const repoConfigDir = path.join(tmpDir, 'repo', '.viewport');
+    await fs.mkdir(repoConfigDir, { recursive: true });
+    await fs.writeFile(
+      path.join(repoConfigDir, 'config.json'),
+      JSON.stringify({
+        version: 1,
+        resources: {
+          contexts: ['ctx_auth'],
+        },
+      }),
+      'utf-8',
+    );
+
+    process.chdir(path.dirname(repoConfigDir));
+
+    await expect(loadConfig()).resolves.toEqual({});
   });
 
   it('loadConfig throws on malformed JSON with actionable error', async () => {
     const dir = path.join(tmpDir, '.viewport');
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, 'config.json'), '{ bad json !!!', 'utf-8');
+    process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'] = dir;
 
     await expect(loadConfig()).rejects.toThrow('Invalid viewport config JSON');
   });
@@ -241,23 +404,106 @@ describe('Config I/O', () => {
       }),
       'utf-8',
     );
+    process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'] = dir;
 
     await expect(loadConfig()).rejects.toThrow('Invalid viewport config schema');
+  });
+
+  it('migrates removed daemon relay keys and persists the sanitized config', async () => {
+    const dir = path.join(tmpDir, '.viewport');
+    await fs.mkdir(dir, { recursive: true });
+    const configPath = path.join(dir, 'config.json');
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({
+        daemon: {
+          relay: {
+            enabled: true,
+            endpoint: 'ws://127.0.0.1:7781/ws',
+            serverUrl: 'http://127.0.0.1:8787',
+            workspaceId: 'workspace_demo',
+            installId: 'install_demo',
+            runtimeTargetId: 'legacy-target',
+            issueToken: 'install-issue-token',
+            enrollToken: 'workspace-enroll-token',
+            projectMachineBindingId: 'removed-runtime-target-alias',
+            tlsVerify: '0',
+          },
+        },
+      }),
+      'utf-8',
+    );
+
+    const config = await loadConfig();
+    expect(config.daemon?.relay?.issueToken).toBe('install-issue-token');
+    expect(config.daemon?.relay?.runtimeTargetId).toBe('legacy-target');
+    expect((config.daemon?.relay as Record<string, unknown>)['enrollToken']).toBeUndefined();
+    expect(
+      (config.daemon?.relay as Record<string, unknown>)['projectMachineBindingId'],
+    ).toBeUndefined();
+
+    const rewritten = JSON.parse(await fs.readFile(configPath, 'utf-8')) as {
+      daemon?: { relay?: Record<string, unknown> };
+    };
+    expect(rewritten.daemon?.relay?.['enrollToken']).toBeUndefined();
+    expect(rewritten.daemon?.relay?.['projectMachineBindingId']).toBeUndefined();
+    expect(rewritten.daemon?.relay?.['runtimeTargetId']).toBe('legacy-target');
+  });
+
+  it('migrates legacy projectMachineBindingId into runtimeTargetId when needed', async () => {
+    const dir = path.join(tmpDir, '.viewport');
+    await fs.mkdir(dir, { recursive: true });
+    const configPath = path.join(dir, 'config.json');
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({
+        daemon: {
+          relay: {
+            enabled: true,
+            serverUrl: 'http://127.0.0.1:8787',
+            workspaceId: 'workspace_demo',
+            projectMachineBindingId: 'legacy-binding-only',
+          },
+        },
+      }),
+      'utf-8',
+    );
+
+    const config = await loadConfig();
+
+    expect(config.daemon?.relay?.runtimeTargetId).toBe('legacy-binding-only');
+    expect(
+      (config.daemon?.relay as Record<string, unknown>)['projectMachineBindingId'],
+    ).toBeUndefined();
+
+    const rewritten = JSON.parse(await fs.readFile(configPath, 'utf-8')) as {
+      daemon?: { relay?: Record<string, unknown> };
+    };
+    expect(rewritten.daemon?.relay?.['runtimeTargetId']).toBe('legacy-binding-only');
+    expect(rewritten.daemon?.relay?.['projectMachineBindingId']).toBeUndefined();
   });
 });
 
 describe('ConfigManager', () => {
   let tmpDir: string;
   let originalHome: string;
+  let originalResourceOverrideDir: string | undefined;
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-cfgmgr-test-'));
     originalHome = process.env['HOME'] ?? '';
+    originalResourceOverrideDir = process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'];
     process.env['HOME'] = tmpDir;
+    delete process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'];
   });
 
   afterEach(async () => {
     process.env['HOME'] = originalHome;
+    if (originalResourceOverrideDir === undefined) {
+      delete process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'];
+    } else {
+      process.env['VIEWPORT_RESOURCE_OVERRIDE_DIR'] = originalResourceOverrideDir;
+    }
     await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
@@ -349,19 +595,6 @@ describe('ConfigManager', () => {
     expect(mgr.getMachineId()).toBe('custom-machine');
   });
 
-  it('returns relay URL when configured', async () => {
-    await saveConfig({ relayUrl: 'wss://relay.test.com' });
-    const mgr = new ConfigManager();
-    await mgr.load();
-    expect(mgr.getRelayUrl()).toBe('wss://relay.test.com');
-  });
-
-  it('returns undefined relay URL when not configured', async () => {
-    const mgr = new ConfigManager();
-    await mgr.load();
-    expect(mgr.getRelayUrl()).toBeUndefined();
-  });
-
   it('sets global defaults', async () => {
     const mgr = new ConfigManager();
     await mgr.load();
@@ -407,5 +640,39 @@ describe('ConfigManager', () => {
         },
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it('clears persisted optional relay credentials when set to undefined', async () => {
+    const mgr = new ConfigManager();
+    await mgr.load();
+
+    await mgr.setDaemonConfig({
+      relay: {
+        enabled: true,
+        endpoint: 'wss://relay.getviewport.com/ws',
+        serverUrl: 'https://app.getviewport.com',
+        workspaceId: 'workspace_demo',
+        installId: 'install_demo',
+        issueToken: 'install-issue-token',
+        tlsVerify: 'auto',
+      },
+    });
+
+    await mgr.setDaemonConfig({
+      relay: {
+        workspaceId: 'workspace_new',
+        installId: 'install_new',
+        issueToken: 'install-issue-token-new',
+      },
+    });
+
+    const relay = mgr.getDaemonConfig()?.relay;
+    expect(relay?.workspaceId).toBe('workspace_new');
+    expect(relay?.installId).toBe('install_new');
+    expect(relay?.issueToken).toBe('install-issue-token-new');
+
+    const reloaded = new ConfigManager();
+    await reloaded.load();
+    expect(reloaded.getDaemonConfig()?.relay?.issueToken).toBe('install-issue-token-new');
   });
 });

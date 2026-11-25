@@ -21,8 +21,13 @@ import type { PermissionCoordinator } from './permission-coordinator.js';
 import { NoopTracker } from '../tracking/noop-tracker.js';
 import { ViewportError } from './errors.js';
 import { logger } from './logger.js';
+import { buildSessionPromptWithContext } from './session-context-prompt.js';
 
 const log = logger.child({ module: 'session-manager' });
+
+function defaultSessionAgentMode(config: SessionConfig): SessionAgentMode {
+  return config.trust === 'automated' && config.approvalPolicy === 'never' ? 'bypass' : 'detect';
+}
 
 // ---------------------------------------------------------------------------
 // Session record — internal tracking of active sessions
@@ -52,6 +57,7 @@ export interface ActiveSession {
 export class SessionManager {
   private sessions = new Map<string, ActiveSession>();
   private sessionModes = new Map<string, SessionAgentMode>();
+  private sessionEndReasons = new Map<string, string>();
 
   constructor(
     private readonly eventBus: TypedEventEmitter<DaemonEvents>,
@@ -99,7 +105,10 @@ export class SessionManager {
 
     // Create tracker (falls back to noop if git setup fails — e.g. not a git repo)
     const sessionId = crypto.randomUUID();
+    this.sessionEndReasons.delete(sessionId);
     const { tracker, worktreePath } = await this.setupTracker(config, sessionId, dir.path);
+    const initialMode = defaultSessionAgentMode(config);
+    this.permissionCoordinator.setSessionMode(sessionId, initialMode);
 
     // Wire permission handler
     const canUseTool = this.permissionCoordinator.createPermissionHandler(
@@ -108,12 +117,21 @@ export class SessionManager {
     );
 
     // Start session
-    const session = await adapter.startSession(worktreePath, {
-      initialPrompt: prompt,
-      model: config.model,
-      canUseTool,
-      config,
-    });
+    let session: Session;
+    try {
+      session = await adapter.startSession(worktreePath, {
+        initialPrompt: prompt,
+        deferInitialPrompt: true,
+        model: config.model,
+        effort: config.effort,
+        allowedTools: config.allowedTools,
+        canUseTool,
+        config,
+      });
+    } catch (err) {
+      this.permissionCoordinator.clearSessionMode(sessionId);
+      throw err;
+    }
 
     // Store active session
     const active: ActiveSession = {
@@ -125,7 +143,7 @@ export class SessionManager {
       worktreePath,
     };
     this.sessions.set(sessionId, active);
-    this.sessionModes.set(sessionId, 'detect');
+    this.sessionModes.set(sessionId, initialMode);
     this.directoryManager.addSession(directoryId, sessionId);
     this.eventBus.adjustMaxListeners(this.sessions.size);
 
@@ -134,6 +152,8 @@ export class SessionManager {
 
     // Emit session started
     this.eventBus.emit('session:started', { sessionId, directoryId, config });
+
+    this.dispatchInitialPrompt(sessionId, prompt);
 
     return sessionId;
   }
@@ -168,16 +188,28 @@ export class SessionManager {
     }
 
     const { tracker, worktreePath } = await this.setupTracker(config, originalSessionId, dir.path);
+    this.sessionEndReasons.delete(originalSessionId);
+    const initialMode = defaultSessionAgentMode(config);
+    this.permissionCoordinator.setSessionMode(originalSessionId, initialMode);
     const canUseTool = this.permissionCoordinator.createPermissionHandler(originalSessionId, () => {
       return this.sessions.get(originalSessionId)?.config ?? config;
     });
 
-    const session = await adapter.resumeSession(originalSessionId, worktreePath, {
-      initialPrompt: prompt,
-      model: config.model,
-      canUseTool,
-      config,
-    });
+    let session: Session;
+    try {
+      session = await adapter.resumeSession(originalSessionId, worktreePath, {
+        initialPrompt: prompt,
+        deferInitialPrompt: true,
+        model: config.model,
+        effort: config.effort,
+        allowedTools: config.allowedTools,
+        canUseTool,
+        config,
+      });
+    } catch (err) {
+      this.permissionCoordinator.clearSessionMode(originalSessionId);
+      throw err;
+    }
 
     const active: ActiveSession = {
       session,
@@ -188,11 +220,13 @@ export class SessionManager {
       worktreePath,
     };
     this.sessions.set(originalSessionId, active);
-    this.sessionModes.set(originalSessionId, 'detect');
+    this.sessionModes.set(originalSessionId, initialMode);
     this.directoryManager.addSession(directoryId, originalSessionId);
     this.eventBus.adjustMaxListeners(this.sessions.size);
     this.wireSessionEvents(originalSessionId, active);
     this.eventBus.emit('session:started', { sessionId: originalSessionId, directoryId, config });
+
+    this.dispatchInitialPrompt(originalSessionId, prompt);
 
     return originalSessionId;
   }
@@ -224,6 +258,7 @@ export class SessionManager {
   getSessionInfo(sessionId: string): {
     state: SessionState;
     directoryId: string;
+    resourceId?: string;
     agent: string;
     mode: SessionAgentMode;
     steps: ReadonlyArray<Step>;
@@ -232,15 +267,25 @@ export class SessionManager {
     return {
       state: active.session.state,
       directoryId: active.directoryId,
+      resourceId: active.config.resourceId,
       agent: active.config.agent,
       mode: this.getSessionMode(sessionId),
       steps: active.tracker.steps,
     };
   }
 
+  getSessionNativeId(sessionId: string): string {
+    return this.getActiveSession(sessionId).session.id;
+  }
+
+  getSessionEndReason(sessionId: string): string | undefined {
+    return this.sessionEndReasons.get(sessionId);
+  }
+
   listSessionSummaries(): Array<{
     sessionId: string;
     directoryId: string;
+    resourceId?: string;
     agent: string;
     state: SessionState;
     mode: SessionAgentMode;
@@ -249,6 +294,7 @@ export class SessionManager {
     return [...this.sessions.entries()].map(([sessionId, active]) => ({
       sessionId,
       directoryId: active.directoryId,
+      resourceId: active.config.resourceId,
       agent: active.config.agent,
       state: active.session.state,
       mode: this.getSessionMode(sessionId),
@@ -326,6 +372,10 @@ export class SessionManager {
   /** Check if a session exists. */
   hasSession(sessionId: string): boolean {
     return this.sessions.has(sessionId);
+  }
+
+  getSessionWorktreePath(sessionId: string): string {
+    return this.getActiveSession(sessionId).worktreePath;
   }
 
   /** Get the session config (for runtime permission updates). */
@@ -406,6 +456,46 @@ export class SessionManager {
     return active;
   }
 
+  private dispatchInitialPrompt(sessionId: string, prompt: string | undefined): void {
+    const text = prompt?.trim();
+    if (!text) return;
+
+    setImmediate(() => {
+      void this.sendInitialPrompt(sessionId, text).catch((err) => {
+        log.warn({ sessionId, err }, 'Initial prompt dispatch failed');
+        this.failInitialPromptDispatch(sessionId, err);
+      });
+    });
+  }
+
+  private failInitialPromptDispatch(sessionId: string, err: unknown): void {
+    const reason = `error: ${err instanceof Error ? err.message : String(err)}`;
+    if (this.sessionEndReasons.has(sessionId)) return;
+
+    const active = this.sessions.get(sessionId);
+    if (active) {
+      active.session.emit('ended', reason);
+      return;
+    }
+
+    this.sessionEndReasons.set(sessionId, reason);
+    this.eventBus.emit('session:state-changed', { sessionId, state: 'errored' });
+    this.eventBus.emit('session:ended', { sessionId, reason });
+  }
+
+  private async sendInitialPrompt(sessionId: string, text: string): Promise<void> {
+    const active = this.getActiveSession(sessionId);
+    const directory = this.directoryManager.get(active.directoryId);
+    const prompt =
+      active.config.contextInjection === 'disabled'
+        ? text
+        : await buildSessionPromptWithContext({
+            workingDirectory: directory?.path ?? active.worktreePath,
+            prompt: text,
+          });
+    await this.sendPrompt(sessionId, prompt);
+  }
+
   /**
    * Create and set up a tracker. If GitTracker setup fails (e.g. directory
    * isn't a git repo), falls back to NoopTracker and logs a warning.
@@ -450,6 +540,7 @@ export class SessionManager {
       session.off('state-change', onStateChange);
       session.off('ended', onEnded);
 
+      this.sessionEndReasons.set(sessionId, reason);
       this.eventBus.emit('session:ended', { sessionId, reason });
 
       // Reject any dangling permission promises before teardown

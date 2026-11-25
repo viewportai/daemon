@@ -33,10 +33,12 @@ function codeToStatus(code: ViewportErrorCode): number {
     case ErrorCodes.RATE_LIMITED:
       return 429;
     case ErrorCodes.SESSION_NOT_FOUND:
+    case ErrorCodes.DISCOVERED_SESSION_NOT_FOUND:
     case ErrorCodes.DIRECTORY_NOT_FOUND:
     case ErrorCodes.DIRECTORY_NOT_REGISTERED:
       return 404;
     case ErrorCodes.SESSION_ALREADY_EXISTS:
+    case ErrorCodes.SESSION_NOT_RESUMABLE:
       return 409;
     case ErrorCodes.INVALID_INPUT:
     case ErrorCodes.CONFIG_INVALID:

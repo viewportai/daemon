@@ -16,9 +16,14 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { parseJSONLEntry, type RichSessionMessage } from './jsonl-entry-parser.js';
+import { claudeProjectsDir, decodeProjectDir } from './jsonl-paths.js';
+
+export { parseJSONLEntry } from './jsonl-entry-parser.js';
+export type { RichSessionMessage } from './jsonl-entry-parser.js';
+export { claudeProjectsDir, decodeProjectDir, encodeProjectDir } from './jsonl-paths.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,6 +33,16 @@ export interface SessionSummary {
   sessionId: string;
   /** First user message (truncated). */
   summary: string;
+  nativeTitle?: string;
+  generatedTitle?: string;
+  displayTitle?: string;
+  titleSource?: 'native' | 'generated' | 'first_prompt' | 'fallback';
+  firstPrompt?: string;
+  lastPrompt?: string;
+  latestModel?: string;
+  approvalPolicy?: string;
+  sandboxMode?: string;
+  reasoningEffort?: string;
   /** Message count (user + assistant). */
   messageCount: number;
   /** Last activity ISO timestamp. */
@@ -38,6 +53,8 @@ export interface SessionSummary {
   gitBranch?: string;
   /** Whether session can be resumed via SDK. */
   resumable: boolean;
+  /** Source JSONL file backing this session. */
+  sourcePath?: string;
 }
 
 export interface SessionMessage {
@@ -48,91 +65,8 @@ export interface SessionMessage {
 }
 
 // ---------------------------------------------------------------------------
-// Rich session messages — structured content blocks from JSONL
-// ---------------------------------------------------------------------------
-
-export type RichSessionMessage =
-  | { kind: 'text'; role: 'user' | 'assistant'; text: string; ts: string; uuid: string }
-  | {
-      kind: 'tool_use';
-      toolName: string;
-      toolId: string;
-      input: Record<string, unknown>;
-      ts: string;
-      uuid: string;
-    }
-  | {
-      kind: 'tool_result';
-      toolId: string;
-      output: string;
-      isError: boolean;
-      ts: string;
-      uuid: string;
-    }
-  | { kind: 'thinking'; text: string; ts: string; uuid: string };
-
-// ---------------------------------------------------------------------------
-// Path encoding (matches Claude Code's directory naming)
-// ---------------------------------------------------------------------------
-
-/**
- * Decode a Claude Code project directory name back to a filesystem path.
- * Claude-style encoding:
- *   '/'  -> '-'
- *   '-'  -> '--'
- * Example: /Users/dev-user/my-project -> -Users-dev--user-my--project
- */
-export function decodeProjectDir(dirName: string): string {
-  const hasLeadingSlash = dirName.startsWith('-');
-  const source = hasLeadingSlash ? dirName.slice(1) : dirName;
-  let decoded = '';
-
-  for (let i = 0; i < source.length; i += 1) {
-    const ch = source[i];
-    if (ch !== '-') {
-      decoded += ch;
-      continue;
-    }
-    const next = source[i + 1];
-    if (next === '-') {
-      decoded += '-';
-      i += 1;
-    } else {
-      decoded += '/';
-    }
-  }
-
-  return hasLeadingSlash ? `/${decoded}` : decoded;
-}
-
-/**
- * Encode a filesystem path to a Claude Code project directory name.
- * '/'  -> '-'
- * '-'  -> '--'
- */
-export function encodeProjectDir(fsPath: string): string {
-  const normalized = path.resolve(fsPath);
-  let encoded = '';
-  for (const ch of normalized) {
-    if (ch === '/') {
-      encoded += '-';
-    } else if (ch === '-') {
-      encoded += '--';
-    } else {
-      encoded += ch;
-    }
-  }
-  return encoded;
-}
-
-// ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
-
-/** Path to Claude Code's projects directory. */
-export function claudeProjectsDir(): string {
-  return path.join(os.homedir(), '.claude', 'projects');
-}
 
 /**
  * List all Claude Code project directories.
@@ -216,6 +150,12 @@ async function parseSessionSummary(
   sessionId: string,
 ): Promise<SessionSummary | null> {
   let firstUserMessage = '';
+  let lastUserMessage = '';
+  let nativeTitle = '';
+  let latestModel: string | undefined;
+  let approvalPolicy: string | undefined;
+  let sandboxMode: string | undefined;
+  let reasoningEffort: string | undefined;
   let messageCount = 0;
   let lastTimestamp = '';
   let cwd = '';
@@ -241,6 +181,18 @@ async function parseSessionSummary(
         gitBranch = entry.gitBranch;
       }
 
+      if (type === 'custom-title' && typeof entry.customTitle === 'string') {
+        nativeTitle = cleanSessionText(entry.customTitle).slice(0, 120);
+      }
+      if (!latestModel && typeof entry.model === 'string') latestModel = entry.model;
+      if (!approvalPolicy && typeof entry.permissionMode === 'string') {
+        approvalPolicy = entry.permissionMode;
+      }
+      if (!sandboxMode && typeof entry.sandboxMode === 'string') sandboxMode = entry.sandboxMode;
+      if (!reasoningEffort && typeof entry.modelReasoningEffort === 'string') {
+        reasoningEffort = entry.modelReasoningEffort;
+      }
+
       if (type === 'user' || type === 'assistant') {
         messageCount++;
 
@@ -262,8 +214,12 @@ async function parseSessionSummary(
         }
 
         // Get first user message as summary
-        if (type === 'user' && !firstUserMessage) {
-          firstUserMessage = extractTextContent(message);
+        if (type === 'user') {
+          const text = cleanSessionText(extractTextContent(message));
+          if (text) {
+            if (!firstUserMessage) firstUserMessage = text;
+            lastUserMessage = text;
+          }
         }
       }
     } catch {
@@ -279,12 +235,40 @@ async function parseSessionSummary(
   return {
     sessionId,
     summary: firstUserMessage.slice(0, 120),
+    nativeTitle: nativeTitle || undefined,
+    displayTitle: nativeTitle || firstUserMessage.slice(0, 120) || undefined,
+    titleSource: nativeTitle ? 'native' : 'first_prompt',
+    firstPrompt: firstUserMessage || undefined,
+    lastPrompt: lastUserMessage || undefined,
+    latestModel,
+    approvalPolicy,
+    sandboxMode,
+    reasoningEffort,
     messageCount,
     lastActivity: lastTimestamp || new Date().toISOString(),
     cwd,
     gitBranch,
     resumable: !resumePoisoned,
+    sourcePath: filePath,
   };
+}
+
+function cleanSessionText(value: string): string {
+  const text = value
+    .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, ' ')
+    .replace(/<cwd>[\s\S]*?<\/cwd>/gi, ' ')
+    .replace(/<shell>[\s\S]*?<\/shell>/gi, ' ')
+    .replace(/<current_date>[\s\S]*?<\/current_date>/gi, ' ')
+    .replace(/<timezone>[\s\S]*?<\/timezone>/gi, ' ')
+    .replace(
+      /^<(?:local-command-caveat|local-command-std(?:err|out)|command-(?:name|message|args)|task-notification|teammate-message|bash-(?:input|stdout))>[\s\S]*/i,
+      ' ',
+    )
+    .replace(/<\/?[a-zA-Z_][^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text || /^(none|null|n\/a|na|-|—)$/i.test(text)) return '';
+  return text;
 }
 
 /**
@@ -373,303 +357,178 @@ export async function readRichSessionMessagesFromFile(
   return blocks;
 }
 
-// ---------------------------------------------------------------------------
-// Single-entry parser (used by both readSessionMessagesRich and tail events)
-// ---------------------------------------------------------------------------
+/**
+ * Read the newest rich messages from a JSONL session file without parsing the
+ * whole transcript. Session detail pages usually need the latest timeline slice,
+ * and large Codex sessions can expand into tens of thousands of rich blocks.
+ */
+export async function readRichSessionMessagesTailFromFile(
+  filePath: string,
+  limit: number,
+  options: RichSessionTailReadOptions = {},
+): Promise<RichSessionMessage[]> {
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const stat = await handle.stat();
+    const blocksNewestFirst: RichSessionMessage[] = [];
+    const chunkSize = normalizePositiveInteger(options.chunkSize, DEFAULT_TAIL_CHUNK_SIZE);
+    const maxBytes = normalizePositiveInteger(options.maxBytes, DEFAULT_TAIL_SCAN_BYTES);
+    const maxLineBytes = normalizePositiveInteger(options.maxLineBytes, DEFAULT_TAIL_LINE_BYTES);
+    let remaining = stat.size;
+    let bytesScanned = 0;
+    let carry = Buffer.alloc(0);
+
+    while (remaining > 0 && blocksNewestFirst.length < limit && bytesScanned < maxBytes) {
+      const readSize = Math.min(chunkSize, remaining, maxBytes - bytesScanned);
+      if (readSize <= 0) break;
+      remaining -= readSize;
+      const buffer = Buffer.allocUnsafe(readSize);
+      await handle.read(buffer, 0, readSize, remaining);
+      bytesScanned += readSize;
+
+      const data =
+        carry.length > 0 ? Buffer.concat([buffer, carry], readSize + carry.length) : buffer;
+      let lineEnd = data.length;
+
+      for (
+        let index = data.length - 1;
+        index >= 0 && blocksNewestFirst.length < limit;
+        index -= 1
+      ) {
+        if (data[index] !== 0x0a) continue;
+        pushTailLineBlocks(
+          data.subarray(index + 1, lineEnd),
+          limit,
+          maxLineBytes,
+          blocksNewestFirst,
+        );
+        lineEnd = index;
+      }
+
+      carry = data.subarray(0, lineEnd);
+    }
+
+    if (remaining === 0 && blocksNewestFirst.length < limit && carry.length > 0) {
+      pushTailLineBlocks(carry, limit, maxLineBytes, blocksNewestFirst);
+    }
+
+    return blocksNewestFirst.reverse();
+  } finally {
+    await handle.close();
+  }
+}
+
+export interface RichSessionTailPage {
+  messages: RichSessionMessage[];
+  nextOffset: number;
+  hasMoreBefore: boolean;
+}
 
 /**
- * Parse a single JSONL entry (already JSON.parsed) into RichSessionMessage blocks.
- * A single entry may produce 0, 1, or many blocks (e.g. an assistant message
- * with text + tool_use + thinking blocks).
+ * Read a latest-first page from the end of a JSONL transcript.
  *
- * Extracted from readSessionMessagesRich() so both the full-file reader
- * and the incremental tailer can share the same parsing logic.
+ * `offset` is measured from the newest parsed rich block. offset=0 returns the
+ * latest page; offset=200 returns the page immediately before the newest 200
+ * blocks. Internally this still reads backwards from the file and asks for one
+ * extra block so callers can render an honest "load older" affordance without
+ * scanning the whole file.
  */
-export function parseJSONLEntry(entry: unknown): RichSessionMessage[] {
-  if (typeof entry !== 'object' || entry === null) return [];
+export async function readRichSessionMessagesTailPageFromFile(
+  filePath: string,
+  limit: number,
+  offset = 0,
+  options: RichSessionTailReadOptions = {},
+): Promise<RichSessionTailPage> {
+  const safeLimit = normalizePositiveInteger(limit, 1);
+  const safeOffset = normalizeNonNegativeInteger(offset);
+  const tail = await readRichSessionMessagesTailFromFile(
+    filePath,
+    safeLimit + safeOffset + 1,
+    options,
+  );
 
-  const e = entry as Record<string, unknown>;
-  return parseClaudeEntry(e) ?? parseCodexEntry(e) ?? [];
+  return pageFromTailMessages(tail, safeLimit, safeOffset);
 }
 
-function parseClaudeEntry(e: Record<string, unknown>): RichSessionMessage[] | null {
-  const type = e.type as string;
-  if (type !== 'user' && type !== 'assistant') return null;
+export function pageFromTailMessages<T>(
+  tail: T[],
+  limit: number,
+  offset = 0,
+): {
+  messages: T[];
+  nextOffset: number;
+  hasMoreBefore: boolean;
+} {
+  const safeLimit = normalizePositiveInteger(limit, 1);
+  const safeOffset = normalizeNonNegativeInteger(offset);
+  const withoutNewer = safeOffset > 0 ? tail.slice(0, Math.max(0, tail.length - safeOffset)) : tail;
+  const page = withoutNewer.slice(-safeLimit);
+  return {
+    messages: page,
+    nextOffset: safeOffset + page.length,
+    hasMoreBefore: withoutNewer.length > page.length,
+  };
+}
 
-  const ts = (e.timestamp as string) || new Date().toISOString();
-  const uuid = (e.uuid as string) || '';
-  const message = e.message as Record<string, unknown> | undefined;
-  if (!message) return [];
+export interface RichSessionTailReadOptions {
+  /** Bytes per backwards file read. Exposed for deterministic split-boundary tests. */
+  chunkSize?: number;
+  /** Hard cap on bytes scanned from the end of the file. Keeps live transcript requests bounded. */
+  maxBytes?: number;
+  /** Lines above this size are skipped instead of parsed into giant ack payloads. */
+  maxLineBytes?: number;
+}
 
-  const content = message.content;
-  const blocks: RichSessionMessage[] = [];
+const DEFAULT_TAIL_CHUNK_SIZE = 512 * 1024;
+const DEFAULT_TAIL_SCAN_BYTES = 64 * 1024 * 1024;
+const DEFAULT_TAIL_LINE_BYTES = 8 * 1024 * 1024;
 
-  // Simple string content → single text block
-  if (typeof content === 'string') {
-    if (content) {
-      blocks.push({ kind: 'text', role: type, text: content, ts, uuid });
+function pushTailLineBlocks(
+  lineBuffer: Buffer,
+  limit: number,
+  maxLineBytes: number,
+  outNewestFirst: RichSessionMessage[],
+): void {
+  if (outNewestFirst.length >= limit) return;
+  const line = trimAsciiWhitespace(lineBuffer);
+  if (line.length === 0 || line.length > maxLineBytes) return;
+
+  try {
+    const entry = JSON.parse(line.toString('utf-8'));
+    const parsed = parseJSONLEntry(entry);
+    for (let blockIndex = parsed.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = parsed[blockIndex];
+      if (!block) continue;
+      outNewestFirst.push(block);
+      if (outNewestFirst.length >= limit) break;
     }
-    return blocks;
+  } catch {
+    // Skip malformed JSONL lines. In active sessions the writer may leave a trailing partial line.
   }
-
-  if (!Array.isArray(content)) return blocks;
-
-  for (const block of content) {
-    if (typeof block === 'string') {
-      if (block) {
-        blocks.push({ kind: 'text', role: type, text: block, ts, uuid });
-      }
-      continue;
-    }
-
-    if (typeof block !== 'object' || block === null) continue;
-    const b = block as Record<string, unknown>;
-    const blockType = b.type as string;
-
-    switch (blockType) {
-      case 'text':
-        if (typeof b.text === 'string' && b.text) {
-          blocks.push({ kind: 'text', role: type, text: b.text, ts, uuid });
-        }
-        break;
-
-      case 'thinking':
-        if (typeof b.thinking === 'string' && b.thinking) {
-          blocks.push({ kind: 'thinking', text: b.thinking, ts, uuid });
-        }
-        break;
-
-      case 'tool_use':
-        blocks.push({
-          kind: 'tool_use',
-          toolName: (b.name as string) || 'unknown',
-          toolId: (b.id as string) || '',
-          input:
-            typeof b.input === 'object' && b.input !== null
-              ? (b.input as Record<string, unknown>)
-              : {},
-          ts,
-          uuid,
-        });
-        break;
-
-      case 'tool_result': {
-        const toolId = (b.tool_use_id as string) || '';
-        const isError = b.is_error === true;
-        const output = extractToolResultContent(b.content);
-        blocks.push({ kind: 'tool_result', toolId, output, isError, ts, uuid });
-        break;
-      }
-    }
-  }
-
-  return blocks;
 }
 
-function parseCodexEntry(e: Record<string, unknown>): RichSessionMessage[] | null {
-  const envelopeType = e.type as string;
-  if (envelopeType !== 'response_item') return null;
-
-  const payload =
-    typeof e.payload === 'object' && e.payload !== null
-      ? (e.payload as Record<string, unknown>)
-      : null;
-  if (!payload) return [];
-
-  const ts = timestampFromEntry(e, payload);
-  const itemType = payload.type as string;
-
-  if (itemType === 'message') {
-    const role = normalizeCodexRole(payload.role);
-    const messageBlocks: RichSessionMessage[] = [];
-    const content = payload.content;
-    const baseUuid = codexUuid(payload, ts, 'message');
-
-    if (typeof content === 'string') {
-      const text = content.trim();
-      if (text) {
-        messageBlocks.push({ kind: 'text', role, text, ts, uuid: baseUuid });
-      }
-      return messageBlocks;
-    }
-
-    if (!Array.isArray(content)) return messageBlocks;
-
-    for (let i = 0; i < content.length; i += 1) {
-      const item = content[i];
-      const itemRec =
-        typeof item === 'object' && item !== null ? (item as Record<string, unknown>) : null;
-      const text = extractCodexContentText(itemRec ?? item);
-      if (!text) continue;
-      messageBlocks.push({
-        kind: 'text',
-        role,
-        text,
-        ts,
-        uuid: `${baseUuid}-${i}`,
-      });
-    }
-    return messageBlocks;
-  }
-
-  if (itemType === 'function_call') {
-    const toolId = codexToolId(payload);
-    const toolName =
-      (typeof payload.name === 'string' && payload.name) ||
-      (typeof payload.tool_name === 'string' && payload.tool_name) ||
-      'tool';
-    return [
-      {
-        kind: 'tool_use',
-        toolName,
-        toolId,
-        input: parseCodexFunctionCallInput(payload.arguments),
-        ts,
-        uuid: codexUuid(payload, ts, 'tool-use'),
-      },
-    ];
-  }
-
-  if (itemType === 'function_call_output') {
-    const output =
-      (typeof payload.output === 'string' && payload.output) ||
-      (typeof payload.result === 'string' && payload.result) ||
-      '';
-    return [
-      {
-        kind: 'tool_result',
-        toolId: codexToolId(payload),
-        output,
-        isError: payload.is_error === true || payload.isError === true,
-        ts,
-        uuid: codexUuid(payload, ts, 'tool-result'),
-      },
-    ];
-  }
-
-  if (itemType === 'reasoning') {
-    const thinking = extractCodexReasoning(payload);
-    if (!thinking) return [];
-    return [
-      {
-        kind: 'thinking',
-        text: thinking,
-        ts,
-        uuid: codexUuid(payload, ts, 'thinking'),
-      },
-    ];
-  }
-
-  return [];
+function trimAsciiWhitespace(buffer: Buffer): Buffer {
+  let start = 0;
+  let end = buffer.length;
+  while (start < end && isAsciiWhitespace(buffer[start]!)) start += 1;
+  while (end > start && isAsciiWhitespace(buffer[end - 1]!)) end -= 1;
+  return buffer.subarray(start, end);
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Extract text from a tool_result content field.
- * Content can be a string, an array of text blocks, or absent.
- */
-function extractToolResultContent(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    const parts: string[] = [];
-    for (const item of content) {
-      if (typeof item === 'string') {
-        parts.push(item);
-      } else if (typeof item === 'object' && item !== null) {
-        const c = item as Record<string, unknown>;
-        if (c.type === 'text' && typeof c.text === 'string') {
-          parts.push(c.text);
-        }
-      }
-    }
-    return parts.join('\n');
-  }
-  return '';
+function isAsciiWhitespace(value: number): boolean {
+  return value === 0x20 || value === 0x09 || value === 0x0a || value === 0x0d;
 }
 
-function timestampFromEntry(
-  entry: Record<string, unknown>,
-  payload?: Record<string, unknown>,
-): string {
-  const fromPayload = payload?.timestamp;
-  if (typeof fromPayload === 'string' && fromPayload) return fromPayload;
-  const fromEntry = entry.timestamp;
-  if (typeof fromEntry === 'string' && fromEntry) return fromEntry;
-  return new Date().toISOString();
+function normalizePositiveInteger(value: number | undefined, fallback: number): number {
+  if (!Number.isFinite(value) || value === undefined || value <= 0) return fallback;
+  return Math.floor(value);
 }
 
-function normalizeCodexRole(value: unknown): 'user' | 'assistant' {
-  return value === 'user' ? 'user' : 'assistant';
-}
-
-function codexToolId(payload: Record<string, unknown>): string {
-  const candidates = [payload.call_id, payload.callId, payload.id];
-  for (const candidate of candidates) {
-    if (typeof candidate === 'string' && candidate) return candidate;
-  }
-  return '';
-}
-
-function codexUuid(payload: Record<string, unknown>, ts: string, suffix: string): string {
-  const candidates = [payload.id, payload.call_id, payload.callId];
-  for (const candidate of candidates) {
-    if (typeof candidate === 'string' && candidate) return candidate;
-  }
-  return `codex-${suffix}-${ts}`;
-}
-
-function parseCodexFunctionCallInput(value: unknown): Record<string, unknown> {
-  if (typeof value === 'object' && value !== null) {
-    return value as Record<string, unknown>;
-  }
-  if (typeof value === 'string') {
-    try {
-      const parsed = JSON.parse(value) as unknown;
-      if (typeof parsed === 'object' && parsed !== null) {
-        return parsed as Record<string, unknown>;
-      }
-    } catch {
-      return {};
-    }
-  }
-  return {};
-}
-
-function extractCodexContentText(value: unknown): string {
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    return trimmed;
-  }
-  if (typeof value !== 'object' || value === null) return '';
-  const rec = value as Record<string, unknown>;
-  const candidates = [rec.text, rec.output_text, rec.input_text, rec.value, rec.content];
-  for (const candidate of candidates) {
-    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
-  }
-  return '';
-}
-
-function extractCodexReasoning(payload: Record<string, unknown>): string {
-  const summary = payload.summary;
-  if (Array.isArray(summary)) {
-    const pieces: string[] = [];
-    for (const item of summary) {
-      if (typeof item === 'string' && item.trim()) {
-        pieces.push(item.trim());
-        continue;
-      }
-      if (typeof item !== 'object' || item === null) continue;
-      const rec = item as Record<string, unknown>;
-      const text = extractCodexContentText(rec);
-      if (text) pieces.push(text);
-    }
-    if (pieces.length > 0) return pieces.join('\n');
-  }
-  const fallback = extractCodexContentText(payload);
-  return fallback;
+function normalizeNonNegativeInteger(value: number | undefined): number {
+  if (!Number.isFinite(value) || value === undefined || value < 0) return 0;
+  return Math.floor(value);
 }
 
 /**

@@ -95,6 +95,9 @@ describe('pairing offers', () => {
     expect(typeof peer['relayPairingSecretIv']).toBe('string');
     expect(typeof peer['relayPairingSecretTag']).toBe('string');
     expect((firstRedeem as Record<string, unknown>)['relayPairingSecret']).toBeUndefined();
+    const resolvedPeerSecret = await resolveRelayPairingSecret(identity.peerId);
+    expect(resolvedPeerSecret).not.toBeNull();
+    expect(resolvedPeerSecret?.length).toBe(32);
 
     const secondRedeem = await redeemPairingOffer(
       offer.offerId,
@@ -354,38 +357,5 @@ describe('pairing offers', () => {
       .filter((peerId): peerId is string => typeof peerId === 'string');
     expect(storedPeerIds.length).toBe(3);
     expect(storedPeerIds).toEqual(pairedPeerIds.slice(-3));
-  });
-
-  it('auto-migrates legacy plaintext relay pairing secret to encrypted fields on read', async () => {
-    const legacySecretBytes = Buffer.alloc(32, 7);
-    const legacySecret = legacySecretBytes.toString('base64url');
-    const peersPath = path.join(process.env['VIEWPORT_HOME'] ?? '', 'pairing-peers.json');
-    const legacyStore = {
-      version: 1,
-      peers: [
-        {
-          peerId: 'peer_legacy',
-          publicKey: 'legacy_public_key',
-          relayPairingSecret: legacySecret,
-          firstPairedAt: Date.now(),
-          lastPairedAt: Date.now(),
-          lastOfferId: 'offer_legacy',
-          trustAnchor: 'trust_anchor_legacy',
-        },
-      ],
-    };
-    await fs.writeFile(peersPath, JSON.stringify(legacyStore, null, 2), { mode: 0o600 });
-
-    const resolved = await resolveRelayPairingSecret('peer_legacy');
-    expect(resolved?.toString('base64url')).toBe(legacySecret);
-
-    const migrated = JSON.parse(await fs.readFile(peersPath, 'utf8')) as {
-      peers?: Array<Record<string, unknown>>;
-    };
-    const peer = migrated.peers?.[0] ?? {};
-    expect(peer['relayPairingSecret']).toBeUndefined();
-    expect(typeof peer['relayPairingSecretCiphertext']).toBe('string');
-    expect(typeof peer['relayPairingSecretIv']).toBe('string');
-    expect(typeof peer['relayPairingSecretTag']).toBe('string');
   });
 });

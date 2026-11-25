@@ -7,6 +7,9 @@ import {
   encodeProjectDir,
   decodeProjectDir,
   listProjectSessions,
+  pageFromTailMessages,
+  readRichSessionMessagesTailPageFromFile,
+  readRichSessionMessagesTailFromFile,
 } from '../../src/discovery/jsonl-reader.js';
 
 // ---------------------------------------------------------------------------
@@ -58,10 +61,60 @@ describe('parseJSONLEntry', () => {
     expect(parseJSONLEntry(true)).toEqual([]);
   });
 
-  it('returns empty for non-user/assistant type', () => {
-    expect(parseJSONLEntry({ type: 'progress', data: {} })).toEqual([]);
-    expect(parseJSONLEntry({ type: 'system', data: {} })).toEqual([]);
-    expect(parseJSONLEntry({ type: 'file-history-snapshot' })).toEqual([]);
+  it('surfaces unknown provider events instead of silently dropping them', () => {
+    expect(parseJSONLEntry({ type: 'progress', data: {} })).toMatchObject([
+      { kind: 'event', title: 'Provider event: progress', tone: 'muted' },
+    ]);
+    expect(parseJSONLEntry({ type: 'system', data: {} })).toMatchObject([
+      { kind: 'event', title: 'Provider event: system', tone: 'muted' },
+    ]);
+    expect(parseJSONLEntry({ type: 'file-history-snapshot' })).toMatchObject([
+      { kind: 'event', title: 'File snapshot captured', tone: 'muted' },
+    ]);
+  });
+
+  it('normalizes common provider metadata events for UI rendering', () => {
+    expect(parseJSONLEntry({ type: 'ai-title', aiTitle: 'Internal' })).toEqual([]);
+    const taskComplete = parseJSONLEntry({
+      type: 'task_complete',
+      last_agent_message: 'Fixed the sessions breakage.',
+      duration_ms: 946705,
+    });
+    expect(taskComplete).toMatchObject([
+      {
+        kind: 'event',
+        title: 'Task completed',
+        body: expect.stringContaining('Fixed the sessions breakage.'),
+        tone: 'success',
+      },
+    ]);
+    if (taskComplete[0]?.kind === 'event') {
+      expect(taskComplete[0].body).toContain('Completed in 15m 47s');
+      expect(taskComplete[0].body).not.toContain('duration_ms');
+    }
+  });
+
+  it('renders codex task completion duration as readable time', () => {
+    const taskComplete = parseJSONLEntry({
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        last_agent_message: 'Finished the run.',
+        duration_ms: 2770940,
+      },
+    });
+    expect(taskComplete).toMatchObject([
+      {
+        kind: 'event',
+        title: 'Task completed',
+        body: expect.stringContaining('Finished the run.'),
+        tone: 'success',
+      },
+    ]);
+    if (taskComplete[0]?.kind === 'event') {
+      expect(taskComplete[0].body).toContain('Completed in 46m 11s');
+      expect(taskComplete[0].body).not.toContain('duration_ms');
+    }
   });
 
   it('returns empty for entry without message', () => {
@@ -131,11 +184,10 @@ describe('parseJSONLEntry', () => {
     };
     const blocks = parseJSONLEntry(entry);
     expect(blocks).toHaveLength(1);
-    expect(blocks[0]!.kind).toBe('tool_use');
-    if (blocks[0]!.kind === 'tool_use') {
-      expect(blocks[0]!.toolName).toBe('Edit');
-      expect(blocks[0]!.toolId).toBe('tu-1');
-      expect(blocks[0]!.input).toEqual({ file_path: '/test.ts' });
+    expect(blocks[0]!.kind).toBe('file_change');
+    if (blocks[0]!.kind === 'file_change') {
+      expect(blocks[0]!.path).toBe('/test.ts');
+      expect(blocks[0]!.operation).toBe('Edit');
     }
   });
 
@@ -222,7 +274,7 @@ describe('parseJSONLEntry', () => {
     expect(blocks).toHaveLength(3);
     expect(blocks[0]!.kind).toBe('thinking');
     expect(blocks[1]!.kind).toBe('text');
-    expect(blocks[2]!.kind).toBe('tool_use');
+    expect(blocks[2]!.kind).toBe('file_change');
   });
 
   it('skips empty text blocks', () => {
@@ -400,7 +452,275 @@ describe('parseJSONLEntry', () => {
       expect(outputBlocks[0]!.isError).toBe(false);
     }
   });
+
+  it('parses Codex compacted replacement history into text messages', () => {
+    const blocks = parseJSONLEntry({
+      timestamp: '2026-05-03T14:22:53.010Z',
+      type: 'compacted',
+      payload: {
+        message: 'compact previous turns',
+        replacement_history: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'first prior prompt' }],
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'first prior answer' }],
+          },
+          {
+            type: 'compaction',
+            encrypted_content: 'ignored',
+          },
+        ],
+      },
+    });
+
+    expect(
+      blocks.map((block) => (block.kind === 'text' ? `${block.role}:${block.text}` : block.kind)),
+    ).toEqual(['user:first prior prompt', 'assistant:first prior answer']);
+  });
 });
+
+// ---------------------------------------------------------------------------
+// readRichSessionMessagesTailFromFile
+// ---------------------------------------------------------------------------
+
+describe('readRichSessionMessagesTailFromFile', () => {
+  it('reads newest rich messages in chronological order from the file tail', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-jsonl-tail-'));
+    try {
+      const filePath = path.join(dir, 'session.jsonl');
+      await fs.writeFile(
+        filePath,
+        [
+          jsonlMessage('user', 'oldest'),
+          JSON.stringify({ type: 'system', timestamp: '2026-01-01T00:00:01Z' }),
+          jsonlMessage('assistant', 'middle'),
+          jsonlMessage('user', 'newest'),
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const blocks = await readRichSessionMessagesTailFromFile(filePath, 2, { chunkSize: 19 });
+      expect(blocks.map((block) => (block.kind === 'text' ? block.text : block.kind))).toEqual([
+        'middle',
+        'newest',
+      ]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('handles JSON lines split across tiny backwards chunks', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-jsonl-tail-'));
+    try {
+      const filePath = path.join(dir, 'session.jsonl');
+      await fs.writeFile(
+        filePath,
+        [
+          jsonlMessage('user', 'first split-safe message'),
+          jsonlMessage('assistant', 'second split-safe message'),
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const blocks = await readRichSessionMessagesTailFromFile(filePath, 2, { chunkSize: 7 });
+      expect(blocks.map((block) => (block.kind === 'text' ? block.text : block.kind))).toEqual([
+        'first split-safe message',
+        'second split-safe message',
+      ]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stops at the configured tail scan budget instead of reading unbounded history', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-jsonl-tail-'));
+    try {
+      const filePath = path.join(dir, 'session.jsonl');
+      await fs.writeFile(
+        filePath,
+        [
+          jsonlMessage('user', 'outside the scan budget'),
+          ...Array.from({ length: 100 }, (_, index) =>
+            JSON.stringify({
+              type: 'system',
+              timestamp: `2026-01-01T00:00:${index}Z`,
+              pad: 'x'.repeat(128),
+            }),
+          ),
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const blocks = await readRichSessionMessagesTailFromFile(filePath, 5, {
+        chunkSize: 64,
+        maxBytes: 512,
+      });
+      expect(
+        blocks.some((block) => block.kind === 'text' && block.text === 'outside the scan budget'),
+      ).toBe(false);
+      expect(blocks.every((block) => block.kind === 'event')).toBe(true);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('skips oversized tail lines and still returns earlier usable messages', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-jsonl-tail-'));
+    try {
+      const filePath = path.join(dir, 'session.jsonl');
+      await fs.writeFile(
+        filePath,
+        [
+          jsonlMessage('assistant', 'usable before huge line'),
+          jsonlMessage('user', 'x'.repeat(2_048)),
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const blocks = await readRichSessionMessagesTailFromFile(filePath, 2, {
+        chunkSize: 128,
+        maxLineBytes: 1_024,
+      });
+      expect(blocks.map((block) => (block.kind === 'text' ? block.text : block.kind))).toEqual([
+        'usable before huge line',
+      ]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('pages older transcript blocks from the tail without full-file reads', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-jsonl-tail-page-'));
+    try {
+      const filePath = path.join(dir, 'session.jsonl');
+      await fs.writeFile(
+        filePath,
+        Array.from({ length: 8 }, (_, index) => jsonlMessage('assistant', `message ${index}`)).join(
+          '\n',
+        ),
+        'utf-8',
+      );
+
+      const latest = await readRichSessionMessagesTailPageFromFile(filePath, 3, 0, {
+        chunkSize: 31,
+      });
+      expect(
+        latest.messages.map((block) => (block.kind === 'text' ? block.text : block.kind)),
+      ).toEqual(['message 5', 'message 6', 'message 7']);
+      expect(latest).toMatchObject({ nextOffset: 3, hasMoreBefore: true });
+
+      const older = await readRichSessionMessagesTailPageFromFile(filePath, 3, latest.nextOffset, {
+        chunkSize: 31,
+      });
+      expect(
+        older.messages.map((block) => (block.kind === 'text' ? block.text : block.kind)),
+      ).toEqual(['message 2', 'message 3', 'message 4']);
+      expect(older).toMatchObject({ nextOffset: 6, hasMoreBefore: true });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('can page into Codex compacted history before a resumed tail', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'viewport-jsonl-tail-page-'));
+    try {
+      const filePath = path.join(dir, 'codex-resumed.jsonl');
+      await fs.writeFile(
+        filePath,
+        [
+          JSON.stringify({
+            timestamp: '2026-05-03T14:22:53.010Z',
+            type: 'compacted',
+            payload: {
+              replacement_history: [
+                {
+                  type: 'message',
+                  role: 'user',
+                  content: [{ type: 'input_text', text: 'old user prompt' }],
+                },
+                {
+                  type: 'message',
+                  role: 'assistant',
+                  content: [{ type: 'output_text', text: 'old assistant answer' }],
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            timestamp: '2026-05-09T20:19:00.000Z',
+            type: 'response_item',
+            payload: {
+              type: 'function_call',
+              name: 'exec_command',
+              call_id: 'call_1',
+              arguments: '{"cmd":"pwd"}',
+            },
+          }),
+          JSON.stringify({
+            timestamp: '2026-05-09T20:20:00.000Z',
+            type: 'response_item',
+            payload: {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'resumed assistant tail' }],
+            },
+          }),
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const latest = await readRichSessionMessagesTailPageFromFile(filePath, 2, 0, {
+        chunkSize: 128,
+      });
+      expect(
+        latest.messages.map((block) => (block.kind === 'text' ? block.text : block.kind)),
+      ).toEqual(['tool_use', 'resumed assistant tail']);
+
+      const older = await readRichSessionMessagesTailPageFromFile(filePath, 2, latest.nextOffset, {
+        chunkSize: 128,
+      });
+      expect(
+        older.messages.map((block) => (block.kind === 'text' ? block.text : block.kind)),
+      ).toEqual(['old user prompt', 'old assistant answer']);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('computes tail pages from an already bounded replay buffer', () => {
+    expect(pageFromTailMessages([1, 2, 3, 4, 5, 6], 2, 0)).toEqual({
+      messages: [5, 6],
+      nextOffset: 2,
+      hasMoreBefore: true,
+    });
+    expect(pageFromTailMessages([1, 2, 3, 4, 5, 6], 2, 2)).toEqual({
+      messages: [3, 4],
+      nextOffset: 4,
+      hasMoreBefore: true,
+    });
+    expect(pageFromTailMessages([1, 2, 3, 4, 5, 6], 2, 4)).toEqual({
+      messages: [1, 2],
+      nextOffset: 6,
+      hasMoreBefore: false,
+    });
+  });
+});
+
+function jsonlMessage(role: 'user' | 'assistant', text: string): string {
+  return JSON.stringify({
+    type: role,
+    timestamp: '2026-01-01T00:00:00Z',
+    uuid: `${role}-${text.slice(0, 8)}`,
+    message: {
+      content: [{ type: 'text', text }],
+    },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // listProjectSessions

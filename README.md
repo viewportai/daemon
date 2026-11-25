@@ -17,7 +17,7 @@ Runtime supervision and orchestration layer for AI coding agents.
 ## One Command Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/viewportai/daemon/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/viewportai/viewport/main/packages/daemon/scripts/install.sh | bash
 ```
 
 This installs `@viewportai/daemon` globally, then runs `vpd setup`.
@@ -33,6 +33,8 @@ Local development link mode:
 ```bash
 ./scripts/install-dev.sh --link --yes --no-service --no-prereqs --no-hooks
 ```
+
+Link mode is for active daemon development when you want the repo checkout to become the global `vpd` binary. For release-confidence validation, prefer the tarball path through `npm run verify:install`.
 
 Local uninstall/reinstall:
 
@@ -101,6 +103,105 @@ For user-level systemd service auto-start after reboot, enable linger once:
 sudo loginctl enable-linger "$USER"
 ```
 
+## Profiles
+
+Profiles isolate daemon environments on one machine. Use them when switching
+between local development and production, or when demoing multiple users from
+separate terminals.
+
+Fresh managed installs create and select `prod` during `vpd setup`, so ordinary
+users can install and pair without learning this command surface.
+
+```bash
+vpd profile create local --copy-current --server https://api.getviewport.test --app-url https://app.getviewport.test --relay wss://relay.getviewport.test:7781/ws
+vpd profile create prod --server https://api.getviewport.com --app-url https://app.getviewport.com --relay wss://relay.getviewport.com/ws
+vpd profile use prod
+vpd profile status
+```
+
+Profile state lives in `~/.viewport/profiles/<name>`. That includes the config,
+auth token, pairing state, keys, relay identity, and runtime stores. The base
+`~/.viewport` home keeps only the profile registry and current-profile pointer
+once you move to named profiles.
+
+`vpd profile use <name>` and `vpd use <name>` change the machine default for
+future CLI commands. They do not move or retarget an already-running daemon. For
+one terminal or one command, use scoped profile execution:
+
+```bash
+eval "$(vpd profile env prod)"
+VPD_PROFILE=prod vpd status
+vpd --profile prod status
+vpd profile doctor prod
+```
+
+`vpd start --profile local|lan|relay` still controls the daemon network
+exposure mode. Put daemon profile flags before the command, or use
+`VPD_PROFILE`, to avoid ambiguity.
+
+Multiple daemons:
+
+```bash
+vpd profile create prod-user-1 --server https://api.getviewport.com --app-url https://app.getviewport.com --relay wss://relay.getviewport.com/ws --listen 127.0.0.1:7071
+vpd profile create prod-user-2 --server https://api.getviewport.com --app-url https://app.getviewport.com --relay wss://relay.getviewport.com/ws --listen 127.0.0.1:7072
+vpd profile start prod-user-1
+vpd profile start prod-user-2
+vpd profile ps
+```
+
+Each running profile owns a separate supervisor/owner process, worker process,
+state file, auth token, key store, and relay connection. The OS service manages
+the currently selected default profile; for multi-profile demos, start profiles
+explicitly.
+
+Repo bindings include the active profile:
+
+```bash
+cd /path/to/repo
+vpd bind .
+```
+
+The generated `.viewport/local.yaml` is gitignored and includes
+`profile: <name>`. Relay streaming is allowed only when both the organization
+and the daemon's startup profile match. This prevents a repo bound in local
+development from accidentally streaming to production after `vpd profile use
+prod`, and it also prevents changing a shell default from silently rerouting a
+running daemon.
+
+Managed workers can also be operated from the daemon CLI:
+
+```bash
+vpd worker doctor --server https://api.getviewport.com --workspace <org-id> --executor <runner-id> --credential <vpexec-token> --runner-pool <pool> --json
+vpd worker start --server https://api.getviewport.com --workspace <org-id> --executor <runner-id> --credential <vpexec-token> --runner-pool <pool>
+```
+
+When the Viewport app creates or rotates a runner credential it also returns a
+registration profile. Save that JSON profile locally and start the worker with:
+
+```bash
+vpd worker doctor --registration-profile="$HOME/.viewport/managed-executors/<runner>.json" --json
+vpd worker start --registration-profile="$HOME/.viewport/managed-executors/<runner>.json"
+```
+
+`--doctor` checks the local daemon agent inventory and proves the platform
+runner credential with heartbeat-only traffic. It does not claim workflow work.
+The runner remains organization scoped; teams are preserved on workflow runs,
+review packets, and exported artifacts.
+
+Team Resource export bundles can be synced into a Git checkout without giving
+the API permission to clone or push remote repositories:
+
+```bash
+vpd team-resource sync --bundle /path/to/export-bundle.json --repo /path/to/team-resource-repo --json
+vpd team-resource sync --server https://api.getviewport.com --workspace <org-id> --executor <runner-id> --credential <vpexec-token> --resource <team-resource-id> --repo /path/to/team-resource-repo --push --json
+```
+
+The command verifies each file hash, rejects paths outside `.viewport/`, writes
+the bundle, and creates a Git commit. With server credentials it fetches the
+bundle and reports the resulting commit back to Viewport. Pass `--push` to push
+`HEAD` to `origin` for the selected branch. Use `--no-commit` to only
+materialize the files for inspection.
+
 ## Quality gates
 
 ```bash
@@ -110,6 +211,19 @@ npm run format:check
 npm run test
 npm run check
 ```
+
+## Package operations
+
+```bash
+vpd upgrade --restart
+vpd uninstall --yes
+vpd uninstall --yes --purge-home
+```
+
+`upgrade` installs the latest global `@viewportai/daemon` package. `uninstall`
+stops known profile daemons, removes the user service when present, and removes
+the global package. It does not remove `~/.viewport` unless `--purge-home` is
+explicitly passed.
 
 ## Testing Setup Flow
 
@@ -123,13 +237,13 @@ npm run check
 # manual verification test (no service or package installs)
 VIEWPORT_HOME="$(mktemp -d)" vpd setup --yes --no-service --no-prereqs --no-hooks
 
-# full local environment verification (isolated home + dedicated listen target)
+# full local environment verification (temporary config dir + dedicated listen target)
 npm run verify:env
 
 # include OS service checks (launchd/systemd)
 npm run verify:env:service
 
-# package/install verification from local tarball in isolated prefix
+# package/install verification from local tarball in a temporary npm prefix
 npm run verify:install
 
 # one-command verification gate
@@ -144,14 +258,24 @@ npm run verify:linux:ci
 1. Semantic commits (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`).
 2. One logical change per commit.
 3. Changes to protocol or runtime behavior require matching tests.
+4. Branch names use semantic prefixes with concise kebab-case descriptions (`feat/...`, `fix/...`, `docs/...`).
+5. PR titles use semantic commit format with an optional scope (`feat(runtime): ...`, `fix(daemon): ...`).
+6. Do not use roadmap labels or temporary agent labels in branches or PR titles.
 
 ## Release
 
 This package publishes as `@viewportai/daemon`.
 
-1. Merge semantic commits to `main`.
-2. CI must pass.
-3. Release workflow computes version (`feat` => minor, `fix` => patch, `BREAKING CHANGE` => major), tags, and publishes to npm using `NPM_TOKEN`.
+Package release mechanics are maintainer-owned. Feature PRs should stay focused on code, tests, and docs unless the PR is explicitly intended to cut a package release.
+
+When a release is intentionally being prepared, use the repo's current publish workflow from `main` and validate the built CLI before shipping.
+
+Runtime config follows one simple rule:
+
+- global defaults live in `~/.viewport/config.json`
+- the nearest project `.viewport/config.json` can override selected daemon targets like server or relay
+- `vpd doctor` will tell you whether that override was chosen explicitly or simply because it was the nearest ancestor config
+- environment variables and CLI flags are temporary overrides, not the normal runtime model
 
 See [docs/releasing.md](./docs/releasing.md) for setup and operations.
 See [docs/testing.md](./docs/testing.md) and [docs/developer-workflows.md](./docs/developer-workflows.md) for local validation workflows.

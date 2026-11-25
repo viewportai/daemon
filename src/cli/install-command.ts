@@ -1,12 +1,14 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { AgentRegistry } from '../core/agent-registry.js';
-import { configDir } from '../core/config.js';
-import { getDaemonPort } from './args.js';
+import { ConfigManager, configDir } from '../core/config.js';
+import { getDaemonPort, getFlag, hasFlag } from './args.js';
 import { BUILT_IN_AGENTS } from '../agents/built-in.js';
 import { ClaudeHookInstaller, HOOK_EVENT_KINDS } from '../hooks/index.js';
 import type { HookInstaller } from '../hooks/index.js';
 import { isJsonMode, printJson, shortError } from './command-shared.js';
+import { readDaemonRuntimeState } from './daemon-lifecycle.js';
+import { parseListenTarget } from './listen-target.js';
 
 /** Hook installers for each supported agent. */
 const HOOK_INSTALLERS: HookInstaller[] = [new ClaudeHookInstaller()];
@@ -27,8 +29,40 @@ function resolveVpdPath(): string {
   return arg1;
 }
 
-export async function install(): Promise<void> {
+async function resolveHookDaemonListen(): Promise<string> {
+  const explicitListen = getFlag('listen');
+  if (explicitListen) {
+    return parseListenTarget(explicitListen).listen;
+  }
+
+  const explicitPort = getFlag('port');
+  if (explicitPort) {
+    const host = getFlag('host') ?? '127.0.0.1';
+    return parseListenTarget(`${host}:${explicitPort}`).listen;
+  }
+
+  const runtimeState = await readDaemonRuntimeState();
+  if (runtimeState?.listen) {
+    return runtimeState.listen;
+  }
+
+  const manager = new ConfigManager();
+  await manager.load();
+  const configuredListen = manager.getDaemonConfig()?.listen;
+  if (configuredListen) {
+    return parseListenTarget(configuredListen).listen;
+  }
+
+  return parseListenTarget(`${getFlag('host') ?? '127.0.0.1'}:${getDaemonPort()}`).listen;
+}
+
+interface InstallOptions {
+  installHooks?: boolean;
+}
+
+export async function install(options: InstallOptions = {}): Promise<void> {
   const asJson = isJsonMode();
+  const installHooks = options.installHooks ?? hasFlag('hooks');
 
   const registry = new AgentRegistry();
   for (const def of BUILT_IN_AGENTS) {
@@ -38,7 +72,7 @@ export async function install(): Promise<void> {
   const availability = await registry.detectAvailable();
 
   const vpdPath = resolveVpdPath();
-  const port = getDaemonPort();
+  const daemonListen = installHooks ? await resolveHookDaemonListen() : null;
 
   const hookResults: Array<{
     adapter: string;
@@ -46,23 +80,25 @@ export async function install(): Promise<void> {
     error?: string;
   }> = [];
 
-  for (const installer of HOOK_INSTALLERS) {
-    try {
-      const changed = await installer.install({
-        vpdBinaryPath: vpdPath,
-        daemonPort: port,
-        events: [...HOOK_EVENT_KINDS],
-      });
-      hookResults.push({
-        adapter: installer.adapterName,
-        status: changed ? 'installed' : 'up-to-date',
-      });
-    } catch (err) {
-      hookResults.push({
-        adapter: installer.adapterName,
-        status: 'failed',
-        error: shortError(err),
-      });
+  if (installHooks) {
+    for (const installer of HOOK_INSTALLERS) {
+      try {
+        const changed = await installer.install({
+          vpdBinaryPath: vpdPath,
+          daemonListen: daemonListen ?? `${getFlag('host') ?? '127.0.0.1'}:${getDaemonPort()}`,
+          events: [...HOOK_EVENT_KINDS],
+        });
+        hookResults.push({
+          adapter: installer.adapterName,
+          status: changed ? 'installed' : 'up-to-date',
+        });
+      } catch (err) {
+        hookResults.push({
+          adapter: installer.adapterName,
+          status: 'failed',
+          error: shortError(err),
+        });
+      }
     }
   }
 
@@ -79,7 +115,9 @@ export async function install(): Promise<void> {
         available: availability.get(def.id) ?? false,
         detection: def.detection.description,
       })),
+      hookInstallRequested: installHooks,
       hooks: hookResults,
+      daemonListen,
     });
     return;
   }
@@ -94,14 +132,18 @@ export async function install(): Promise<void> {
     console.log(`      ${def.detection.description}`);
   }
 
-  console.log('\nInstalling hooks:\n');
-  for (const result of hookResults) {
-    if (result.status === 'failed') {
-      console.log(`  [-] ${result.adapter}: failed (${result.error ?? 'unknown'})`);
-      continue;
+  if (installHooks) {
+    console.log('\nInstalling hooks:\n');
+    for (const result of hookResults) {
+      if (result.status === 'failed') {
+        console.log(`  [-] ${result.adapter}: failed (${result.error ?? 'unknown'})`);
+        continue;
+      }
+      const label = result.status === 'installed' ? 'installed' : 'already up to date';
+      console.log(`  [+] ${result.adapter}: ${label}`);
     }
-    const label = result.status === 'installed' ? 'installed' : 'already up to date';
-    console.log(`  [+] ${result.adapter}: ${label}`);
+  } else {
+    console.log('\nHooks: skipped (run `vpd install --hooks` when you explicitly want hooks).');
   }
 
   console.log(`\nViewport config: ${dir}/config.json`);

@@ -25,6 +25,9 @@ import {
   HookBaseInputSchema,
 } from './types.js';
 import { logger } from '../core/logger.js';
+import { workflowHookRegistry } from '../workflows/hook-registry.js';
+import { emitSpecificHookEvent } from './specific-events.js';
+import { buildContextHookResponse } from './context-injector.js';
 
 const log = logger.child({ module: 'hook-router' });
 const MAX_PENDING_PERMISSION_REQUESTS = 512;
@@ -88,7 +91,7 @@ export class HookRouter {
     const baseResult = HookBaseInputSchema.safeParse(input);
     if (!baseResult.success) {
       log.warn(
-        { input, error: baseResult.error.message },
+        { input: safeHookLogInput(input), error: baseResult.error.message },
         'Invalid hook input — missing base fields',
       );
       return { passthrough: true };
@@ -109,6 +112,11 @@ export class HookRouter {
 
     const sessionId = baseResult.data.session_id;
     const cwd = baseResult.data.cwd;
+    const workflowHook = workflowHookRegistry.resolve(
+      sessionId,
+      kind,
+      parsed.data as Record<string, unknown>,
+    );
 
     // Emit the generic hook:event for any listeners
     this.eventBus.emit('hook:event', {
@@ -118,6 +126,21 @@ export class HookRouter {
       cwd,
       payload: parsed.data as Record<string, unknown>,
     });
+
+    if (workflowHook) {
+      this.eventBus.emit('workflow:hook-fired', {
+        workflowRunId: workflowHook.registration.workflowRunId,
+        workflowNodeId: workflowHook.registration.workflowNodeId,
+        sessionId,
+        kind,
+        adapter,
+        ...(workflowHook.response ? { response: workflowHook.response } : {}),
+        payload: parsed.data as Record<string, unknown>,
+      });
+      if (workflowHook.response) {
+        return workflowHook.response;
+      }
+    }
 
     // Dispatch to specific event handler
     const def = this.definitions.get(kind);
@@ -134,7 +157,14 @@ export class HookRouter {
     this.emitSpecificEvent(kind, parsed.data as Record<string, unknown>, {
       sessionId,
       adapter,
+      cwd,
     });
+    const contextResponse = await buildContextHookResponse({
+      kind,
+      data: parsed.data as Record<string, unknown>,
+      cwd,
+    });
+    if (contextResponse) return contextResponse;
     return { passthrough: false };
   }
 
@@ -197,6 +227,10 @@ export class HookRouter {
     data: Record<string, unknown>,
     ctx: { sessionId: string; adapter: string; cwd?: string; timeoutMs: number },
   ): Promise<HookResponse> {
+    if (kind === 'PermissionRequest' && isExitPlanModeRequest(data)) {
+      return this.holdPermissionRequest(data, ctx);
+    }
+
     // If not supervised, fall through immediately
     if (!this.supervision.isSupervised(ctx.sessionId)) {
       log.debug({ kind, sessionId: ctx.sessionId }, 'Not supervised — passthrough');
@@ -236,6 +270,7 @@ export class HookRouter {
     const hookRequestId = `hk-${++this.hookRequestCounter}-${Date.now()}`;
     const toolName = (data.tool_name as string) ?? 'unknown';
     const toolInput = data.tool_input;
+    const dataWithHookRequestId = { ...data, hook_request_id: hookRequestId };
 
     // Emit the permission request event so WS server can broadcast
     this.eventBus.emit('hook:permission-request', {
@@ -246,6 +281,7 @@ export class HookRouter {
       toolInput,
       cwd: ctx.cwd,
     });
+    this.emitSpecificEvent('PermissionRequest', dataWithHookRequestId, ctx);
 
     return new Promise<HookResponse>((resolve) => {
       const timer = setTimeout(() => {
@@ -272,81 +308,28 @@ export class HookRouter {
   private emitSpecificEvent(
     kind: HookEventKind,
     data: Record<string, unknown>,
-    ctx: { sessionId: string; adapter: string },
+    ctx: { sessionId: string; adapter: string; cwd?: string },
   ): void {
-    switch (kind) {
-      case 'SessionStart':
-        this.eventBus.emit('hook:session-start', {
-          sessionId: ctx.sessionId,
-          adapter: ctx.adapter,
-          cwd: data.cwd as string | undefined,
-          source: data.source as string | undefined,
-          agentType: data.agent_type as string | undefined,
-          model: data.model as string | undefined,
-        });
-        break;
-      case 'SessionEnd':
-        this.eventBus.emit('hook:session-end', {
-          sessionId: ctx.sessionId,
-          adapter: ctx.adapter,
-          reason: data.reason as string | undefined,
-        });
-        break;
-      case 'Notification':
-        this.eventBus.emit('hook:notification', {
-          sessionId: ctx.sessionId,
-          adapter: ctx.adapter,
-          message: (data.message as string) ?? '',
-          title: data.title as string | undefined,
-          notificationType: data.notification_type as string | undefined,
-        });
-        break;
-      case 'PostToolUse':
-        this.eventBus.emit('hook:tool-completed', {
-          sessionId: ctx.sessionId,
-          adapter: ctx.adapter,
-          toolName: (data.tool_name as string) ?? '',
-          toolInput: data.tool_input,
-          toolResponse: data.tool_response,
-        });
-        break;
-      case 'PostToolUseFailure':
-        this.eventBus.emit('hook:tool-failed', {
-          sessionId: ctx.sessionId,
-          adapter: ctx.adapter,
-          toolName: (data.tool_name as string) ?? '',
-          error: data.error as string | undefined,
-          isInterrupt: data.is_interrupt as boolean | undefined,
-        });
-        break;
-      case 'Stop':
-        this.eventBus.emit('hook:stop', {
-          sessionId: ctx.sessionId,
-          adapter: ctx.adapter,
-          lastMessage: data.last_assistant_message as string | undefined,
-        });
-        break;
-      case 'SubagentStart':
-        this.eventBus.emit('hook:subagent-start', {
-          sessionId: ctx.sessionId,
-          adapter: ctx.adapter,
-          agentId: data.agent_id as string | undefined,
-          agentType: data.agent_type as string | undefined,
-        });
-        break;
-      case 'SubagentStop':
-        this.eventBus.emit('hook:subagent-stop', {
-          sessionId: ctx.sessionId,
-          adapter: ctx.adapter,
-          agentId: data.agent_id as string | undefined,
-          agentType: data.agent_type as string | undefined,
-          lastMessage: data.last_assistant_message as string | undefined,
-        });
-        break;
-      default:
-        // Generic events (UserPromptSubmit, TaskCompleted, PreToolUse, PermissionRequest)
-        // are already emitted via hook:event — no specific event needed yet
-        break;
-    }
+    emitSpecificHookEvent(this.eventBus, kind, data, ctx);
   }
+}
+
+function isExitPlanModeRequest(data: Record<string, unknown>): boolean {
+  if (data.tool_name !== 'ExitPlanMode') return false;
+  const toolInput = data.tool_input;
+  if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) return false;
+  const plan = (toolInput as Record<string, unknown>).plan;
+  return typeof plan === 'string' && plan.trim().length > 0;
+}
+
+export function safeHookLogInput(input: Record<string, unknown>): Record<string, unknown> {
+  return {
+    hook_event_name: typeof input.hook_event_name === 'string' ? input.hook_event_name : undefined,
+    adapter: typeof input.adapter === 'string' ? input.adapter : undefined,
+    has_session_id: typeof input.session_id === 'string' && input.session_id.trim().length > 0,
+    keys: Object.keys(input).filter(
+      (key) =>
+        !['body', 'metadata', 'plan', 'plan_markdown', 'tool_input', 'tool_response'].includes(key),
+    ),
+  };
 }

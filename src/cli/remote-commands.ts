@@ -1,10 +1,26 @@
 import { ConfigManager } from '../core/config.js';
 import { getArgs, getFlag, hasFlag } from './args.js';
+import { resolveDisplayVersion } from '../core/package-meta.js';
+import { resolveDaemonRuntimeIdentity, toInstallCapabilities } from '../core/runtime-identity.js';
+import {
+  fetchContextCandidateDecisionKeys,
+  parseDecisionSigningKeys,
+} from './remote-decision-keys.js';
+import {
+  createRelayMachineId,
+  ensureRelayBindingMachineId,
+  seedRelayBindings,
+  upsertRelayBinding,
+} from './relay-binding-config.js';
 
 function boolLike(value: string | undefined): boolean {
   if (!value) return false;
   const lowered = value.trim().toLowerCase();
   return lowered === '1' || lowered === 'true' || lowered === 'yes' || lowered === 'on';
+}
+
+function inferRelayTokenJwksUrl(serverUrl: string): string {
+  return `${serverUrl.replace(/\/+$/, '')}/api/.well-known/jwks.json`;
 }
 
 function asJsonMode(): boolean {
@@ -18,11 +34,31 @@ function print(value: unknown): void {
 export function inferRelayEndpointFromServer(serverUrl: string): string {
   const parsed = new URL(serverUrl);
   const scheme = parsed.protocol === 'https:' ? 'wss' : 'ws';
-  return `${scheme}://${parsed.hostname}:7781/ws`;
-}
+  let relayHost = parsed.hostname;
 
-function joinUrl(base: string, pathname: string): string {
-  return `${base.replace(/\/+$/, '')}${pathname.startsWith('/') ? pathname : `/${pathname}`}`;
+  if (relayHost.startsWith('app.')) {
+    const appBaseHost = relayHost.slice(4);
+    relayHost = `relay.${appBaseHost}`;
+  } else if (relayHost.startsWith('api.')) {
+    const apiBaseHost = relayHost.slice(4);
+    relayHost = `relay.${apiBaseHost}`;
+  } else if (relayHost === 'getviewport.com' || relayHost === 'getviewport.dev') {
+    relayHost = `relay.${relayHost}`;
+  }
+  const isLocalHost =
+    relayHost === '127.0.0.1' ||
+    relayHost === 'localhost' ||
+    relayHost === '::1' ||
+    relayHost.endsWith('.test');
+  if (relayHost === 'relay.getviewport.com') {
+    return `${scheme}://${relayHost}/ws`;
+  }
+  if (relayHost === 'relay.getviewport.dev' || isLocalHost || relayHost.endsWith('.test')) {
+    return `${scheme}://${relayHost}:7781/ws`;
+  }
+  throw new Error(
+    `Cannot infer relay endpoint from ${serverUrl}. Pass --relay-endpoint for self-hosted or custom deployments.`,
+  );
 }
 
 function redact(token: string | undefined): string | undefined {
@@ -31,89 +67,34 @@ function redact(token: string | undefined): string | undefined {
   return `${token.slice(0, 4)}...${token.slice(-4)}`;
 }
 
-function usage(): never {
-  throw new Error(
-    'Usage: vpd remote <login|status|enable|disable|logout> [--server <url>] [--workspace <id>] [--token <enroll-token>] [--user <id>] [--workspace-name <name>] [--relay-endpoint <ws(s)://.../ws>] [--relay-tls-verify auto|0|1]',
-  );
+function usage(): string {
+  return 'Usage: vpd remote <login|status|enable|disable|logout> [--server <url>] [--workspace <id>] [--token <issue-token>] [--relay-endpoint <ws(s)://.../ws>] [--relay-tls-verify auto|0|1] [--context-decision-key kid:base64-public-key]';
 }
 
-async function parseJson(res: Response): Promise<Record<string, unknown> | null> {
-  return (await res.json().catch(() => null)) as Record<string, unknown> | null;
+function showRemoteHelp(): void {
+  console.log(usage());
 }
 
-async function discoverRelayEndpoint(serverUrl: string): Promise<string | null> {
-  const res = await fetch(joinUrl(serverUrl, '/api/poc/relay/state'));
-  if (!res.ok) return null;
-  const json = await parseJson(res);
-  if (!json || json.ok !== true) return null;
-
-  const state = json.state as Record<string, unknown> | undefined;
-  const wsBaseUrl = typeof state?.wsBaseUrl === 'string' ? state.wsBaseUrl : null;
-  return wsBaseUrl && wsBaseUrl.length > 0 ? wsBaseUrl : null;
-}
-
-async function resetWorkspaceEnrollToken(
-  serverUrl: string,
-  workspaceId: string,
-): Promise<{ ok: true; token: string } | { ok: false; workspaceMissing: boolean; reason: string }> {
-  const res = await fetch(
-    joinUrl(serverUrl, `/api/poc/workspaces/${encodeURIComponent(workspaceId)}/reset-enroll-token`),
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    },
-  );
-  const json = await parseJson(res);
-
-  if (res.ok && json?.ok === true && typeof json.workspaceEnrollToken === 'string') {
-    return { ok: true, token: json.workspaceEnrollToken };
-  }
-
-  const reason = typeof json?.error === 'string' ? json.error : 'reset enroll token failed';
-  const workspaceMissing = reason === 'workspace not found' || res.status === 404;
-  return { ok: false, workspaceMissing, reason };
-}
-
-async function enrollWorkspace(
-  serverUrl: string,
-  workspaceId: string,
-  userId: string,
-  workspaceName?: string,
-): Promise<{ token: string; created: boolean }> {
-  const res = await fetch(joinUrl(serverUrl, '/api/poc/workspaces/enroll'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      userId,
-      workspaceId,
-      workspaceName: workspaceName || workspaceId,
-    }),
+function resolveInstallMetadata(serverUrl: string, relayEndpoint: string, manager: ConfigManager) {
+  const identity = resolveDaemonRuntimeIdentity({
+    daemonConfig: manager.getDaemonConfig(),
+    daemonVersion: resolveDisplayVersion(),
   });
-  const json = await parseJson(res);
-
-  if (res.ok && json?.ok === true && typeof json.workspaceEnrollToken === 'string') {
-    return { token: json.workspaceEnrollToken, created: true };
-  }
-
-  if (res.status === 409) {
-    const reset = await resetWorkspaceEnrollToken(serverUrl, workspaceId);
-    if (reset.ok) {
-      return { token: reset.token, created: false };
-    }
-    throw new Error(`Failed to reset workspace enroll token: ${reset.reason}`);
-  }
-
-  throw new Error(
-    `Failed to enroll workspace: ${
-      typeof json?.error === 'string' ? json.error : `HTTP ${res.status}`
-    }`,
-  );
+  return toInstallCapabilities({
+    ...identity,
+    serverUrl,
+    relayEndpoint,
+    relayServerUrl: serverUrl,
+  });
 }
 
 export async function remote(): Promise<void> {
   const args = getArgs();
   const subcommand = args[1];
-  if (!subcommand) usage();
+  if (!subcommand) {
+    showRemoteHelp();
+    return;
+  }
 
   const manager = new ConfigManager();
   await manager.load();
@@ -127,13 +108,30 @@ export async function remote(): Promise<void> {
       ok: true,
       relay: {
         enabled: relayConfig.enabled ?? false,
+        bindings: (relayConfig.bindings ?? []).map((binding) => ({
+          enabled: binding.enabled ?? true,
+          endpoint: binding.endpoint,
+          serverUrl: binding.serverUrl,
+          workspaceId: binding.workspaceId,
+          installId: binding.installId,
+          runtimeTargetId: binding.runtimeTargetId,
+          machineId: binding.machineId,
+          issueToken: redact(binding.issueToken),
+          tlsVerify: binding.tlsVerify ?? 'auto',
+          caCertPath: binding.caCertPath,
+        })),
         endpoint: relayConfig.endpoint,
         serverUrl: relayConfig.serverUrl,
         workspaceId: relayConfig.workspaceId,
-        enrollToken: redact(relayConfig.enrollToken),
+        installId: relayConfig.installId,
+        runtimeTargetId: relayConfig.runtimeTargetId,
+        machineId: relayConfig.machineId,
         issueToken: redact(relayConfig.issueToken),
         tlsVerify: relayConfig.tlsVerify ?? 'auto',
         caCertPath: relayConfig.caCertPath,
+        contextCandidateDecisionKeyIds: daemonConfig.server?.contextCandidateDecisionKeys
+          ? Object.keys(daemonConfig.server.contextCandidateDecisionKeys)
+          : [],
       },
     };
     if (asJson) {
@@ -142,13 +140,26 @@ export async function remote(): Promise<void> {
     }
 
     console.log(`Remote relay enabled: ${payload.relay.enabled ? 'yes' : 'no'}`);
+    if (payload.relay.bindings.length > 0) {
+      console.log(`Relay bindings:       ${payload.relay.bindings.length}`);
+      for (const binding of payload.relay.bindings) {
+        console.log(
+          `  - ${binding.workspaceId ?? '-'} ${binding.endpoint ?? '-'} (${binding.enabled ? 'enabled' : 'disabled'})`,
+        );
+      }
+    }
     console.log(`Relay endpoint:       ${payload.relay.endpoint ?? '-'}`);
     console.log(`Relay server:         ${payload.relay.serverUrl ?? '-'}`);
     console.log(`Workspace:            ${payload.relay.workspaceId ?? '-'}`);
-    console.log(`Enroll token:         ${payload.relay.enrollToken ?? '-'}`);
+    console.log(`Install:              ${payload.relay.installId ?? '-'}`);
+    console.log(`Runtime target:       ${payload.relay.runtimeTargetId ?? '-'}`);
+    console.log(`Machine:              ${payload.relay.machineId ?? '-'}`);
     console.log(`Issue token:          ${payload.relay.issueToken ?? '-'}`);
     console.log(`TLS verify:           ${payload.relay.tlsVerify}`);
     console.log(`CA cert path:         ${payload.relay.caCertPath ?? '-'}`);
+    console.log(
+      `Context decision keys: ${payload.relay.contextCandidateDecisionKeyIds.join(', ') || '-'}`,
+    );
     return;
   }
 
@@ -175,7 +186,10 @@ export async function remote(): Promise<void> {
       relay: {
         ...relayConfig,
         enabled: false,
-        enrollToken: undefined,
+        bindings: [],
+        installId: undefined,
+        runtimeTargetId: undefined,
+        machineId: undefined,
         issueToken: undefined,
       },
     });
@@ -192,39 +206,38 @@ export async function remote(): Promise<void> {
   if (subcommand === 'login') {
     const serverUrl = getFlag('server') ?? relayConfig.serverUrl;
     const workspaceId = getFlag('workspace') ?? relayConfig.workspaceId;
-    const userId = getFlag('user');
-    const workspaceName = getFlag('workspace-name');
-    let enrollToken = getFlag('token') ?? relayConfig.enrollToken;
+    const replaceExisting = hasFlag('replace');
+    const addBinding = hasFlag('add');
+    const preserveIssuedInstall = relayConfig.workspaceId === workspaceId;
+    const issueToken =
+      getFlag('token') ??
+      getFlag('issue-token') ??
+      (preserveIssuedInstall && relayConfig.serverUrl === serverUrl
+        ? relayConfig.issueToken
+        : undefined);
 
     if (!serverUrl || !workspaceId) {
-      usage();
+      throw new Error(usage());
+    }
+    if (!issueToken) {
+      throw new Error(
+        'Missing relay issue token. Pass --token <issue-token> or --issue-token <issue-token>.',
+      );
+    }
+    if (
+      relayConfig.workspaceId &&
+      !addBinding &&
+      (relayConfig.workspaceId !== workspaceId || relayConfig.serverUrl !== serverUrl) &&
+      !replaceExisting
+    ) {
+      throw new Error(
+        `Remote relay is already configured for workspace ${relayConfig.workspaceId}. Re-run with --replace to delete that binding and replace it with ${workspaceId}. Use --add to keep both organizations paired.`,
+      );
     }
 
     let relayEndpoint = getFlag('relay-endpoint') ?? relayConfig.endpoint;
     if (!relayEndpoint) {
-      relayEndpoint =
-        (await discoverRelayEndpoint(serverUrl).catch(() => null)) ??
-        inferRelayEndpointFromServer(serverUrl);
-    }
-
-    let tokenSource: 'flag_or_config' | 'reset' | 'enroll' = 'flag_or_config';
-    if (!enrollToken) {
-      const reset = await resetWorkspaceEnrollToken(serverUrl, workspaceId);
-      if (reset.ok) {
-        enrollToken = reset.token;
-        tokenSource = 'reset';
-      } else if (reset.workspaceMissing) {
-        if (!userId) {
-          throw new Error(
-            'Workspace not found and no --user provided. Pass --user to auto-enroll workspace, or pass --token explicitly.',
-          );
-        }
-        const enrolled = await enrollWorkspace(serverUrl, workspaceId, userId, workspaceName);
-        enrollToken = enrolled.token;
-        tokenSource = 'enroll';
-      } else {
-        throw new Error(`Failed to obtain enroll token: ${reset.reason}`);
-      }
+      relayEndpoint = inferRelayEndpointFromServer(serverUrl);
     }
 
     const relayTlsVerify = (getFlag('relay-tls-verify') ?? relayConfig.tlsVerify ?? 'auto') as
@@ -232,19 +245,82 @@ export async function remote(): Promise<void> {
       | '0'
       | '1';
     const relayCaCertPath = getFlag('relay-ca-cert') ?? relayConfig.caCertPath;
+    let contextCandidateDecisionKeys =
+      parseDecisionSigningKeys(getFlag('context-decision-key')) ??
+      daemonConfig.server?.contextCandidateDecisionKeys;
     const enableNow = hasFlag('enable') || !boolLike(getFlag('no-enable'));
+    const nextIssueToken = preserveIssuedInstall ? relayConfig.issueToken : undefined;
+    const nextInstallId = preserveIssuedInstall ? relayConfig.installId : undefined;
+    const nextRuntimeTargetId = preserveIssuedInstall ? relayConfig.runtimeTargetId : undefined;
+    const seededBindings = seedRelayBindings(relayConfig);
+    const existingBinding = seededBindings.find(
+      (binding) => binding.workspaceId === workspaceId && binding.serverUrl === serverUrl,
+    );
+    const nextMachineId =
+      (preserveIssuedInstall ? relayConfig.machineId : undefined) ??
+      existingBinding?.machineId ??
+      createRelayMachineId();
+
+    if (!contextCandidateDecisionKeys) {
+      contextCandidateDecisionKeys = await fetchContextCandidateDecisionKeys({
+        serverUrl,
+        tlsVerify: relayTlsVerify,
+        caCertPath: relayCaCertPath,
+        tlsPins: relayConfig.tlsPins,
+      });
+    }
+
+    const nextBinding = ensureRelayBindingMachineId({
+      enabled: enableNow,
+      endpoint: relayEndpoint,
+      serverUrl,
+      workspaceId,
+      installId: nextInstallId,
+      runtimeTargetId: nextRuntimeTargetId,
+      machineId: nextMachineId,
+      issueToken: issueToken.trim() || nextIssueToken,
+      tlsVerify: relayTlsVerify,
+      caCertPath: relayCaCertPath,
+      tlsPins: relayConfig.tlsPins,
+      tokenIssuer: relayConfig.tokenIssuer,
+      tokenAudience: relayConfig.tokenAudience,
+      tokenJwksUrl: relayConfig.tokenJwksUrl ?? inferRelayTokenJwksUrl(serverUrl),
+      signingKeys: relayConfig.signingKeys,
+      tokenClockSkewSec: relayConfig.tokenClockSkewSec,
+    });
+    const nextBindings = addBinding
+      ? upsertRelayBinding(seededBindings, nextBinding, replaceExisting)
+      : [nextBinding];
+    const primaryBinding =
+      addBinding && relayConfig.workspaceId
+        ? (nextBindings.find(
+            (binding) =>
+              binding.workspaceId === relayConfig.workspaceId &&
+              binding.serverUrl === relayConfig.serverUrl,
+          ) ??
+          nextBindings[0] ??
+          nextBinding)
+        : nextBinding;
 
     await manager.setDaemonConfig({
+      server: {
+        ...(daemonConfig.server ?? {}),
+        url: serverUrl,
+        ...(contextCandidateDecisionKeys ? { contextCandidateDecisionKeys } : {}),
+      },
       relay: {
         ...relayConfig,
         enabled: enableNow,
-        endpoint: relayEndpoint,
-        serverUrl,
-        workspaceId,
-        enrollToken,
-        issueToken: relayConfig.issueToken,
-        tlsVerify: relayTlsVerify,
-        caCertPath: relayCaCertPath,
+        bindings: nextBindings,
+        endpoint: primaryBinding.endpoint,
+        serverUrl: primaryBinding.serverUrl,
+        workspaceId: primaryBinding.workspaceId,
+        installId: primaryBinding.installId,
+        runtimeTargetId: primaryBinding.runtimeTargetId,
+        machineId: primaryBinding.machineId,
+        issueToken: primaryBinding.issueToken,
+        tlsVerify: primaryBinding.tlsVerify,
+        caCertPath: primaryBinding.caCertPath,
       },
     });
 
@@ -256,12 +332,17 @@ export async function remote(): Promise<void> {
         endpoint: relayEndpoint,
         serverUrl,
         workspaceId,
-        enrollToken: redact(enrollToken),
-        issueToken: redact(relayConfig.issueToken),
+        installId: nextInstallId,
+        runtimeTargetId: nextRuntimeTargetId,
+        machineId: nextMachineId,
+        issueToken: redact(issueToken.trim() || nextIssueToken),
         tlsVerify: relayTlsVerify,
         caCertPath: relayCaCertPath,
       },
-      tokenSource,
+      capabilities: resolveInstallMetadata(serverUrl, relayEndpoint, manager),
+      contextCandidateDecisionKeyIds: contextCandidateDecisionKeys
+        ? Object.keys(contextCandidateDecisionKeys)
+        : [],
       next: 'Run `vpd restart` to apply relay runtime changes.',
     };
 
@@ -274,11 +355,16 @@ export async function remote(): Promise<void> {
     console.log(`- endpoint:  ${relayEndpoint}`);
     console.log(`- server:    ${serverUrl}`);
     console.log(`- workspace: ${workspaceId}`);
-    console.log(`- token:     ${tokenSource}`);
+    console.log(`- token:     provided`);
     console.log(`- enabled:   ${enableNow ? 'yes' : 'no'}`);
+    if (contextCandidateDecisionKeys && Object.keys(contextCandidateDecisionKeys).length > 0) {
+      console.log(
+        `- context decision keys: ${Object.keys(contextCandidateDecisionKeys).join(', ')}`,
+      );
+    }
     console.log('Run `vpd restart` to apply relay runtime changes.');
     return;
   }
 
-  usage();
+  throw new Error(usage());
 }

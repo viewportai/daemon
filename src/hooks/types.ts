@@ -13,6 +13,7 @@
  */
 
 import { z } from 'zod';
+import { PLAN_PROPOSAL_SCHEMA_VERSION } from './plan-extractor.js';
 
 // ---------------------------------------------------------------------------
 // Hook event kinds — add new events here
@@ -31,9 +32,20 @@ export const HOOK_EVENT_KINDS = [
   'SubagentStop',
   'UserPromptSubmit',
   'TaskCompleted',
+  'PlanProposed',
 ] as const;
 
 export type HookEventKind = (typeof HOOK_EVENT_KINDS)[number];
+
+/**
+ * Claude Code only accepts documented lifecycle hook events in settings.json.
+ * Viewport still supports PlanProposed as an internal/direct CLI event, but
+ * installing it as a Claude hook causes Claude to ignore the entry with a
+ * settings warning.
+ */
+export const CLAUDE_HOOK_EVENT_KINDS = HOOK_EVENT_KINDS.filter(
+  (event): event is Exclude<HookEventKind, 'PlanProposed'> => event !== 'PlanProposed',
+);
 
 // ---------------------------------------------------------------------------
 // Base input — all hook events include these fields
@@ -134,6 +146,33 @@ export const TaskCompletedInputSchema = HookBaseInputSchema.extend({
   task_description: z.string().optional(),
 });
 
+export const PlanProposedInputSchema = HookBaseInputSchema.extend({
+  hook_event_name: z.literal('PlanProposed'),
+  schema: z.literal(PLAN_PROPOSAL_SCHEMA_VERSION),
+  title: z.string().optional(),
+  summary: z.string().optional(),
+  body: z.string().optional(),
+  plan: z.string().optional(),
+  plan_markdown: z.string().optional(),
+  source: z.string().optional(),
+  source_ref: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+}).superRefine((value, ctx) => {
+  const bodyFields = ['body', 'plan', 'plan_markdown'] as const;
+  const present = bodyFields.filter((field) => {
+    const candidate = value[field];
+    return typeof candidate === 'string' && candidate.trim().length > 0;
+  });
+
+  if (present.length !== 1) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['body'],
+      message: 'PlanProposed requires exactly one non-empty body, plan, or plan_markdown field.',
+    });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Schema registry — maps event kind to its Zod schema
 // ---------------------------------------------------------------------------
@@ -151,6 +190,7 @@ export const HOOK_INPUT_SCHEMAS: Record<HookEventKind, z.ZodType> = {
   SubagentStop: SubagentStopInputSchema,
   UserPromptSubmit: UserPromptSubmitInputSchema,
   TaskCompleted: TaskCompletedInputSchema,
+  PlanProposed: PlanProposedInputSchema,
 };
 
 // ---------------------------------------------------------------------------
@@ -163,6 +203,16 @@ export interface HookResponse {
   passthrough: boolean;
   /** Permission decision (only for PermissionRequest). */
   decision?: { behavior: 'allow' | 'deny'; message?: string };
+  /**
+   * Claude Code hook-specific output. Used for context injection without
+   * rendering noisy stdout in the user's terminal.
+   */
+  hookSpecificOutput?: {
+    hookEventName: HookEventKind;
+    additionalContext?: string;
+  };
+  /** Suppress hook stdout in Claude debug surfaces when supported. */
+  suppressOutput?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,4 +250,5 @@ export const DEFAULT_EVENT_DEFINITIONS: HookEventDefinition[] = [
   { kind: 'SubagentStop', blocking: false, defaultTimeoutMs: 5_000 },
   { kind: 'UserPromptSubmit', blocking: false, defaultTimeoutMs: 5_000 },
   { kind: 'TaskCompleted', blocking: false, defaultTimeoutMs: 5_000 },
+  { kind: 'PlanProposed', blocking: false, defaultTimeoutMs: 5_000 },
 ];

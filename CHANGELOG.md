@@ -1,16 +1,545 @@
-# [0.2.0](https://github.com/viewportai/daemon/compare/v0.1.0...v0.2.0) (2026-03-09)
+# [0.31.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.30.0...@viewportai/daemon@0.31.0) (2026-06-12)
+
+
+### Bug Fixes
+
+* **daemon:** pin protocol and add contract drift gate ([#164](https://github.com/viewportai/viewport/issues/164)) ([e9d9653](https://github.com/viewportai/viewport/commit/e9d965373c02de5692561625e02167118ad88267))
+* **relay:** admit client session-events admission claims ([#161](https://github.com/viewportai/viewport/issues/161)) ([e24d3f9](https://github.com/viewportai/viewport/commit/e24d3f9c8d1f079666b17fa2ebcb0b6f71e1d652))
 
 
 ### Features
 
-* **relay:** add native remote runtime bridge ([#2](https://github.com/viewportai/daemon/issues/2)) ([61c0cbb](https://github.com/viewportai/daemon/commit/61c0cbb9163785fff6d42b9a2a429424802bd989))
+* **relay:** viewer presence frames ([#162](https://github.com/viewportai/viewport/issues/162)) ([781fbfa](https://github.com/viewportai/viewport/commit/781fbfaf3966f5790a8d438d5ac51daa9add09e8))
 
-# [0.1.0](https://github.com/viewportai/daemon/compare/v0.0.0...v0.1.0) (2026-03-03)
+# [0.30.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.29.1...@viewportai/daemon@0.30.0) (2026-06-10)
 
 
 ### Features
 
-* **daemon:** import production daemon implementation ([#1](https://github.com/viewportai/daemon/issues/1)) ([f1f366f](https://github.com/viewportai/daemon/commit/f1f366f81a199050b1236303ea7074b06e0ae381))
+* **ci:** add gitleaks secret-scanning gate (SEC-02) ([#159](https://github.com/viewportai/viewport/issues/159)) ([cd32848](https://github.com/viewportai/viewport/commit/cd328487a786fa8e9926975e2d6532dc5dd089ca))
+
+## [0.29.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.29.0...@viewportai/daemon@0.29.1) (2026-06-10)
+
+
+### Bug Fixes
+
+* **test:** deflake root vitest suite via workspace config and cwd-safe fixtures ([#157](https://github.com/viewportai/viewport/issues/157)) ([20f4ff0](https://github.com/viewportai/viewport/commit/20f4ff03c2cea775e4290d62cd36e18fc59966f4))
+
+# [0.29.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.28.0...@viewportai/daemon@0.29.0) (2026-06-10)
+
+
+### Features
+
+* **exec-01:** worker run-once --lease refuses to fabricate completion ([#156](https://github.com/viewportai/viewport/issues/156)) ([3b3af6e](https://github.com/viewportai/viewport/commit/3b3af6ef0f301d084fc5997839ceb0a3a1b7d94d))
+
+# [0.28.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.27.0...@viewportai/daemon@0.28.0) (2026-06-09)
+
+
+### Bug Fixes
+
+* authenticate litellm proxy requests ([da41340](https://github.com/viewportai/viewport/commit/da413409e03c09333796be962327f5aa3218e95f))
+* **daemon:** accept Product20 capability policy envelopes ([1de841d](https://github.com/viewportai/viewport/commit/1de841dbbbc11bc4208069e52d46dcbf3f7eb20f))
+* **daemon:** build docker image from workspace ([5bb2bc0](https://github.com/viewportai/viewport/commit/5bb2bc0f0590518d90e4ea1bc8d8c2e028eadd01))
+* **daemon:** inject hosted runtime context target ([d51017d](https://github.com/viewportai/viewport/commit/d51017da583b0344679e8b57673561eba8320575))
+* **daemon:** pass run-scoped context target ([ab4efec](https://github.com/viewportai/viewport/commit/ab4efec166b375ad2f6ea4bcc81717e197f28d64))
+* **daemon:** prefer run-scoped context targets ([13951c3](https://github.com/viewportai/viewport/commit/13951c3722262baea6342319ee4a0fb1098ef607))
+* **daemon:** preserve agent session ids over http ([f2a4cf0](https://github.com/viewportai/viewport/commit/f2a4cf03a0a22823f9667b411a4efe26e42c9f47))
+* **daemon:** preserve hosted bootstrap context target ([7c1e3c4](https://github.com/viewportai/viewport/commit/7c1e3c43e67853f7e6c812c71e9c6708f16be37c))
+* **daemon:** preserve hosted session ids ([a2563e1](https://github.com/viewportai/viewport/commit/a2563e10aca56afde85860faefd4d02231f22e4c))
+* **daemon:** preserve managed worker session ids ([cd7956f](https://github.com/viewportai/viewport/commit/cd7956f3ae26eed5f6117c9faa9de22b2ba1798e))
+* **daemon:** refresh session verification contract ([23d36cc](https://github.com/viewportai/viewport/commit/23d36cc067300a598df76ece77ec80ffeb26dea2))
+* **daemon:** report missing session memory targets ([0cf385b](https://github.com/viewportai/viewport/commit/0cf385bba9a6811aa97728cb39389b9be1f8d24d))
+* **daemon:** request json for runtime context ([f1c71e7](https://github.com/viewportai/viewport/commit/f1c71e72674d2b0b5708e42b160565e3405e441a))
+* **daemon:** resolve hosted run context targets ([e4e1b28](https://github.com/viewportai/viewport/commit/e4e1b28c342237049f07add4cc514785a7348692))
+* **daemon:** resolve product20 session memory ids ([b384885](https://github.com/viewportai/viewport/commit/b384885b89a3c1b6a6817ac3818a953aa3e9f488))
+* **daemon:** use hosted context target ([fdcbc39](https://github.com/viewportai/viewport/commit/fdcbc39c34056edd5a3de0b3217feb8c3a12cbc4))
+* **daemon:** verify sessions from checkout worktree ([3390902](https://github.com/viewportai/viewport/commit/339090252224d80f69ee07d756cfd8d5b1173cb9))
+* normalize managed heartbeat capabilities ([29fd1e2](https://github.com/viewportai/viewport/commit/29fd1e2abb56c934ffc2520592280d18a5ca9e7c))
+* **relay:** handle empty worker responses ([5e9c497](https://github.com/viewportai/viewport/commit/5e9c49749d09b8c4d9b361f698496f2da28aca9f))
+* **shim-gateway:** expose streaming completion responses ([e67f307](https://github.com/viewportai/viewport/commit/e67f307810b697e2e23861e23b5bacbcd92e3157))
+* **worker:** execute hosted session verification ([f3ce11e](https://github.com/viewportai/viewport/commit/f3ce11edc7de5b1912a98816b9119c67178e651e))
+
+
+### Features
+
+* add dbos durable execution adapter ([17a6d7c](https://github.com/viewportai/viewport/commit/17a6d7c68578ffd5f711b287a9161e22dfbc2eff))
+* **daemon:** add tenant-side signal extractor ([5703e0b](https://github.com/viewportai/viewport/commit/5703e0bf74ff2704a6a54120a3fd802c9ff0537a))
+* **daemon:** inject session mailbox context ([345445d](https://github.com/viewportai/viewport/commit/345445da5c2daa673cd91f56304bee6fc87c42fb))
+* **daemon:** pass runner-local BYOK model keys ([57eebb5](https://github.com/viewportai/viewport/commit/57eebb51a9a196502056a0e766121e171d501801))
+* expand durable execution shim ([47acb74](https://github.com/viewportai/viewport/commit/47acb7468940a777929269d207fff762e2cb3d6e))
+* expose gateway leases to managed worker runtime ([9198f09](https://github.com/viewportai/viewport/commit/9198f09942e96e1e58dff18999d8ac2454af4340))
+* **relay:** route managed worker transport ([c910da7](https://github.com/viewportai/viewport/commit/c910da7c009419f4287ced582fcf234d8aa1c9b5))
+* **relay:** route Product20 session event subscriptions ([73e4458](https://github.com/viewportai/viewport/commit/73e4458f4f79b52a4e84daf23dac41c513e5a12e))
+* **relay:** support platform tls termination ([e2e6400](https://github.com/viewportai/viewport/commit/e2e6400915ee2540bdda3432a1c3bcc9935b73b2))
+* **shims:** add durable side effect claims ([3d1b196](https://github.com/viewportai/viewport/commit/3d1b196eec4f31ee7f924a762ab9c53a6e063680))
+* **worker:** execute session verification contracts ([65a8c72](https://github.com/viewportai/viewport/commit/65a8c726af46c0879cb9fbb51d674ea942a14874))
+
+# [0.27.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.26.1...@viewportai/daemon@0.27.0) (2026-06-02)
+
+
+### Features
+
+* add swappable gateway shim contracts ([#153](https://github.com/viewportai/viewport/issues/153)) ([3898b0c](https://github.com/viewportai/viewport/commit/3898b0cccee67b5e2b612be263b1ebc451a72f5a))
+
+## [0.26.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.26.0...@viewportai/daemon@0.26.1) (2026-06-02)
+
+
+### Bug Fixes
+
+* scope local github proof credentials ([#152](https://github.com/viewportai/viewport/issues/152)) ([24688ba](https://github.com/viewportai/viewport/commit/24688ba6537179aa2f5a213c66c9aecd1548f19b))
+
+# [0.26.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.13...@viewportai/daemon@0.26.0) (2026-06-02)
+
+
+### Features
+
+* add worker transport abstraction ([#151](https://github.com/viewportai/viewport/issues/151)) ([78d76d2](https://github.com/viewportai/viewport/commit/78d76d24cf9ae608ffc4dd088b1d15e124903986))
+
+## [0.25.13](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.12...@viewportai/daemon@0.25.13) (2026-06-01)
+
+
+### Bug Fixes
+
+* keep hosted managed runner out of oss ([#150](https://github.com/viewportai/viewport/issues/150)) ([346003a](https://github.com/viewportai/viewport/commit/346003a5f2158127bafe8cb44160b3f0e4a4a8dc))
+
+## [0.25.12](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.11...@viewportai/daemon@0.25.12) (2026-05-30)
+
+
+### Bug Fixes
+
+* sync worker startup failures ([869af10](https://github.com/viewportai/viewport/commit/869af108ae5a9ab73f2f88f027263be19c4a5148))
+
+## [0.25.11](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.10...@viewportai/daemon@0.25.11) (2026-05-29)
+
+
+### Bug Fixes
+
+* fail git publish without changes ([14151d2](https://github.com/viewportai/viewport/commit/14151d279d83903fd6a4c25388af1006af1b1e6d))
+* load workflow worker credentials from file ([49f9717](https://github.com/viewportai/viewport/commit/49f97173311223214ec23952e024aa764c07f106))
+* render absolute Slack completion links ([f788006](https://github.com/viewportai/viewport/commit/f788006204ea3c50053b575f1d06c22b424b42d3))
+
+## [0.25.10](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.9...@viewportai/daemon@0.25.10) (2026-05-29)
+
+
+### Bug Fixes
+
+* harden hosted prompt and receipt sync ([d95b5c0](https://github.com/viewportai/viewport/commit/d95b5c0734234e095e3d451e79dbe1e1ffdf2bf2))
+
+## [0.25.9](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.8...@viewportai/daemon@0.25.9) (2026-05-29)
+
+
+### Bug Fixes
+
+* render Slack completion runtime links ([65a4e82](https://github.com/viewportai/viewport/commit/65a4e82a58cbe86f6889a13e49fad7faacc1aa53))
+
+## [0.25.8](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.7...@viewportai/daemon@0.25.8) (2026-05-29)
+
+
+### Bug Fixes
+
+* preserve runner pool on worker heartbeat ([477ec6b](https://github.com/viewportai/viewport/commit/477ec6b41d2acc94e9e36b918e460d00d9a359f8))
+
+## [0.25.7](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.6...@viewportai/daemon@0.25.7) (2026-05-29)
+
+
+### Bug Fixes
+
+* fail closed on missing managed worker state ([03cc0a8](https://github.com/viewportai/viewport/commit/03cc0a87d8b1e6117dab585ae73d59826a88ab7c))
+
+## [0.25.6](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.5...@viewportai/daemon@0.25.6) (2026-05-29)
+
+
+### Bug Fixes
+
+* avoid credential env name collisions ([#143](https://github.com/viewportai/viewport/issues/143)) ([5c2e832](https://github.com/viewportai/viewport/commit/5c2e832e676c29d9250974ca024ecd2a9a76269a))
+
+## [0.25.5](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.4...@viewportai/daemon@0.25.5) (2026-05-29)
+
+
+### Bug Fixes
+
+* daemon brokered action resume flow ([#142](https://github.com/viewportai/viewport/issues/142)) ([6a140aa](https://github.com/viewportai/viewport/commit/6a140aab9af042dc48ccc9fe28185a5a20fba567))
+
+## [0.25.4](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.3...@viewportai/daemon@0.25.4) (2026-05-28)
+
+
+### Bug Fixes
+
+* constrain hosted worker credentials and prompt tools ([#141](https://github.com/viewportai/viewport/issues/141)) ([2788899](https://github.com/viewportai/viewport/commit/27888992d847ed86d4cb0c3869461f25bf31b65c))
+
+## [0.25.3](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.2...@viewportai/daemon@0.25.3) (2026-05-28)
+
+
+### Bug Fixes
+
+* require brokered github action credentials ([#140](https://github.com/viewportai/viewport/issues/140)) ([ad75668](https://github.com/viewportai/viewport/commit/ad756680c0afed886f40c0c4f84ae564d8cae017))
+
+## [0.25.2](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.1...@viewportai/daemon@0.25.2) (2026-05-28)
+
+
+### Bug Fixes
+
+* support gp2 context-backed runner proof ([#139](https://github.com/viewportai/viewport/issues/139)) ([a980a43](https://github.com/viewportai/viewport/commit/a980a432015311eafda65e80599191902dd64573))
+
+## [0.25.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.25.0...@viewportai/daemon@0.25.1) (2026-05-28)
+
+
+### Bug Fixes
+
+* manual golden runner execution blockers ([#138](https://github.com/viewportai/viewport/issues/138)) ([7fe71a3](https://github.com/viewportai/viewport/commit/7fe71a31da41a5ad6bf53db04dec7c91ff74b16f))
+
+# [0.25.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.24.0...@viewportai/daemon@0.25.0) (2026-05-28)
+
+
+### Features
+
+* gate inbound worker transport ([#137](https://github.com/viewportai/viewport/issues/137)) ([c93624e](https://github.com/viewportai/viewport/commit/c93624e592aac0cdabf5816c3f8e520b229bf3e6))
+
+# [0.24.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.23.0...@viewportai/daemon@0.24.0) (2026-05-28)
+
+
+### Features
+
+* close runner phase 7 update posture ([#136](https://github.com/viewportai/viewport/issues/136)) ([d3bc09e](https://github.com/viewportai/viewport/commit/d3bc09efc620e17042d401dc9ea2ed9c9bff3442))
+
+# [0.23.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.22.7...@viewportai/daemon@0.23.0) (2026-05-28)
+
+
+### Features
+
+* add worker pairing reset command ([#134](https://github.com/viewportai/viewport/issues/134)) ([96aea0c](https://github.com/viewportai/viewport/commit/96aea0c6bd3a25f090e2e2d8363cf4cf382a1a2a))
+
+## [0.22.7](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.22.6...@viewportai/daemon@0.22.7) (2026-05-28)
+
+
+### Bug Fixes
+
+* enforce workflow run max duration ([#133](https://github.com/viewportai/viewport/issues/133)) ([d728842](https://github.com/viewportai/viewport/commit/d728842930c4484d91c60e525e8e78fd9331b4f6))
+
+## [0.22.6](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.22.5...@viewportai/daemon@0.22.6) (2026-05-28)
+
+
+### Bug Fixes
+
+* default shell node timeouts ([#131](https://github.com/viewportai/viewport/issues/131)) ([31cdf89](https://github.com/viewportai/viewport/commit/31cdf8952d599badfd8e5fe2c765590c9cae5bfb))
+* preflight workflow run directories ([#132](https://github.com/viewportai/viewport/issues/132)) ([9f155c8](https://github.com/viewportai/viewport/commit/9f155c802f9c33032328284f6352ebbb04841ded))
+
+## [0.22.5](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.22.4...@viewportai/daemon@0.22.5) (2026-05-28)
+
+
+### Bug Fixes
+
+* block prompt cwd workspace escapes ([#129](https://github.com/viewportai/viewport/issues/129)) ([db3497b](https://github.com/viewportai/viewport/commit/db3497b92c15ee6ac6d5c63667955dfcaa1514b6))
+* fail automated workflow permission stalls ([#130](https://github.com/viewportai/viewport/issues/130)) ([3366245](https://github.com/viewportai/viewport/commit/3366245e4f5cf81b53e35ed5e3ad2cedc15842b9))
+
+## [0.22.4](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.22.3...@viewportai/daemon@0.22.4) (2026-05-28)
+
+
+### Bug Fixes
+
+* preflight worker workspace root ([#128](https://github.com/viewportai/viewport/issues/128)) ([93bcf98](https://github.com/viewportai/viewport/commit/93bcf98cbd539f0ed1b3c5e702a4a11118f46c3a))
+
+## [0.22.3](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.22.2...@viewportai/daemon@0.22.3) (2026-05-28)
+
+
+### Bug Fixes
+
+* reduce workflow approval command latency ([#127](https://github.com/viewportai/viewport/issues/127)) ([0d93763](https://github.com/viewportai/viewport/commit/0d9376376a8271d19774fa3005889bf0900ad19f))
+
+## [0.22.2](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.22.1...@viewportai/daemon@0.22.2) (2026-05-28)
+
+
+### Bug Fixes
+
+* preserve workflow session error reasons ([#126](https://github.com/viewportai/viewport/issues/126)) ([1cf8e33](https://github.com/viewportai/viewport/commit/1cf8e33c9cdae4cf93bfd1c4231c0a6eaa57d935))
+
+## [0.22.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.22.0...@viewportai/daemon@0.22.1) (2026-05-28)
+
+
+### Bug Fixes
+
+* sign managed worker runtime requests ([#125](https://github.com/viewportai/viewport/issues/125)) ([786d522](https://github.com/viewportai/viewport/commit/786d5225739deb79979816c5b090546fb3e3bec6))
+
+# [0.22.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.21.0...@viewportai/daemon@0.22.0) (2026-05-28)
+
+
+### Features
+
+* integrate vpd worker runtime hardening ([#124](https://github.com/viewportai/viewport/issues/124)) ([8001d45](https://github.com/viewportai/viewport/commit/8001d45c584a0134d83910affbaf29c4df239980))
+
+# [0.21.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.20.1...@viewportai/daemon@0.21.0) (2026-05-26)
+
+
+### Features
+
+* add team resource sync for managed workers ([#120](https://github.com/viewportai/viewport/issues/120)) ([2542216](https://github.com/viewportai/viewport/commit/2542216d96e128308b90347d987d171d7959b411))
+* harden workflow runner preparation primitives ([#121](https://github.com/viewportai/viewport/issues/121)) ([ae66abc](https://github.com/viewportai/viewport/commit/ae66abc5f82baaa345761749eca1e8ad87e2e763))
+
+## [0.20.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.20.0...@viewportai/daemon@0.20.1) (2026-05-18)
+
+
+### Bug Fixes
+
+* consume protocol 1.3.2 in daemon ([#119](https://github.com/viewportai/viewport/issues/119)) ([30fc4eb](https://github.com/viewportai/viewport/commit/30fc4eb9a034d7a9cbf184cfb49cb9e08dcf567e))
+
+# [0.20.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.19.0...@viewportai/daemon@0.20.0) (2026-05-18)
+
+
+### Bug Fixes
+
+* redact context sync payloads ([2654a13](https://github.com/viewportai/viewport/commit/2654a131b5902e748e6fa2541cb3aaae8f13407b))
+
+
+### Features
+
+* resolve context package config refs ([ec62649](https://github.com/viewportai/viewport/commit/ec626499aa77dbc10606f3521e60ef2fd6bf0edb))
+
+# [0.19.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.18.0...@viewportai/daemon@0.19.0) (2026-05-18)
+
+
+### Features
+
+* attach review artifact subjects to packets ([5f04b12](https://github.com/viewportai/viewport/commit/5f04b12574454a84d33fac2961d9f96e01857227))
+
+# [0.18.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.17.0...@viewportai/daemon@0.18.0) (2026-05-17)
+
+
+### Features
+
+* emit workflow context receipts ([#116](https://github.com/viewportai/viewport/issues/116)) ([3d44092](https://github.com/viewportai/viewport/commit/3d44092f679a4144bc93eeedd22b787504aa0a67))
+
+# [0.17.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.16.0...@viewportai/daemon@0.17.0) (2026-05-17)
+
+
+### Features
+
+* reconcile provider action receipts ([#115](https://github.com/viewportai/viewport/issues/115)) ([2d0c9d9](https://github.com/viewportai/viewport/commit/2d0c9d95fa099019220f0fa5f40e201916164181))
+
+# [0.16.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.15.2...@viewportai/daemon@0.16.0) (2026-05-17)
+
+
+### Features
+
+* carry approval execution grants ([#113](https://github.com/viewportai/viewport/issues/113)) ([a5536a0](https://github.com/viewportai/viewport/commit/a5536a09003baff6e2232bbe952fcffadd1d9a9e))
+
+## [0.15.2](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.15.1...@viewportai/daemon@0.15.2) (2026-05-17)
+
+
+### Bug Fixes
+
+* sync local workflow contract records ([dc00b11](https://github.com/viewportai/viewport/commit/dc00b113f11ea956a630e50594e91af452f66c6c))
+
+## [0.15.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.15.0...@viewportai/daemon@0.15.1) (2026-05-17)
+
+
+### Bug Fixes
+
+* sync canonical workflow approval decisions ([905ca1a](https://github.com/viewportai/viewport/commit/905ca1a72b7c6c197f43640bcac2078301d036d8))
+
+# [0.15.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.14.0...@viewportai/daemon@0.15.0) (2026-05-17)
+
+
+### Features
+
+* replay actions with provider adapters ([29345c4](https://github.com/viewportai/viewport/commit/29345c42afade2f632b5096b9bcb191ef1e32460))
+
+# [0.14.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.13.2...@viewportai/daemon@0.14.0) (2026-05-17)
+
+
+### Bug Fixes
+
+* enforce route profile protocol contracts ([#107](https://github.com/viewportai/viewport/issues/107)) ([cb67e62](https://github.com/viewportai/viewport/commit/cb67e6285de7dbc10e150084a9da66e88903fea7))
+* enforce workflow record contracts ([#108](https://github.com/viewportai/viewport/issues/108)) ([9b87fff](https://github.com/viewportai/viewport/commit/9b87fffb3b895607642404b8c455ee95f795c624))
+
+
+### Features
+
+* process managed action replays ([fb573c7](https://github.com/viewportai/viewport/commit/fb573c7d8266e01ae99a78fc7d6eec1d2758b4e3))
+
+## [0.13.2](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.13.1...@viewportai/daemon@0.13.2) (2026-05-16)
+
+
+### Bug Fixes
+
+* sync action dead-letter receipts ([1d72ba9](https://github.com/viewportai/viewport/commit/1d72ba9e65ff432c3f73eb9e4644a842df594c39))
+
+## [0.13.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.13.0...@viewportai/daemon@0.13.1) (2026-05-16)
+
+
+### Bug Fixes
+
+* resume reclaimed approved actions ([3eff2ea](https://github.com/viewportai/viewport/commit/3eff2eabfdae6998a66951c503284edd1f2d5d18))
+
+# [0.13.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.12.0...@viewportai/daemon@0.13.0) (2026-05-16)
+
+
+### Features
+
+* pass route context through managed worker ([8dc5d94](https://github.com/viewportai/viewport/commit/8dc5d943b5235349de2533b6fd1943b93162826b))
+
+# [0.12.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.11.0...@viewportai/daemon@0.12.0) (2026-05-16)
+
+
+### Features
+
+* add managed worker trust receipts ([0e48fc2](https://github.com/viewportai/viewport/commit/0e48fc2297f48c7d840ca1f15c9a9016552cbed4))
+
+# [0.11.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.10.0...@viewportai/daemon@0.11.0) (2026-05-16)
+
+
+### Features
+
+* add workflow automation foundation ([1d738e6](https://github.com/viewportai/viewport/commit/1d738e6707d90c01b6b812a2e25c3a256130d8a4))
+
+# [0.10.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.9.1...@viewportai/daemon@0.10.0) (2026-05-15)
+
+
+### Bug Fixes
+
+* renew managed workflow leases ([87093d7](https://github.com/viewportai/viewport/commit/87093d7502ebdbb86f359e72f86a03aacf90e231))
+* resume reclaimed workflow runs ([775f681](https://github.com/viewportai/viewport/commit/775f6819e8357787c0dffb3332234fd9e0938190))
+* send workflow assignment claim token ([9e7b889](https://github.com/viewportai/viewport/commit/9e7b88938f55b68b8a8f14708d7042e863bb7765))
+* split workflow contract modules ([b429a8c](https://github.com/viewportai/viewport/commit/b429a8cc676c216466c1a4ff21e7d6b52b3582e5))
+
+
+### Features
+
+* add managed workflow worker ([0a3231f](https://github.com/viewportai/viewport/commit/0a3231f189b58f522ddfec692a6a41d5eb922fa2))
+* align daemon workflow production contract ([7787e5c](https://github.com/viewportai/viewport/commit/7787e5c31b38567eebec9aeedd12d0521d15e1fe))
+* execute github workflow actions ([febe039](https://github.com/viewportai/viewport/commit/febe039b3a1184fa9b3fad1d8c0707b8544efafc))
+* execute jira and slack workflow actions ([adaf522](https://github.com/viewportai/viewport/commit/adaf522e671e3033a38c84bb4cb438c67b5b5eb2))
+* execute webhook workflow actions ([0ce08d7](https://github.com/viewportai/viewport/commit/0ce08d7fb96599760c5a9a038bd227c88851853d))
+* execute workflow condition branches ([9392877](https://github.com/viewportai/viewport/commit/9392877c8acdd437b2ac9e5907f2f2accb16db21))
+* forward workflow action idempotency keys ([205a8c2](https://github.com/viewportai/viewport/commit/205a8c2ee861757aa04c336346280b10a17c5e55))
+* resolve workflow context nodes ([367ee7a](https://github.com/viewportai/viewport/commit/367ee7ae7af328db74a715e9b838f91eb3b4a269))
+* resume approved workflow actions ([23ec00a](https://github.com/viewportai/viewport/commit/23ec00a683b32399084fb81a2cf86973bc60a16c))
+
+## [0.9.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.9.0...@viewportai/daemon@0.9.1) (2026-05-15)
+
+
+### Bug Fixes
+
+* stabilize daemon profile routing and session resume ([#100](https://github.com/viewportai/viewport/issues/100)) ([b5a534b](https://github.com/viewportai/viewport/commit/b5a534b496fedd5fb30d0fab2a7a37197b541eeb))
+
+# [0.9.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.8.0...@viewportai/daemon@0.9.0) (2026-05-14)
+
+
+### Features
+
+* add GitHub context provider ([#99](https://github.com/viewportai/viewport/issues/99)) ([6c8fe62](https://github.com/viewportai/viewport/commit/6c8fe62ddf0b6b2a981139a81f67db767f4a7b91))
+
+# [0.8.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.7.0...@viewportai/daemon@0.8.0) (2026-05-14)
+
+
+### Features
+
+* send auto unlock preference during pairing ([#98](https://github.com/viewportai/viewport/issues/98)) ([dd43b75](https://github.com/viewportai/viewport/commit/dd43b7575e30e96dceab4f2a9320d570fcb3e395))
+
+# [0.7.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.6.2...@viewportai/daemon@0.7.0) (2026-05-14)
+
+
+### Features
+
+* enrich session discovery parity ([#97](https://github.com/viewportai/viewport/issues/97)) ([c9f5b32](https://github.com/viewportai/viewport/commit/c9f5b32d61f8612804c8bbb57c71ef032e6ef042))
+
+## [0.6.2](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.6.1...@viewportai/daemon@0.6.2) (2026-05-14)
+
+
+### Bug Fixes
+
+* stabilize plan auto-open and context binding errors ([#96](https://github.com/viewportai/viewport/issues/96)) ([f039e15](https://github.com/viewportai/viewport/commit/f039e158fc85bea7a2d917d1e6a605de7fa21fbf))
+
+## [0.6.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.6.0...@viewportai/daemon@0.6.1) (2026-05-14)
+
+
+### Bug Fixes
+
+* clean runtime docs and daemon checks ([#95](https://github.com/viewportai/viewport/issues/95)) ([3ba3f19](https://github.com/viewportai/viewport/commit/3ba3f1921e77904aa5065eafd19643cebb623e8c))
+
+# [0.6.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.5.3...@viewportai/daemon@0.6.0) (2026-05-13)
+
+
+### Features
+
+* add trusted-edge epoch grant flows ([#94](https://github.com/viewportai/viewport/issues/94)) ([3a33aa7](https://github.com/viewportai/viewport/commit/3a33aa730d9eade5af3a36db6bebccb17d5d18e2))
+
+## [0.5.3](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.5.2...@viewportai/daemon@0.5.3) (2026-05-13)
+
+
+### Bug Fixes
+
+* implement trusted-edge context and plan grants ([#93](https://github.com/viewportai/viewport/issues/93)) ([f34f952](https://github.com/viewportai/viewport/commit/f34f95299ec1a3c8ee3b316f73dab69e6df15606))
+
+## [0.5.2](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.5.1...@viewportai/daemon@0.5.2) (2026-05-13)
+
+
+### Bug Fixes
+
+* **daemon:** stream trusted-edge plan drafts ([0cc8c80](https://github.com/viewportai/viewport/commit/0cc8c80875e26d162c278f039948392bb63fb0d9))
+
+## [0.5.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.5.0...@viewportai/daemon@0.5.1) (2026-05-13)
+
+
+### Bug Fixes
+
+* resolve tenant-specific relay targets ([8422b1d](https://github.com/viewportai/viewport/commit/8422b1db6a9e43925c15401eccd4b8f8ae06d2c0))
+
+# [0.5.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.4.1...@viewportai/daemon@0.5.0) (2026-05-13)
+
+
+### Features
+
+* add automatic context injection and trusted-edge routes ([#90](https://github.com/viewportai/viewport/issues/90)) ([af0fbec](https://github.com/viewportai/viewport/commit/af0fbec6842cc4c0147ebb611b44e996c5d94399))
+
+## [0.4.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.4.0...@viewportai/daemon@0.4.1) (2026-05-12)
+
+
+### Bug Fixes
+
+* **daemon:** align relay defaults with api origin ([4f28f16](https://github.com/viewportai/viewport/commit/4f28f1654467bb7291001a2c893bc1021eae63ad))
+
+# [0.4.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.3.0...@viewportai/daemon@0.4.0) (2026-05-11)
+
+
+### Features
+
+* add explicit org directory bindings ([c13208a](https://github.com/viewportai/viewport/commit/c13208a78ed53341d4815893a5aec3f4daba340f))
+
+# [0.3.0](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.2.1...@viewportai/daemon@0.3.0) (2026-05-11)
+
+
+### Bug Fixes
+
+* **daemon:** allow hosted app origins in local profile ([9b326cf](https://github.com/viewportai/viewport/commit/9b326cf150f48786761be88d4903fae95e2e379d))
+* **daemon:** coalesce overlapping discovery runs ([8df8b27](https://github.com/viewportai/viewport/commit/8df8b27691f905a5d98fe103f18a1b202812572e))
+* **daemon:** enforce private config file permissions ([b1422b1](https://github.com/viewportai/viewport/commit/b1422b1a34b9a5b9b7b973d34187fb281bd9f9d8))
+* **relay:** publish image under org package ([#84](https://github.com/viewportai/viewport/issues/84)) ([4753793](https://github.com/viewportai/viewport/commit/4753793d57a69b1db5804d698db1776d7df8e993))
+
+
+### Features
+
+* **daemon:** preview context candidates locally ([42f3a96](https://github.com/viewportai/viewport/commit/42f3a966fe4b403513f082ff2ea230879946b0ce))
+
+## [0.2.1](https://github.com/viewportai/viewport/compare/@viewportai/daemon@0.2.0...@viewportai/daemon@0.2.1) (2026-05-10)
+
+
+### Bug Fixes
+
+* **daemon:** route context proposals through providers ([68ca104](https://github.com/viewportai/viewport/commit/68ca104c73fdb484114b0291fe2555a20773a3ad))
+
+# [0.2.0](https://github.com/viewportai/viewport/compare/v0.1.0...v0.2.0) (2026-03-09)
+
+
+### Features
+
+* **relay:** add native remote runtime bridge ([#2](https://github.com/viewportai/viewport/issues/2)) ([61c0cbb](https://github.com/viewportai/viewport/commit/61c0cbb9163785fff6d42b9a2a429424802bd989))
+
+# [0.1.0](https://github.com/viewportai/viewport/compare/v0.0.0...v0.1.0) (2026-03-03)
+
+
+### Features
+
+* **daemon:** import production daemon implementation ([#1](https://github.com/viewportai/viewport/issues/1)) ([f1f366f](https://github.com/viewportai/viewport/commit/f1f366f81a199050b1236303ea7074b06e0ae381))
 
 # Changelog
 
